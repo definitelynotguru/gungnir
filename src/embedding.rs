@@ -172,8 +172,6 @@ pub fn hybrid_search(
     vec_rank.sort_by(|a, b| vec_scores[*b].total_cmp(&vec_scores[*a]));
 
     let fused = rrf_fuse(&[kw_rank, vec_rank], visible.len(), 60.0);
-    let bucket_of =
-        |e: &Entry| recall::bucket(e);
 
     let mut hits: Vec<Hit> = fused
         .into_iter()
@@ -186,8 +184,8 @@ pub fn hybrid_search(
         .collect();
 
     hits.sort_by(|a, b| {
-        bucket_of(&b.entry)
-            .cmp(&bucket_of(&a.entry))
+        recall::bucket(&b.entry)
+            .cmp(&recall::bucket(&a.entry))
             .then(b.score.total_cmp(&a.score))
     });
     Ok(hits)

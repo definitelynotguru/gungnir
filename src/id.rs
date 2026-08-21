@@ -24,10 +24,6 @@ impl EntryId {
     pub fn timestamp_ms(&self) -> u64 {
         self.0.timestamp_ms()
     }
-
-    pub fn as_ulid(&self) -> Ulid {
-        self.0
-    }
 }
 
 impl fmt::Display for EntryId {

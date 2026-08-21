@@ -14,18 +14,12 @@ pub const MAX_EXCERPT_LEN: usize = 500;
 /// about.
 pub type Exists<'a> = &'a dyn Fn(EntryId) -> Result<bool>;
 
-/// Validate an entry about to be created. Uniqueness is the store's job
-/// (it knows its own ids); everything else lives here.
-pub fn validate_new(entry: &Entry, exists: Exists<'_>) -> Result<()> {
-    validate_refs_and_shape(entry, exists)
-}
-
-/// Validate an update to an existing entry.
-pub fn validate_update(entry: &Entry, exists: Exists<'_>) -> Result<()> {
-    validate_refs_and_shape(entry, exists)
-}
-
-fn validate_refs_and_shape(entry: &Entry, exists: Exists<'_>) -> Result<()> {
+/// Validate an entry against every write-time rule except uniqueness,
+/// which only the store can judge (it knows its own ids).
+///
+/// Used for both creates and updates; the store distinguishes them by
+/// checking id presence before calling here.
+pub fn validate_entry(entry: &Entry, exists: Exists<'_>) -> Result<()> {
     if entry.summary.len() > MAX_SUMMARY_LEN {
         return Err(crate::Error::Invalid(format!(
             "summary is {} chars; cap is {MAX_SUMMARY_LEN}",

@@ -149,6 +149,18 @@ fn gng(root: &Option<PathBuf>) -> Result<Gungnir> {
     Gungnir::open(layout::resolve_root(root.clone()))
 }
 
+/// Rebuild a session handle from its persisted identity. The task text is
+/// not recoverable here; it only feeds briefing headers, which `brief`
+/// rebuilds from its own argument.
+fn session_handle(id: String, agent: String) -> crate::Session {
+    crate::Session {
+        id,
+        agent,
+        task: String::new(),
+        started_at: chrono::Utc::now(),
+    }
+}
+
 fn layer_of(name: &str) -> Result<&'static str> {
     match name {
         "codex" => Ok(crate::layout::CODEX),
@@ -253,32 +265,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                 println!("{}", s.id);
             }
             SessionCmd::Obs { session_id, agent, text } => {
-                let s = crate::Session {
-                    id: session_id,
-                    agent,
-                    task: String::new(),
-                    started_at: chrono::Utc::now(),
-                };
+                let s = session_handle(session_id, agent);
                 let id = g.add_observation(&s, text)?;
                 println!("{id}");
             }
             SessionCmd::Attempt { session_id, agent, text, succeeded } => {
-                let s = crate::Session {
-                    id: session_id,
-                    agent,
-                    task: String::new(),
-                    started_at: chrono::Utc::now(),
-                };
+                let s = session_handle(session_id, agent);
                 let id = g.add_attempt(&s, text, succeeded)?;
                 println!("{id}");
             }
             SessionCmd::End { session_id, agent, summary } => {
-                let s = crate::Session {
-                    id: session_id,
-                    agent,
-                    task: String::new(),
-                    started_at: chrono::Utc::now(),
-                };
+                let s = session_handle(session_id, agent);
                 let report = g.end_session(&s, summary, vec![])?;
                 println!("archived {}", report.journal_id);
             }

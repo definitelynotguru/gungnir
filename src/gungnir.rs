@@ -152,15 +152,12 @@ impl Gungnir {
 
         let codex = self.codex()?;
         let mut promoted_ids = Vec::new();
-        let exists = |id: EntryId| -> crate::Result<bool> {
-            Ok(codex.exists(id)? || journal_store.exists(id)? || scratch.exists(id)?)
-        };
         for p in promotions {
             let mut c = Entry::new(&session.agent, p.kind, p.summary);
             c.session_id = Some(session.id.clone());
             c.body = p.body;
             c.evidence.push(Evidence::Ref { id: journal_entry.id });
-            codex.create_with(&c, &exists)?;
+            codex.create_with(&c, &|id| self.exists_anywhere(id))?;
             promoted_ids.push(c.id);
         }
 
@@ -207,21 +204,7 @@ impl Gungnir {
     /// (Codex fact citing its Journal archive, etc.), so all mutation paths
     /// validate against the union.
     fn exists_anywhere(&self, id: EntryId) -> Result<bool> {
-        if self.codex()?.exists(id)? {
-            return Ok(true);
-        }
-        for base_name in [JOURNAL, SCRATCH] {
-            let base = self.root.join(base_name);
-            if !base.exists() {
-                continue;
-            }
-            for sub in std::fs::read_dir(&base)? {
-                if Store::open(base.join(sub?.file_name()))?.exists(id)? {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        Ok(self.locate(id)?.is_some())
     }
 
     pub fn verify(&self, id: EntryId, verifier: &str, note: Option<String>) -> Result<()> {
@@ -276,15 +259,14 @@ impl Gungnir {
         summary: impl Into<String>,
         body: impl Into<String>,
     ) -> Result<EntryId> {
-        let source = self.locate(from)?.ok_or(Error::NotFound(from))?;
+        if self.locate(from)?.is_none() {
+            return Err(Error::NotFound(from));
+        }
         let codex = self.codex()?;
         let mut c = Entry::new(agent, kind, summary);
         c.body = body.into();
         c.evidence.push(Evidence::Ref { id: from });
-        let exists = |id: EntryId| -> Result<bool> {
-            Ok(codex.exists(id)? || source.exists(id)?)
-        };
-        codex.create_with(&c, &exists)?;
+        codex.create_with(&c, &|id| self.exists_anywhere(id))?;
         Ok(c.id)
     }
 

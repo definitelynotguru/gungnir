@@ -78,7 +78,7 @@ impl Store {
         if self.exists(entry.id)? {
             return Err(Error::Duplicate(entry.id));
         }
-        validate::validate_new(entry, exists)?;
+        validate::validate_entry(entry, exists)?;
         let _guard = self.lock()?;
         self.persist_locked(entry)
     }
@@ -93,7 +93,7 @@ impl Store {
         if !self.exists(entry.id)? {
             return Err(Error::NotFound(entry.id));
         }
-        validate::validate_update(entry, exists)?;
+        validate::validate_entry(entry, exists)?;
         let _guard = self.lock()?;
         self.persist_locked(entry)
     }
