@@ -1,0 +1,33 @@
+[package]
+name = "gungnir"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first, markdown-native memory for AI agents"
+license = "MIT"
+repository = "https://github.com/definitelynotguru/gungnir"
+keywords = ["agent", "memory", "mcp", "llm", "markdown"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+serde_json = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+ulid = { version = "1", features = ["serde"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "gungnir"
+path = "src/main.rs"
+
+[lib]
+name = "gungnir"
+path = "src/lib.rs"
