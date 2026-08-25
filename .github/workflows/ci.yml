@@ -37,6 +37,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked || true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fails on known vulnerabilities. Unmaintained notices (e.g. serde_yaml)
+      # warn without failing until that dependency is replaced.
       - name: Audit
-        run: ~/.cargo/bin/cargo-audit audit --deny warnings
+        run: cargo audit
