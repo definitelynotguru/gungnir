@@ -140,4 +140,73 @@ fn mcp_subprocess_handshake_and_workflow() {
         }),
     ));
     assert_eq!(again["result"]["isError"], false, "{again}");
+
+    // Promotion over the wire: journal finding becomes shared Codex fact.
+    let archived = recall_text
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    let promoted = p.rpc(&msg(
+        9,
+        "tools/call",
+        serde_json::json!({
+            "name": "promote",
+            "arguments": {"from": archived, "agent": "builder", "kind": "decision",
+                          "summary": "checkout rewrites go through orders_archive_idx"}
+        }),
+    ));
+    assert_eq!(promoted["result"]["isError"], false, "{promoted}");
+    let codex_id = promoted["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("promoted to ")
+        .to_string();
+
+    // Verify first, so the later rollback has a verified ancestor to anchor
+    // to. Then supersede and roll back; history stays intact throughout.
+    let verified = p.rpc(&msg(
+        10,
+        "tools/call",
+        serde_json::json!({
+            "name": "verify",
+            "arguments": {"id": codex_id, "verifier": "team"}
+        }),
+    ));
+    assert_eq!(verified["result"]["isError"], false, "{verified}");
+
+    // Supersede it, then roll the revision back. History stays intact.
+    let superseded = p.rpc(&msg(
+        11,
+        "tools/call",
+        serde_json::json!({
+            "name": "supersede",
+            "arguments": {"id": codex_id, "agent": "builder",
+                          "summary": "covering index preferred over rewrite"}
+        }),
+    ));
+    assert_eq!(superseded["result"]["isError"], false, "{superseded}");
+    let revision = superseded["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("revision ")
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let rolled = p.rpc(&msg(
+        12,
+        "tools/call",
+        serde_json::json!({"name": "rollback", "arguments": {"id": revision, "agent": "builder"}}),
+    ));
+    assert_eq!(rolled["result"]["isError"], false, "{rolled}");
+
+    // list reflects the post-rollback codex.
+    let listed = p.rpc(&msg(13, "tools/call", serde_json::json!({"name": "list"})));
+    let list_text = listed["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(list_text.contains("orders_archive_idx"), "{list_text}");
 }

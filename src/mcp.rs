@@ -11,10 +11,13 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
+use crate::entry::EntryKind;
 use crate::gungnir::Session;
 use crate::id::EntryId;
+use crate::layout;
 use crate::recall::Query;
 use crate::{Error, Gungnir, Result};
 
@@ -108,6 +111,44 @@ impl Server {
                 }), &["id"])
             },
             {
+                "name": "promote",
+                "description": "Copy a finding into the shared Codex with provenance linked to its source entry.",
+                "inputSchema": schema(json!({
+                    "from": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["decision", "observation", "attempt", "review"]},
+                    "summary": {"type": "string"},
+                    "body": {"type": "string"}
+                }), &["from", "agent", "summary"])
+            },
+            {
+                "name": "supersede",
+                "description": "Write a revision of an existing fact; history is preserved via the revises chain.",
+                "inputSchema": schema(json!({
+                    "id": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "body": {"type": "string"}
+                }), &["id", "agent", "summary"])
+            },
+            {
+                "name": "rollback",
+                "description": "Non-destructively roll back a fact to its first verified ancestor.",
+                "inputSchema": schema(json!({
+                    "id": {"type": "string"},
+                    "agent": {"type": "string"}
+                }), &["id", "agent"])
+            },
+            {
+                "name": "list",
+                "description": "List entries in a layer. layer: codex (default) or journal.",
+                "inputSchema": schema(json!({
+                    "layer": {"type": "string", "enum": ["codex", "journal"]},
+                    "agent": {"type": "string"},
+                    "limit": {"type": "integer"}
+                }), &[])
+            },
+            {
                 "name": "get",
                 "description": "Fetch one entry from any layer.",
                 "inputSchema": schema(json!({
@@ -193,6 +234,72 @@ impl Server {
                 self.g
                     .verify(id, verifier, arg("note").map(str::to_owned))?;
                 Ok(format!("verified {id}"))
+            }
+            "promote" => {
+                let from: EntryId = arg("from")
+                    .ok_or_else(|| Error::Invalid("from required".into()))?
+                    .parse()
+                    .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
+                let agent =
+                    arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let kind = match arg("kind") {
+                    Some(k) => k.parse()?,
+                    None => EntryKind::Decision,
+                };
+                let summary =
+                    arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
+                let id = self
+                    .g
+                    .promote(from, agent, kind, summary, arg("body").unwrap_or(""))?;
+                Ok(format!("promoted to {id}"))
+            }
+            "supersede" => {
+                let id: EntryId = arg("id")
+                    .ok_or_else(|| Error::Invalid("id required".into()))?
+                    .parse()
+                    .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
+                let agent =
+                    arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let summary =
+                    arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
+                let new_id = self
+                    .g
+                    .supersede(id, agent, summary, arg("body").unwrap_or(""))?;
+                Ok(format!("revision {new_id} supersedes {id}"))
+            }
+            "rollback" => {
+                let id: EntryId = arg("id")
+                    .ok_or_else(|| Error::Invalid("id required".into()))?
+                    .parse()
+                    .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
+                let agent =
+                    arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let rb = self.g.rollback(id, agent)?;
+                Ok(format!("rollback entry: {rb}"))
+            }
+            "list" => {
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+                let render = |entries: Vec<crate::entry::Entry>| -> String {
+                    if entries.is_empty() {
+                        "(empty)".into()
+                    } else {
+                        entries
+                            .into_iter()
+                            .take(limit)
+                            .map(|e| format!("{}  {}\t{}", e.id, e.kind, e.summary))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                };
+                match arg("layer") {
+                    Some("journal") => {
+                        let agent = arg("agent").ok_or_else(|| {
+                            Error::Invalid("agent required for journal list".into())
+                        })?;
+                        Ok(render(self.g.journal(agent)?.entries()?))
+                    }
+                    _ => Ok(render(self.g.codex()?.entries()?)),
+                }
             }
             "get" => {
                 let id: EntryId = arg("id")
