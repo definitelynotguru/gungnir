@@ -19,7 +19,8 @@ pub const CACHE: &str = ".cache";
 
 /// Root resolution: explicit argument beats `GUNGNIR_ROOT` beats `~/.gungnir`.
 pub fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {
-    explicit.or_else(|| std::env::var("GUNGNIR_ROOT").ok().map(PathBuf::from))
+    explicit
+        .or_else(|| std::env::var("GUNGNIR_ROOT").ok().map(PathBuf::from))
         .unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(home).join(".gungnir")

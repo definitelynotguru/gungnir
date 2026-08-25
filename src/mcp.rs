@@ -28,7 +28,10 @@ pub struct Server {
 
 impl Server {
     pub fn new(g: Gungnir) -> Self {
-        Self { g, sessions: HashMap::new() }
+        Self {
+            g,
+            sessions: HashMap::new(),
+        }
     }
 
     fn tools(&self) -> Value {
@@ -134,13 +137,17 @@ impl Server {
             "add_attempt" => {
                 let s = self.session(args)?;
                 let text = arg("text").ok_or_else(|| Error::Invalid("text required".into()))?;
-                let ok = args.get("succeeded").and_then(Value::as_bool).unwrap_or(false);
+                let ok = args
+                    .get("succeeded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let id = self.g.add_attempt(&s, text, ok)?;
                 Ok(id.to_string())
             }
             "end_session" => {
                 let s = self.session(args)?;
-                let summary = arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
+                let summary =
+                    arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
                 let report = self.g.end_session(&s, summary, vec![])?;
                 self.sessions.remove(&s.id);
                 Ok(format!("archived {}", report.journal_id))
@@ -150,10 +157,17 @@ impl Server {
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
                 let hits = match arg("layer") {
                     Some("journal") => {
-                        let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required for journal recall".into()))?;
-                        self.g.recall_layer(crate::gungnir::Layer::Journal { agent }, &Query::new(query, limit))?
+                        let agent = arg("agent").ok_or_else(|| {
+                            Error::Invalid("agent required for journal recall".into())
+                        })?;
+                        self.g.recall_layer(
+                            crate::gungnir::Layer::Journal { agent },
+                            &Query::new(query, limit),
+                        )?
                     }
-                    _ => self.g.recall_layer(crate::gungnir::Layer::Codex, &Query::new(query, limit))?,
+                    _ => self
+                        .g
+                        .recall_layer(crate::gungnir::Layer::Codex, &Query::new(query, limit))?,
                 };
                 if hits.is_empty() {
                     return Ok("no matches".into());
@@ -176,7 +190,8 @@ impl Server {
                     .parse()
                     .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
                 let verifier = arg("verifier").unwrap_or("agent");
-                self.g.verify(id, verifier, arg("note").map(str::to_owned))?;
+                self.g
+                    .verify(id, verifier, arg("note").map(str::to_owned))?;
                 Ok(format!("verified {id}"))
             }
             "get" => {
@@ -200,9 +215,8 @@ impl Server {
         if let Some(s) = self.sessions.get(id) {
             return Ok(s.clone());
         }
-        let agent = arg("agent").ok_or_else(|| {
-            Error::Invalid("agent required (unknown session_id)".into())
-        })?;
+        let agent = arg("agent")
+            .ok_or_else(|| Error::Invalid("agent required (unknown session_id)".into()))?;
         Ok(Session {
             id: id.to_string(),
             agent: agent.to_string(),
@@ -227,10 +241,13 @@ impl Server {
             let req: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
-                    self.respond(out, json!({
-                        "jsonrpc": "2.0", "id": null,
-                        "error": {"code": -32700, "message": format!("parse error: {e}")}
-                    }))?;
+                    self.respond(
+                        out,
+                        json!({
+                            "jsonrpc": "2.0", "id": null,
+                            "error": {"code": -32700, "message": format!("parse error: {e}")}
+                        }),
+                    )?;
                     continue;
                 }
             };
@@ -248,7 +265,9 @@ impl Server {
                 }),
                 "notifications/initialized" | "initialized" => continue,
                 "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-                "tools/list" => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": self.tools()}}),
+                "tools/list" => {
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"tools": self.tools()}})
+                }
                 "tools/call" => {
                     let params = req.get("params").cloned().unwrap_or(Value::Null);
                     let name = params.get("name").and_then(Value::as_str).unwrap_or("");

@@ -86,21 +86,30 @@ fn mcp_subprocess_handshake_and_workflow() {
 
     // Record work.
     for (id, call) in [
-        (4u64, serde_json::json!({
-            "name": "add_observation",
-            "arguments": {"session_id": sid, "agent": "builder",
-                          "text": "EXPLAIN shows seq scan on orders"}
-        })),
-        (5, serde_json::json!({
-            "name": "add_attempt",
-            "arguments": {"session_id": sid, "agent": "builder",
-                          "text": "rewrote query with index hint", "succeeded": true}
-        })),
-        (6, serde_json::json!({
-            "name": "end_session",
-            "arguments": {"session_id": sid, "agent": "builder",
-                          "summary": "rewrote checkout query"}
-        })),
+        (
+            4u64,
+            serde_json::json!({
+                "name": "add_observation",
+                "arguments": {"session_id": sid, "agent": "builder",
+                              "text": "EXPLAIN shows seq scan on orders"}
+            }),
+        ),
+        (
+            5,
+            serde_json::json!({
+                "name": "add_attempt",
+                "arguments": {"session_id": sid, "agent": "builder",
+                              "text": "rewrote query with index hint", "succeeded": true}
+            }),
+        ),
+        (
+            6,
+            serde_json::json!({
+                "name": "end_session",
+                "arguments": {"session_id": sid, "agent": "builder",
+                              "summary": "rewrote checkout query"}
+            }),
+        ),
     ] {
         let r = p.rpc(&msg(id, "tools/call", call));
         assert_eq!(r["result"]["isError"], false, "{r}");
@@ -116,7 +125,10 @@ fn mcp_subprocess_handshake_and_workflow() {
         }),
     ));
     let recall_text = recall["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(recall_text.contains("rewrote checkout query"), "{recall_text}");
+    assert!(
+        recall_text.contains("rewrote checkout query"),
+        "{recall_text}"
+    );
 
     // Scratch cleared after end: observing again still works (fresh scratch).
     let again = p.rpc(&msg(

@@ -13,7 +13,10 @@ pub struct Query {
 
 impl Query {
     pub fn new(text: impl Into<String>, limit: usize) -> Self {
-        Self { text: text.into(), limit }
+        Self {
+            text: text.into(),
+            limit,
+        }
     }
 }
 
@@ -34,9 +37,9 @@ pub fn bucket(entry: &Entry) -> u8 {
 }
 
 const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
-    "has", "have", "in", "is", "it", "its", "of", "on", "or", "that", "the",
-    "this", "to", "was", "were", "will", "with",
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "in",
+    "is", "it", "its", "of", "on", "or", "that", "the", "this", "to", "was", "were", "will",
+    "with",
 ];
 
 pub fn tokenize(text: &str) -> Vec<String> {
@@ -109,7 +112,10 @@ mod tests {
 
     #[test]
     fn tokenizer_drops_stopwords_and_punctuation() {
-        assert_eq!(tokenize("The checkout QUERY, is slow!"), vec!["checkout", "query", "slow"]);
+        assert_eq!(
+            tokenize("The checkout QUERY, is slow!"),
+            vec!["checkout", "query", "slow"]
+        );
     }
 
     #[test]
@@ -131,7 +137,9 @@ mod tests {
         let mut e = Entry::new("a", EntryKind::Decision, "postgres pooling");
         e.mark_rolled_back("rb");
         let (_d, store) = store_with(vec![e]);
-        assert!(search(&store, &Query::new("postgres", 10)).unwrap().is_empty());
+        assert!(search(&store, &Query::new("postgres", 10))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -151,6 +159,8 @@ mod tests {
     fn no_overlap_yields_no_hits() {
         let e = Entry::new("a", EntryKind::Decision, "kubernetes ingress");
         let (_d, store) = store_with(vec![e]);
-        assert!(search(&store, &Query::new("quantum entanglement", 5)).unwrap().is_empty());
+        assert!(search(&store, &Query::new("quantum entanglement", 5))
+            .unwrap()
+            .is_empty());
     }
 }

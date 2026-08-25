@@ -30,7 +30,12 @@ fn label(hit: &Hit, superseded: &HashSet<EntryId>, task_tokens: &[String]) -> St
     let mut out = if tags.is_empty() {
         format!("- {} ({})", hit.entry.summary, hit.entry.id)
     } else {
-        format!("- [{}] {} ({})", tags.join(", "), hit.entry.summary, hit.entry.id)
+        format!(
+            "- [{}] {} ({})",
+            tags.join(", "),
+            hit.entry.summary,
+            hit.entry.id
+        )
     };
     if let Some(x) = excerpt(&hit.entry.body, task_tokens) {
         out.push_str(&format!("\n  > {x}"));
@@ -99,7 +104,11 @@ pub fn compile(
         ));
     }
 
-    Briefing { markdown: md, codex_hits, journal_hits }
+    Briefing {
+        markdown: md,
+        codex_hits,
+        journal_hits,
+    }
 }
 
 #[cfg(test)]
@@ -118,7 +127,10 @@ mod tests {
     fn superseded_and_contradicted_are_flagged() {
         let mut e = Entry::new("a", EntryKind::Decision, "deploy on fridays");
         e.contradict(EntryId::generate(), "reviewer");
-        let hit = Hit { entry: e, score: 1.0 };
+        let hit = Hit {
+            entry: e,
+            score: 1.0,
+        };
 
         let b = compile("deploy", vec![hit], vec![], HashSet::new(), HashSet::new());
         assert!(b.markdown.contains("CONTRADICTED"));
@@ -130,7 +142,10 @@ mod tests {
         let e = Entry::new("a", EntryKind::Decision, "use mysql");
         let mut set = HashSet::new();
         set.insert(e.id);
-        let hit = Hit { entry: e, score: 1.0 };
+        let hit = Hit {
+            entry: e,
+            score: 1.0,
+        };
         let b = compile("db", vec![hit], vec![], set, HashSet::new());
         assert!(b.markdown.contains("[superseded]"));
     }

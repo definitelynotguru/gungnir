@@ -71,11 +71,19 @@ impl Gungnir {
     }
 
     pub fn journal(&self, agent: &str) -> Result<Store> {
-        Store::open(self.root.join(JOURNAL).join(layout::sanitize_component(agent)))
+        Store::open(
+            self.root
+                .join(JOURNAL)
+                .join(layout::sanitize_component(agent)),
+        )
     }
 
     pub fn scratch(&self, session_id: &str) -> Result<Store> {
-        Store::open(self.root.join(SCRATCH).join(layout::sanitize_component(session_id)))
+        Store::open(
+            self.root
+                .join(SCRATCH)
+                .join(layout::sanitize_component(session_id)),
+        )
     }
 
     // -- session lifecycle ---------------------------------------------------
@@ -112,7 +120,11 @@ impl Gungnir {
         let mut entry = Entry::new(&session.agent, kind, summarize(&text));
         entry.session_id = Some(session.id.clone());
         entry.body = match outcome {
-            Some(ok) => format!("outcome: {}\n\n{}", if ok { "succeeded" } else { "failed" }, text),
+            Some(ok) => format!(
+                "outcome: {}\n\n{}",
+                if ok { "succeeded" } else { "failed" },
+                text
+            ),
             None => text,
         };
         self.scratch(&session.id)?.create(&entry)?;
@@ -134,7 +146,10 @@ impl Gungnir {
         let mut transcript = String::new();
         for e in scratch.entries()? {
             let outcome = if e.body.starts_with("outcome: ") {
-                format!(" [{}]", e.body["outcome: ".len()..].lines().next().unwrap_or(""))
+                format!(
+                    " [{}]",
+                    e.body["outcome: ".len()..].lines().next().unwrap_or("")
+                )
             } else {
                 String::new()
             };
@@ -143,10 +158,7 @@ impl Gungnir {
 
         let mut journal_entry = Entry::new(&session.agent, EntryKind::Session, summary);
         journal_entry.session_id = Some(session.id.clone());
-        journal_entry.body = format!(
-            "# Task\n{}\n\n# Transcript\n{}",
-            session.task, transcript
-        );
+        journal_entry.body = format!("# Task\n{}\n\n# Transcript\n{}", session.task, transcript);
         let journal_store = self.journal(&session.agent)?;
         journal_store.create(&journal_entry)?;
 
@@ -156,17 +168,25 @@ impl Gungnir {
             let mut c = Entry::new(&session.agent, p.kind, p.summary);
             c.session_id = Some(session.id.clone());
             c.body = p.body;
-            c.evidence.push(Evidence::Ref { id: journal_entry.id });
+            c.evidence.push(Evidence::Ref {
+                id: journal_entry.id,
+            });
             codex.create_with(&c, &|id| self.exists_anywhere(id))?;
             promoted_ids.push(c.id);
         }
 
-        let dir = self.root.join(SCRATCH).join(layout::sanitize_component(&session.id));
+        let dir = self
+            .root
+            .join(SCRATCH)
+            .join(layout::sanitize_component(&session.id));
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
 
-        Ok(EndReport { journal_id: journal_entry.id, promoted: promoted_ids })
+        Ok(EndReport {
+            journal_id: journal_entry.id,
+            promoted: promoted_ids,
+        })
     }
 
     // -- reading -------------------------------------------------------------
@@ -339,9 +359,12 @@ mod tests {
     fn full_session_flow_archives_promotes_and_clears_scratch() {
         let (_d, g) = gng();
         let s = g.start_session("builder", "fix slow checkout query");
-        g.add_observation(&s, "EXPLAIN shows seq scan on orders_archive").unwrap();
-        g.add_attempt(&s, "added index on orders.user_id", false).unwrap();
-        g.add_attempt(&s, "rewrote query to use orders_archive_idx", true).unwrap();
+        g.add_observation(&s, "EXPLAIN shows seq scan on orders_archive")
+            .unwrap();
+        g.add_attempt(&s, "added index on orders.user_id", false)
+            .unwrap();
+        g.add_attempt(&s, "rewrote query to use orders_archive_idx", true)
+            .unwrap();
 
         let report = g
             .end_session(
@@ -365,12 +388,20 @@ mod tests {
         let promoted = codex.require(report.promoted[0]).unwrap();
         assert_eq!(
             promoted.evidence,
-            vec![Evidence::Ref { id: report.journal_id }]
+            vec![Evidence::Ref {
+                id: report.journal_id
+            }]
         );
 
         // Scratch cleared.
-        assert!(g.scratch(&s.id).unwrap().entries().unwrap().is_empty()
-            || !g.root.join(SCRATCH).join(layout::sanitize_component(&s.id)).exists());
+        assert!(
+            g.scratch(&s.id).unwrap().entries().unwrap().is_empty()
+                || !g
+                    .root
+                    .join(SCRATCH)
+                    .join(layout::sanitize_component(&s.id))
+                    .exists()
+        );
     }
 
     #[test]
@@ -379,8 +410,10 @@ mod tests {
 
         // Another agent's failure must NOT appear in builder's briefing.
         let other = g.start_session("scout", "checkout perf");
-        g.add_attempt(&other, "tried vacuum full on orders", false).unwrap();
-        g.end_session(&other, "vacuum did not help", vec![]).unwrap();
+        g.add_attempt(&other, "tried vacuum full on orders", false)
+            .unwrap();
+        g.end_session(&other, "vacuum did not help", vec![])
+            .unwrap();
 
         let mine = g.start_session("builder", "fix slow checkout");
         g.add_attempt(&mine, "added checkout cache", true).unwrap();
@@ -398,7 +431,9 @@ mod tests {
         let v1 = Entry::new("a", EntryKind::Decision, "use mysql");
         codex.create(&v1).unwrap();
 
-        let v2 = g.supersede(v1.id, "a", "use postgres", "migration done").unwrap();
+        let v2 = g
+            .supersede(v1.id, "a", "use postgres", "migration done")
+            .unwrap();
         let stored = codex.require(v2).unwrap();
         assert_eq!(stored.revises, Some(v1.id));
 
@@ -413,9 +448,13 @@ mod tests {
         let e = Entry::new("a", EntryKind::Observation, "load balancer healthy");
         codex.create(&e).unwrap();
 
-        g.verify(e.id, "ops", Some("checked dashboard".into())).unwrap();
+        g.verify(e.id, "ops", Some("checked dashboard".into()))
+            .unwrap();
         let after = g.locate(e.id).unwrap().unwrap().require(e.id).unwrap();
-        assert_eq!(after.verification, crate::entry::VerificationState::Verified);
+        assert_eq!(
+            after.verification,
+            crate::entry::VerificationState::Verified
+        );
         assert_eq!(after.verification_log.len(), 1);
     }
 
@@ -430,12 +469,20 @@ mod tests {
         let report = g.end_session(&s, "raised hit rate", vec![]).unwrap();
 
         let cid = g
-            .promote(report.journal_id, "builder", EntryKind::Decision,
-                     "cache tuning worked", "hit rate now 40%")
+            .promote(
+                report.journal_id,
+                "builder",
+                EntryKind::Decision,
+                "cache tuning worked",
+                "hit rate now 40%",
+            )
             .unwrap();
         g.verify(cid, "team", None).unwrap();
 
         let stored = g.codex().unwrap().require(cid).unwrap();
-        assert_eq!(stored.verification, crate::entry::VerificationState::Verified);
+        assert_eq!(
+            stored.verification,
+            crate::entry::VerificationState::Verified
+        );
     }
 }

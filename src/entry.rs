@@ -36,9 +36,7 @@ impl std::fmt::Display for EntryKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Status {
-    Open {
-        assigned_to: String,
-    },
+    Open { assigned_to: String },
     Closed,
 }
 
