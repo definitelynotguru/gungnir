@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
-use crate::briefing::{self, Briefing};
+use crate::briefing::{self, Briefing, BriefingInput};
 use crate::entry::{Entry, EntryKind, Evidence};
 use crate::id::EntryId;
 use crate::layout::{self, CODEX, JOURNAL, SCRATCH};
-use crate::recall::{self, Hit, Query};
+use crate::recall::{self, Hit, Query, SearchOutcome};
 use crate::rollback;
 use crate::validate::MAX_SUMMARY_LEN;
 use crate::{Error, Result, Store};
@@ -192,30 +192,40 @@ impl Gungnir {
     // -- reading -------------------------------------------------------------
 
     /// Compile the pre-task briefing: Codex facts plus this agent's prior
-    /// attempts relevant to `task`.
+    /// attempts relevant to `task`, with coverage driving the abstention
+    /// signal.
     pub fn brief(&self, agent: &str, task: &str, limit: usize) -> Result<Briefing> {
         let codex = self.codex()?;
         let journal = self.journal(agent)?;
         let q = Query::new(task, limit);
 
-        let codex_hits = recall::search(&codex, &q)?;
-        let journal_hits = recall::search(&journal, &q)?;
-        Ok(briefing::compile(
-            task,
-            codex_hits,
-            journal_hits,
-            superseded_ids(&codex)?,
-            superseded_ids(&journal)?,
-        ))
+        let codex_out = recall::search_with_coverage(&codex, &q)?;
+        let journal_out = recall::search_with_coverage(&journal, &q)?;
+        Ok(briefing::compile(BriefingInput {
+            task: task.to_string(),
+            codex_hits: codex_out.hits,
+            journal_hits: journal_out.hits,
+            codex_superseded: superseded_ids(&codex)?,
+            journal_superseded: superseded_ids(&journal)?,
+            codex_coverage: codex_out.coverage,
+            journal_coverage: journal_out.coverage,
+        }))
+    }
+
+    /// Search one layer with coverage accounting.
+    pub fn search_layer(&self, layer: Layer, query: &Query) -> Result<SearchOutcome> {
+        match layer {
+            Layer::Codex => recall::search_with_coverage(&self.codex()?, query),
+            Layer::Journal { agent } => recall::search_with_coverage(&self.journal(agent)?, query),
+            Layer::Scratch { session_id } => {
+                recall::search_with_coverage(&self.scratch(session_id)?, query)
+            }
+        }
     }
 
     /// Keyword recall restricted to one layer.
     pub fn recall_layer(&self, layer: Layer, query: &Query) -> Result<Vec<Hit>> {
-        match layer {
-            Layer::Codex => recall::search(&self.codex()?, query),
-            Layer::Journal { agent } => recall::search(&self.journal(agent)?, query),
-            Layer::Scratch { session_id } => recall::search(&self.scratch(session_id)?, query),
-        }
+        self.search_layer(layer, query).map(|o| o.hits)
     }
 
     // -- mutations ------------------------------------------------------------
