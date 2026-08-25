@@ -11,13 +11,11 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
-use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use crate::entry::EntryKind;
 use crate::gungnir::Session;
 use crate::id::EntryId;
-use crate::layout;
 use crate::recall::Query;
 use crate::{Error, Gungnir, Result};
 
@@ -240,8 +238,7 @@ impl Server {
                     .ok_or_else(|| Error::Invalid("from required".into()))?
                     .parse()
                     .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
-                let agent =
-                    arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let kind = match arg("kind") {
                     Some(k) => k.parse()?,
                     None => EntryKind::Decision,
@@ -258,8 +255,7 @@ impl Server {
                     .ok_or_else(|| Error::Invalid("id required".into()))?
                     .parse()
                     .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
-                let agent =
-                    arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let summary =
                     arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
                 let new_id = self
@@ -272,8 +268,7 @@ impl Server {
                     .ok_or_else(|| Error::Invalid("id required".into()))?
                     .parse()
                     .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
-                let agent =
-                    arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let rb = self.g.rollback(id, agent)?;
                 Ok(format!("rollback entry: {rb}"))
             }

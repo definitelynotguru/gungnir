@@ -124,6 +124,14 @@ enum Cmd {
         cmd: SessionCmd,
     },
 
+    /// Memory health summary.
+    Stats {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run the MCP server on stdio (for Claude Code, Cursor, etc.).
     Mcp,
 }
@@ -309,6 +317,24 @@ fn dispatch(cli: Cli) -> Result<()> {
         C::Brief { agent, task, limit } => {
             let b = g.brief(&agent, &task, limit)?;
             print!("{}", b.markdown);
+        }
+
+        C::Stats { agent, json } => {
+            let r = g.stats(agent.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("codex entries      {}", r.codex_entries);
+                println!("journal entries    {}", r.journal_entries);
+                println!("scratch sessions   {}", r.scratch_sessions);
+                println!("verified           {}", r.verified);
+                println!("unverified         {}", r.unverified);
+                println!("contradicted       {}", r.contradicted);
+                println!("rolled back        {}", r.rolled_back);
+                println!("superseded         {}", r.superseded);
+                println!("stale (>30d)       {}", r.stale_over_30d);
+                println!("verification rate  {:.0}%", r.verification_rate * 100.0);
+            }
         }
 
         C::Mcp => {

@@ -15,7 +15,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use gungnir::{Entry, EntryKind, Gungnir, Promotion, Query};
 
 fn at(hours_from_epoch_base: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_767_225_600 + hours_from_epoch_base * 3600, 0).unwrap()
+    Utc.timestamp_opt(1_767_225_600 + hours_from_epoch_base * 3600, 0)
+        .unwrap()
 }
 
 /// A corpus exercising every layer: two builder sessions on one topic (one
@@ -36,13 +37,17 @@ fn build() -> Corpus {
 
     // Session 1: failure.
     let s1 = g.start_session("builder", "fix slow checkout query");
-    g.add_observation(&s1, "EXPLAIN shows seq scan on orders_archive").unwrap();
-    g.add_attempt(&s1, "added index on orders.user_id", false).unwrap();
-    g.end_session(&s1, "index hint did not help", vec![]).unwrap();
+    g.add_observation(&s1, "EXPLAIN shows seq scan on orders_archive")
+        .unwrap();
+    g.add_attempt(&s1, "added index on orders.user_id", false)
+        .unwrap();
+    g.end_session(&s1, "index hint did not help", vec![])
+        .unwrap();
 
     // Session 2: success, promoted into the Codex with provenance.
     let s2 = g.start_session("builder", "rewrite checkout query");
-    g.add_attempt(&s2, "rewrote query to use orders_archive_idx", true).unwrap();
+    g.add_attempt(&s2, "rewrote query to use orders_archive_idx", true)
+        .unwrap();
     let report = g
         .end_session(
             &s2,
@@ -68,13 +73,19 @@ fn build() -> Corpus {
     codex.create(&c2).unwrap();
 
     // Verified then rolled back, both transitions stamped by hand.
-    let mut f1 = Entry::new("ops", EntryKind::Decision, "feature flags live in launchdarkly");
+    let mut f1 = Entry::new(
+        "ops",
+        EntryKind::Decision,
+        "feature flags live in launchdarkly",
+    );
     f1.timestamp = at(20);
     codex.create(&f1).unwrap();
     let mut verified = f1.clone();
     verified.verify("ops-lead", None);
     verified.verification_log[0].timestamp = at(30);
-    codex.update_with(&verified, &|id| codex.exists(id)).unwrap();
+    codex
+        .update_with(&verified, &|id| codex.exists(id))
+        .unwrap();
     let mut rolled = verified;
     rolled.mark_rolled_back("ops");
     rolled.verification_log.last_mut().unwrap().timestamp = at(40);
@@ -82,8 +93,10 @@ fn build() -> Corpus {
 
     // Another agent's private journal must never leak into briefings.
     let s3 = g.start_session("scout", "investigate deploy timeouts");
-    g.add_observation(&s3, "deploy pipeline timeout in github actions runners").unwrap();
-    g.end_session(&s3, "runner timeouts documented", vec![]).unwrap();
+    g.add_observation(&s3, "deploy pipeline timeout in github actions runners")
+        .unwrap();
+    g.end_session(&s3, "runner timeouts documented", vec![])
+        .unwrap();
 
     // Unrelated verified fact far from every query below.
     let mut unrelated = Entry::new("hr", EntryKind::Decision, "meeting room hera seats eight");
@@ -91,7 +104,11 @@ fn build() -> Corpus {
     codex.create(&unrelated).unwrap();
     g.verify(unrelated.id, "office-manager", None).unwrap();
 
-    Corpus { g, _dir: dir, checkout_decision: report.promoted[0] }
+    Corpus {
+        g,
+        _dir: dir,
+        checkout_decision: report.promoted[0],
+    }
 }
 
 struct Score {
@@ -102,7 +119,11 @@ struct Score {
 
 impl Score {
     fn new(ability: &'static str) -> Self {
-        Self { ability, passed: 0, total: 0 }
+        Self {
+            ability,
+            passed: 0,
+            total: 0,
+        }
     }
     fn check(&mut self, name: &str, ok: bool) -> bool {
         self.total += 1;
@@ -118,13 +139,13 @@ impl Score {
 #[test]
 fn gungnir_bench() {
     let c = build();
-    let mut scores = Vec::new();
-
-    scores.push(extraction(&c));
-    scores.push(multi_session(&c));
-    scores.push(knowledge_updates(&c));
-    scores.push(temporal(&c));
-    scores.push(abstention(&c));
+    let scores = vec![
+        extraction(&c),
+        multi_session(&c),
+        knowledge_updates(&c),
+        temporal(&c),
+        abstention(&c),
+    ];
 
     let total: usize = scores.iter().map(|s| s.total).sum();
     let passed: usize = scores.iter().map(|s| s.passed).sum();
@@ -132,7 +153,10 @@ fn gungnir_bench() {
     for s in &scores {
         println!("  {:<26} {}/{}", s.ability, s.passed, s.total);
     }
-    assert_eq!(passed, total, "bench regressions detected; see FAIL lines above");
+    assert_eq!(
+        passed, total,
+        "bench regressions detected; see FAIL lines above"
+    );
 }
 
 fn extraction(c: &Corpus) -> Score {
@@ -141,13 +165,16 @@ fn extraction(c: &Corpus) -> Score {
     let journal = c.g.journal("builder").unwrap();
 
     // The promoted decision is retrievable by its own content.
-    let hits = c
-        .g
-        .recall_layer(gungnir::Layer::Codex, &Query::new("orders archive bottleneck", 5))
+    let hits =
+        c.g.recall_layer(
+            gungnir::Layer::Codex,
+            &Query::new("orders archive bottleneck", 5),
+        )
         .unwrap();
     s.check(
         "promoted fact recalled",
-        hits.first().is_some_and(|h| h.entry.summary.contains("orders_archive")),
+        hits.first()
+            .is_some_and(|h| h.entry.summary.contains("orders_archive")),
     );
 
     // Provenance survived promotion: evidence resolves to the journal entry.
@@ -159,9 +186,8 @@ fn extraction(c: &Corpus) -> Score {
     s.check("promotion links to journal source", evidence_ok);
 
     // Archived transcript detail is searchable in the journal.
-    let obs = c
-        .g
-        .recall_layer(
+    let obs =
+        c.g.recall_layer(
             gungnir::Layer::Journal { agent: "builder" },
             &Query::new("explain seq scan orders", 5),
         )
@@ -180,8 +206,14 @@ fn multi_session(c: &Corpus) -> Score {
     let b = c.g.brief("builder", "slow checkout rewrite", 10).unwrap();
 
     // Both sessions' outcomes appear in one briefing.
-    s.check("failed attempt present", b.markdown.contains("index hint did not help"));
-    s.check("successful rewrite present", b.markdown.contains("rewrote checkout query"));
+    s.check(
+        "failed attempt present",
+        b.markdown.contains("index hint did not help"),
+    );
+    s.check(
+        "successful rewrite present",
+        b.markdown.contains("rewrote checkout query"),
+    );
 
     // Another agent's private knowledge does not leak.
     s.check(
@@ -203,19 +235,20 @@ fn multi_session(c: &Corpus) -> Score {
 fn knowledge_updates(c: &Corpus) -> Score {
     let mut s = Score::new("knowledge updates");
 
-    let current = c
-        .g
-        .search_layer(
+    let current =
+        c.g.search_layer(
             gungnir::Layer::Codex,
             &Query::new("budget reviews", 10).current(),
         )
         .unwrap();
     s.check(
         "current view keeps chain head only",
-        current.hits.len() == 1
-            && current.hits[0].entry.summary.contains("q1"),
+        current.hits.len() == 1 && current.hits[0].entry.summary.contains("q1"),
     );
-    s.check("superseded tail counted as hidden", current.coverage.hidden_superseded == 1);
+    s.check(
+        "superseded tail counted as hidden",
+        current.coverage.hidden_superseded == 1,
+    );
 
     // Honest coverage: the head is unverified even though its ancestor was
     // verified. Abstention reflects what is true now, not history.
@@ -226,7 +259,10 @@ fn knowledge_updates(c: &Corpus) -> Score {
 
     // Plain recall shows both generations with the stale one flagged.
     let b = c.g.brief("ops", "budget reviews", 10).unwrap();
-    s.check("stale generation flagged superseded", b.markdown.contains(", superseded]"));
+    s.check(
+        "stale generation flagged superseded",
+        b.markdown.contains(", superseded]"),
+    );
 
     s
 }
@@ -235,9 +271,8 @@ fn temporal(c: &Corpus) -> Score {
     let mut s = Score::new("temporal reasoning");
 
     // Before the revision exists, the old fact is the only candidate.
-    let early = c
-        .g
-        .search_layer(
+    let early =
+        c.g.search_layer(
             gungnir::Layer::Codex,
             &Query::new("budget reviews", 10).as_of(at(50)).current(),
         )
@@ -248,9 +283,8 @@ fn temporal(c: &Corpus) -> Score {
     );
 
     // After it lands, the head moves.
-    let late = c
-        .g
-        .search_layer(
+    let late =
+        c.g.search_layer(
             gungnir::Layer::Codex,
             &Query::new("budget reviews", 10).as_of(at(150)).current(),
         )
@@ -261,9 +295,8 @@ fn temporal(c: &Corpus) -> Score {
     );
 
     // Rollback visibility flips at the recorded time, not at write time.
-    let flag_before = c
-        .g
-        .search_layer(
+    let flag_before =
+        c.g.search_layer(
             gungnir::Layer::Codex,
             &Query::new("feature flags", 10).as_of(at(35)),
         )
@@ -272,9 +305,8 @@ fn temporal(c: &Corpus) -> Score {
         "fact verified as-of before rollback",
         flag_before.coverage.verified == 1 && flag_before.hits.len() == 1,
     );
-    let flag_after = c
-        .g
-        .search_layer(
+    let flag_after =
+        c.g.search_layer(
             gungnir::Layer::Codex,
             &Query::new("feature flags", 10).as_of(at(50)),
         )
@@ -290,9 +322,8 @@ fn temporal(c: &Corpus) -> Score {
 fn abstention(c: &Corpus) -> Score {
     let mut s = Score::new("abstention");
 
-    let nothing = c
-        .g
-        .search_layer(
+    let nothing =
+        c.g.search_layer(
             gungnir::Layer::Codex,
             &Query::new("quarterly revenue forecast spreadsheet", 10),
         )
@@ -308,7 +339,8 @@ fn abstention(c: &Corpus) -> Score {
     let b = c.g.brief("builder", "cache tuning internals", 8).unwrap();
     s.check(
         "abstention line when zero verified match",
-        b.markdown.contains("No verified knowledge covers this task"),
+        b.markdown
+            .contains("No verified knowledge covers this task"),
     );
 
     s

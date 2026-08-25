@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 use crate::briefing::{self, Briefing, BriefingInput};
-use crate::entry::{Entry, EntryKind, Evidence};
+use crate::entry::{Entry, EntryKind, Evidence, VerificationState};
 use crate::id::EntryId;
 use crate::layout::{self, CODEX, JOURNAL, SCRATCH};
 use crate::recall::{self, Hit, Query, SearchOutcome};
@@ -46,6 +46,26 @@ pub struct EndReport {
 #[derive(Clone, Debug)]
 pub struct Gungnir {
     root: PathBuf,
+}
+
+/// Memory health snapshot: counts by layer and verification state,
+/// supersession depth, staleness. Powers `gungnir stats`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct StatsReport {
+    pub codex_entries: usize,
+    pub journal_entries: usize,
+    pub scratch_sessions: usize,
+    pub verified: usize,
+    pub unverified: usize,
+    pub contradicted: usize,
+    pub rolled_back: usize,
+    /// Entries whose id appears as the target of some other entry's
+    /// `revises` link; they have newer generations.
+    pub superseded: usize,
+    /// Non-rolled-back entries older than 30 days.
+    pub stale_over_30d: usize,
+    /// verified / (verified + unverified + contradicted), 0.0 when empty.
+    pub verification_rate: f64,
 }
 
 impl Gungnir {
@@ -278,6 +298,85 @@ impl Gungnir {
         rollback::rollback(&store, target, agent)
     }
 
+    /// Memory health across all layers. `agent` scopes the journal count;
+    /// scratch counts sessions, not entries.
+    pub fn stats(&self, agent: Option<&str>) -> Result<StatsReport> {
+        let mut r = StatsReport {
+            codex_entries: 0,
+            journal_entries: 0,
+            scratch_sessions: 0,
+            verified: 0,
+            unverified: 0,
+            contradicted: 0,
+            rolled_back: 0,
+            superseded: 0,
+            stale_over_30d: 0,
+            verification_rate: 0.0,
+        };
+
+        let mut all: Vec<Entry> = Vec::new();
+        r.codex_entries = self.codex()?.entries()?.len();
+        all.extend(self.codex()?.entries()?);
+
+        let journal_base = self.root.join(JOURNAL);
+        let agents: Vec<_> = match agent {
+            Some(a) => vec![layout::sanitize_component(a)],
+            None => {
+                if journal_base.exists() {
+                    std::fs::read_dir(&journal_base)?
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                } else {
+                    vec![]
+                }
+            }
+        };
+        for a in agents {
+            let entries = Store::open(journal_base.join(a))?.entries()?;
+            r.journal_entries += entries.len();
+            all.extend(entries);
+        }
+
+        let scratch_base = self.root.join(SCRATCH);
+        if scratch_base.exists() {
+            for sess in std::fs::read_dir(&scratch_base)?.filter_map(|e| e.ok()) {
+                let n = Store::open(scratch_base.join(sess.file_name()))?
+                    .entries()?
+                    .len();
+                if n > 0 {
+                    r.scratch_sessions += 1;
+                }
+                all.extend(Store::open(scratch_base.join(sess.file_name()))?.entries()?);
+            }
+        }
+
+        use chrono::Utc;
+        let now = Utc::now();
+        for e in &all {
+            match &e.verification {
+                VerificationState::Verified => r.verified += 1,
+                VerificationState::Unverified => r.unverified += 1,
+                VerificationState::Contradicted { .. } => r.contradicted += 1,
+                VerificationState::RolledBack => r.rolled_back += 1,
+            }
+        }
+        r.superseded = superseded_ids(&self.codex()?)?.len();
+        r.stale_over_30d = all
+            .iter()
+            .filter(|e| {
+                e.verification != VerificationState::RolledBack
+                    && (now - e.timestamp).num_days() > 30
+            })
+            .count();
+
+        let decidable = r.verified + r.unverified + r.contradicted;
+        if decidable > 0 {
+            r.verification_rate = r.verified as f64 / decidable as f64;
+        }
+        Ok(r)
+    }
+
     /// Promote an existing entry's finding into the Codex with a provenance
     /// link back to `from`. Works across layers (e.g. Journal archive as
     /// evidence for a Codex fact).
@@ -494,5 +593,38 @@ mod tests {
             stored.verification,
             crate::entry::VerificationState::Verified
         );
+    }
+
+    #[test]
+    fn stats_reports_layer_counts_and_health() {
+        let (_d, g) = gng();
+        let s = g.start_session("builder", "tune checkout");
+        g.add_observation(&s, "hit rate low").unwrap();
+        let report = g
+            .end_session(
+                &s,
+                "cache tuned",
+                vec![Promotion {
+                    kind: EntryKind::Decision,
+                    summary: "checkout cache sized at 512mb".into(),
+                    body: "measured hit rate gain".into(),
+                }],
+            )
+            .unwrap();
+        g.verify(report.promoted[0], "human", None).unwrap();
+        g.verify(report.journal_id, "human", None).unwrap();
+
+        let st = g.stats(None).unwrap();
+        assert_eq!(st.codex_entries, 1);
+        assert_eq!(st.journal_entries, 1);
+        assert_eq!(st.scratch_sessions, 0);
+        assert_eq!(st.verified, 2);
+        assert_eq!(st.unverified, 0);
+        assert!((st.verification_rate - 1.0).abs() < 1e-9);
+
+        let scoped = g.stats(Some("builder")).unwrap();
+        assert_eq!(scoped.journal_entries, 1);
+        let other = g.stats(Some("nobody")).unwrap();
+        assert_eq!(other.journal_entries, 0);
     }
 }
