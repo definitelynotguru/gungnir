@@ -39,7 +39,11 @@ pub fn plan(store: &Store, target: EntryId) -> Result<RollbackPlan> {
                         "target is already verified; nothing to roll back".into(),
                     ));
                 }
-                return Ok(RollbackPlan { target, ancestor: cur, intermediates });
+                return Ok(RollbackPlan {
+                    target,
+                    ancestor: cur,
+                    intermediates,
+                });
             }
             _ => {
                 intermediates.push(cur);
@@ -129,8 +133,14 @@ mod tests {
         }
 
         let rb_id = rollback(&store, ids[2], "agent").unwrap();
-        assert_eq!(store.require(ids[1]).unwrap().verification, VerificationState::RolledBack);
-        assert_eq!(store.require(ids[2]).unwrap().verification, VerificationState::RolledBack);
+        assert_eq!(
+            store.require(ids[1]).unwrap().verification,
+            VerificationState::RolledBack
+        );
+        assert_eq!(
+            store.require(ids[2]).unwrap().verification,
+            VerificationState::RolledBack
+        );
         let rb = store.require(rb_id).unwrap();
         assert_eq!(rb.kind, EntryKind::Rollback);
         assert_eq!(rb.revises, Some(ids[0]));

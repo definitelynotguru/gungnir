@@ -19,7 +19,8 @@ pub const CACHE: &str = ".cache";
 
 /// Root resolution: explicit argument beats `GUNGNIR_ROOT` beats `~/.gungnir`.
 pub fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {
-    explicit.or_else(|| std::env::var("GUNGNIR_ROOT").ok().map(PathBuf::from))
+    explicit
+        .or_else(|| std::env::var("GUNGNIR_ROOT").ok().map(PathBuf::from))
         .unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(home).join(".gungnir")
@@ -46,6 +47,15 @@ pub fn sanitize_component(name: &str) -> String {
         "anon".into()
     } else {
         capped
+    }
+}
+
+/// Shared layer name parser for CLI and MCP. Omitted means Codex.
+pub fn parse_layer_name(raw: Option<&str>) -> Result<&'static str, String> {
+    match raw {
+        None | Some(CODEX) => Ok(CODEX),
+        Some(JOURNAL) => Ok(JOURNAL),
+        Some(other) => Err(format!("unknown layer '{other}' (codex|journal)")),
     }
 }
 

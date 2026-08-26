@@ -36,9 +36,7 @@ impl std::fmt::Display for EntryKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Status {
-    Open {
-        assigned_to: String,
-    },
+    Open { assigned_to: String },
     Closed,
 }
 
@@ -89,6 +87,10 @@ impl std::str::FromStr for EntryKind {
         }
     }
 }
+
+pub const STATUS_VERIFIED: &str = "verified";
+pub const STATUS_CONTRADICTED: &str = "contradicted";
+pub const STATUS_ROLLED_BACK: &str = "rolled_back";
 
 /// An appended record tracking who verified/contradicted/rolled back, when.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,7 +165,7 @@ impl Entry {
         self.verification_log.push(VerificationRecord {
             verifier: verifier.into(),
             timestamp: Utc::now(),
-            status: "verified".into(),
+            status: STATUS_VERIFIED.into(),
             note,
         });
     }
@@ -174,7 +176,7 @@ impl Entry {
         self.verification_log.push(VerificationRecord {
             verifier: verifier.into(),
             timestamp: Utc::now(),
-            status: "contradicted".into(),
+            status: STATUS_CONTRADICTED.into(),
             note: None,
         });
     }
@@ -185,7 +187,7 @@ impl Entry {
         self.verification_log.push(VerificationRecord {
             verifier: verifier.into(),
             timestamp: Utc::now(),
-            status: "rolled_back".into(),
+            status: STATUS_ROLLED_BACK.into(),
             note: None,
         });
     }

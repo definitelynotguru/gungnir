@@ -13,12 +13,25 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
+use crate::entry::EntryKind;
 use crate::gungnir::Session;
 use crate::id::EntryId;
 use crate::recall::Query;
 use crate::{Error, Gungnir, Result};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+enum LayerSel {
+    Codex,
+    Journal,
+}
+
+fn parse_layer(raw: Option<&str>) -> Result<LayerSel> {
+    match crate::layout::parse_layer_name(raw).map_err(Error::Invalid)? {
+        crate::layout::JOURNAL => Ok(LayerSel::Journal),
+        _ => Ok(LayerSel::Codex),
+    }
+}
 
 /// Open sessions by id, so agents only pass a session handle between calls.
 pub struct Server {
@@ -28,7 +41,10 @@ pub struct Server {
 
 impl Server {
     pub fn new(g: Gungnir) -> Self {
-        Self { g, sessions: HashMap::new() }
+        Self {
+            g,
+            sessions: HashMap::new(),
+        }
     }
 
     fn tools(&self) -> Value {
@@ -105,6 +121,44 @@ impl Server {
                 }), &["id"])
             },
             {
+                "name": "promote",
+                "description": "Copy a finding into the shared Codex with provenance linked to its source entry.",
+                "inputSchema": schema(json!({
+                    "from": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["decision", "observation", "attempt", "review"]},
+                    "summary": {"type": "string"},
+                    "body": {"type": "string"}
+                }), &["from", "agent", "summary"])
+            },
+            {
+                "name": "supersede",
+                "description": "Write a revision of an existing fact; history is preserved via the revises chain.",
+                "inputSchema": schema(json!({
+                    "id": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "body": {"type": "string"}
+                }), &["id", "agent", "summary"])
+            },
+            {
+                "name": "rollback",
+                "description": "Non-destructively roll back a fact to its first verified ancestor.",
+                "inputSchema": schema(json!({
+                    "id": {"type": "string"},
+                    "agent": {"type": "string"}
+                }), &["id", "agent"])
+            },
+            {
+                "name": "list",
+                "description": "List entries in a layer. layer: codex (default) or journal.",
+                "inputSchema": schema(json!({
+                    "layer": {"type": "string", "enum": ["codex", "journal"]},
+                    "agent": {"type": "string"},
+                    "limit": {"type": "integer"}
+                }), &[])
+            },
+            {
                 "name": "get",
                 "description": "Fetch one entry from any layer.",
                 "inputSchema": schema(json!({
@@ -134,13 +188,17 @@ impl Server {
             "add_attempt" => {
                 let s = self.session(args)?;
                 let text = arg("text").ok_or_else(|| Error::Invalid("text required".into()))?;
-                let ok = args.get("succeeded").and_then(Value::as_bool).unwrap_or(false);
+                let ok = args
+                    .get("succeeded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let id = self.g.add_attempt(&s, text, ok)?;
                 Ok(id.to_string())
             }
             "end_session" => {
                 let s = self.session(args)?;
-                let summary = arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
+                let summary =
+                    arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
                 let report = self.g.end_session(&s, summary, vec![])?;
                 self.sessions.remove(&s.id);
                 Ok(format!("archived {}", report.journal_id))
@@ -148,12 +206,19 @@ impl Server {
             "recall" => {
                 let query = arg("query").ok_or_else(|| Error::Invalid("query required".into()))?;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-                let hits = match arg("layer") {
-                    Some("journal") => {
-                        let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required for journal recall".into()))?;
-                        self.g.recall_layer(crate::gungnir::Layer::Journal { agent }, &Query::new(query, limit))?
+                let hits = match parse_layer(arg("layer"))? {
+                    LayerSel::Journal => {
+                        let agent = arg("agent").ok_or_else(|| {
+                            Error::Invalid("agent required for journal recall".into())
+                        })?;
+                        self.g.recall_layer(
+                            crate::gungnir::Layer::Journal { agent },
+                            &Query::new(query, limit),
+                        )?
                     }
-                    _ => self.g.recall_layer(crate::gungnir::Layer::Codex, &Query::new(query, limit))?,
+                    LayerSel::Codex => self
+                        .g
+                        .recall_layer(crate::gungnir::Layer::Codex, &Query::new(query, limit))?,
                 };
                 if hits.is_empty() {
                     return Ok("no matches".into());
@@ -176,8 +241,72 @@ impl Server {
                     .parse()
                     .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
                 let verifier = arg("verifier").unwrap_or("agent");
-                self.g.verify(id, verifier, arg("note").map(str::to_owned))?;
+                self.g
+                    .verify(id, verifier, arg("note").map(str::to_owned))?;
                 Ok(format!("verified {id}"))
+            }
+            "promote" => {
+                let from: EntryId = arg("from")
+                    .ok_or_else(|| Error::Invalid("from required".into()))?
+                    .parse()
+                    .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
+                let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let kind = match arg("kind") {
+                    Some(k) => k.parse()?,
+                    None => EntryKind::Decision,
+                };
+                let summary =
+                    arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
+                let id = self
+                    .g
+                    .promote(from, agent, kind, summary, arg("body").unwrap_or(""))?;
+                Ok(format!("promoted to {id}"))
+            }
+            "supersede" => {
+                let id: EntryId = arg("id")
+                    .ok_or_else(|| Error::Invalid("id required".into()))?
+                    .parse()
+                    .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
+                let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let summary =
+                    arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
+                let new_id = self
+                    .g
+                    .supersede(id, agent, summary, arg("body").unwrap_or(""))?;
+                Ok(format!("revision {new_id} supersedes {id}"))
+            }
+            "rollback" => {
+                let id: EntryId = arg("id")
+                    .ok_or_else(|| Error::Invalid("id required".into()))?
+                    .parse()
+                    .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
+                let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let rb = self.g.rollback(id, agent)?;
+                Ok(format!("rollback entry: {rb}"))
+            }
+            "list" => {
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+                let render = |entries: Vec<crate::entry::Entry>| -> String {
+                    if entries.is_empty() {
+                        "(empty)".into()
+                    } else {
+                        entries
+                            .into_iter()
+                            .take(limit)
+                            .map(|e| format!("{}  {}\t{}", e.id, e.kind, e.summary))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                };
+                match parse_layer(arg("layer"))? {
+                    LayerSel::Journal => {
+                        let agent = arg("agent").ok_or_else(|| {
+                            Error::Invalid("agent required for journal list".into())
+                        })?;
+                        Ok(render(self.g.journal(agent)?.entries()?))
+                    }
+                    LayerSel::Codex => Ok(render(self.g.codex()?.entries()?)),
+                }
             }
             "get" => {
                 let id: EntryId = arg("id")
@@ -200,9 +329,8 @@ impl Server {
         if let Some(s) = self.sessions.get(id) {
             return Ok(s.clone());
         }
-        let agent = arg("agent").ok_or_else(|| {
-            Error::Invalid("agent required (unknown session_id)".into())
-        })?;
+        let agent = arg("agent")
+            .ok_or_else(|| Error::Invalid("agent required (unknown session_id)".into()))?;
         Ok(Session {
             id: id.to_string(),
             agent: agent.to_string(),
@@ -227,10 +355,13 @@ impl Server {
             let req: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
-                    self.respond(out, json!({
-                        "jsonrpc": "2.0", "id": null,
-                        "error": {"code": -32700, "message": format!("parse error: {e}")}
-                    }))?;
+                    self.respond(
+                        out,
+                        json!({
+                            "jsonrpc": "2.0", "id": null,
+                            "error": {"code": -32700, "message": format!("parse error: {e}")}
+                        }),
+                    )?;
                     continue;
                 }
             };
@@ -248,7 +379,9 @@ impl Server {
                 }),
                 "notifications/initialized" | "initialized" => continue,
                 "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-                "tools/list" => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": self.tools()}}),
+                "tools/list" => {
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"tools": self.tools()}})
+                }
                 "tools/call" => {
                     let params = req.get("params").cloned().unwrap_or(Value::Null);
                     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -389,5 +522,114 @@ mod tests {
             Gungnir::open(dir.path()).unwrap(),
         );
         assert_eq!(msgs[0]["result"]["isError"], true);
+    }
+
+    #[test]
+    fn promote_rejects_bad_id_and_missing_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gungnir::open(dir.path()).unwrap();
+        let msgs = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"promote","arguments":{"from":"nope","agent":"a","summary":"x"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"promote","arguments":{"from":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"a"}}}"#,
+                "\n"
+            ),
+            g,
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("bad id"));
+        assert_eq!(msgs[1]["result"]["isError"], true);
+        assert!(msgs[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("summary required"));
+    }
+
+    #[test]
+    fn list_journal_requires_agent_and_unknown_layer_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gungnir::open(dir.path()).unwrap();
+        let msgs = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list","arguments":{"layer":"journal"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list","arguments":{"layer":"scratch"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"query":"x","layer":"nope"}}}"#,
+                "\n"
+            ),
+            g,
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("agent required"));
+        assert_eq!(msgs[1]["result"]["isError"], true);
+        assert!(msgs[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown layer"));
+        assert_eq!(msgs[2]["result"]["isError"], true);
+        assert!(msgs[2]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown layer"));
+    }
+
+    #[test]
+    fn recall_journal_requires_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":"x","layer":"journal"}}}"#,
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("agent required"));
+    }
+
+    #[test]
+    fn supersede_and_rollback_reject_malformed_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"supersede","arguments":{"id":"nope","agent":"a","summary":"x"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rollback","arguments":{"id":"nope","agent":"a"}}}"#,
+                "\n"
+            ),
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("bad id"));
+        assert_eq!(msgs[1]["result"]["isError"], true);
+        assert!(msgs[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("bad id"));
+    }
+
+    #[test]
+    fn supersede_unknown_id_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"supersede","arguments":{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"a","summary":"x"}}}"#,
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not found"));
     }
 }
