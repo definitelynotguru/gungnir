@@ -65,6 +65,12 @@ enum Cmd {
         layer: String,
         #[arg(long)]
         agent: Option<String>,
+        /// Resolve supersession chains to heads; drop contradicted facts.
+        #[arg(long)]
+        current: bool,
+        /// Evaluate facts as they stood at this instant (RFC3339).
+        #[arg(long)]
+        as_of: Option<String>,
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
@@ -262,24 +268,43 @@ fn dispatch(cli: Cli) -> Result<()> {
             query,
             layer,
             agent,
+            current,
+            as_of,
             limit,
         } => {
-            let hits = match layer_of(&layer)? {
-                crate::layout::CODEX => {
-                    g.recall_layer(crate::gungnir::Layer::Codex, &Query::new(&query, limit))?
-                }
+            let mut q = Query::new(&query, limit);
+            if current {
+                q = q.current();
+            }
+            if let Some(raw) = as_of {
+                let t = chrono::DateTime::parse_from_rfc3339(&raw)
+                    .map_err(|e| Error::Invalid(format!("bad --as-of: {e}")))?
+                    .with_timezone(&chrono::Utc);
+                q = q.as_of(t);
+            }
+            let out = match layer_of(&layer)? {
+                crate::layout::CODEX => g.search_layer(crate::gungnir::Layer::Codex, &q)?,
                 _ => {
                     let a = agent
                         .as_deref()
                         .ok_or_else(|| Error::Invalid("recall journal requires --agent".into()))?;
-                    g.recall_layer(
-                        crate::gungnir::Layer::Journal { agent: a },
-                        &Query::new(&query, limit),
-                    )?
+                    g.search_layer(crate::gungnir::Layer::Journal { agent: a }, &q)?
                 }
             };
-            for h in hits {
+            for h in &out.hits {
                 println!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary);
+            }
+            if out.hits.is_empty() && out.coverage.total_visible() == 0 {
+                println!("(no knowledge covers this topic)");
+            } else {
+                println!(
+                    "coverage: {} verified, {} unverified, {} contradicted ({} superseded, {} rolled back hidden)",
+                    out.coverage.verified,
+                    out.coverage.unverified,
+                    out.coverage.contradicted,
+                    out.coverage.hidden_superseded,
+                    out.coverage.hidden_rolled_back
+                );
             }
         }
 
