@@ -50,6 +50,15 @@ pub fn sanitize_component(name: &str) -> String {
     }
 }
 
+/// Shared layer name parser for CLI and MCP. Omitted means Codex.
+pub fn parse_layer_name(raw: Option<&str>) -> Result<&'static str, String> {
+    match raw {
+        None | Some(CODEX) => Ok(CODEX),
+        Some(JOURNAL) => Ok(JOURNAL),
+        Some(other) => Err(format!("unknown layer '{other}' (codex|journal)")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

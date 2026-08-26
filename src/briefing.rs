@@ -196,6 +196,41 @@ mod tests {
     }
 
     #[test]
+    fn journal_verified_prevents_abstention() {
+        let e = Entry::new("a", EntryKind::Observation, "maybe cache");
+        let mut i = input();
+        i.codex_hits = vec![Hit {
+            entry: e,
+            score: 1.0,
+        }];
+        i.codex_coverage.unverified = 1;
+        i.journal_coverage.verified = 1;
+        let b = compile(i);
+        assert!(!b.markdown.contains("No verified knowledge"));
+    }
+
+    #[test]
+    fn both_layers_unverified_with_hits_still_abstains() {
+        let e = Entry::new("a", EntryKind::Observation, "maybe cache");
+        let mut i = input();
+        i.codex_hits = vec![Hit {
+            entry: e.clone(),
+            score: 1.0,
+        }];
+        i.journal_hits = vec![Hit {
+            entry: e,
+            score: 1.0,
+        }];
+        i.codex_coverage.unverified = 1;
+        i.journal_coverage.unverified = 1;
+        let b = compile(i);
+        assert!(b
+            .markdown
+            .contains("No verified knowledge covers this task"));
+        assert!(b.markdown.contains("1 unverified"));
+    }
+
+    #[test]
     fn abstention_still_fires_when_unverified_hits_exist() {
         let e = Entry::new(
             "a",

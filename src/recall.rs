@@ -124,9 +124,9 @@ fn state_at(entry: &Entry, as_of: Option<DateTime<Utc>>) -> StateAt {
         .filter(|r| r.timestamp <= cutoff)
         .max_by_key(|r| r.timestamp)
         .map(|r| match r.status.as_str() {
-            "verified" => StateAt::Verified,
-            "contradicted" => StateAt::Contradicted,
-            "rolled_back" => StateAt::RolledBack,
+            crate::entry::STATUS_VERIFIED => StateAt::Verified,
+            crate::entry::STATUS_CONTRADICTED => StateAt::Contradicted,
+            crate::entry::STATUS_ROLLED_BACK => StateAt::RolledBack,
             _ => StateAt::Unverified,
         })
         .unwrap_or(StateAt::Unverified)
@@ -183,7 +183,10 @@ pub fn search_with_coverage(store: &Store, query: &Query) -> Result<SearchOutcom
                 continue;
             }
         }
-        if query.current_only {
+        let state = state_at(&entry, query.as_of);
+        // A rolled-back head must not hide its predecessor. Current view
+        // should fall back to the last live revision.
+        if query.current_only && state != StateAt::RolledBack {
             if let Some(prev) = entry.revises {
                 revised.insert(prev);
             }
@@ -192,7 +195,6 @@ pub fn search_with_coverage(store: &Store, query: &Query) -> Result<SearchOutcom
         if s <= 0.0 {
             continue;
         }
-        let state = state_at(&entry, query.as_of);
         match state {
             StateAt::RolledBack => coverage.hidden_rolled_back += 1,
             _ => matched.push((entry, s, state)),
@@ -369,5 +371,66 @@ mod tests {
         assert_eq!(out.hits.len(), 1);
         assert_eq!(out.coverage.verified, 3);
         assert_eq!(out.coverage.total_visible(), 3);
+    }
+
+    #[test]
+    fn current_only_falls_back_when_head_is_rolled_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let v1 = Entry::new("a", EntryKind::Decision, "sessions use mysql");
+        store.create(&v1).unwrap();
+        let mut v2 = Entry::new("a", EntryKind::Decision, "sessions use postgres");
+        v2.revises = Some(v1.id);
+        store.create(&v2).unwrap();
+        let mut v3 = Entry::new("a", EntryKind::Decision, "sessions use cockroach");
+        v3.revises = Some(v2.id);
+        v3.mark_rolled_back("ops");
+        store.create(&v3).unwrap();
+
+        let out = search_with_coverage(&store, &Query::new("sessions use", 10).current()).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.summary, "sessions use postgres");
+        assert_eq!(out.coverage.hidden_rolled_back, 1);
+        assert_eq!(out.coverage.hidden_superseded, 1);
+    }
+
+    #[test]
+    fn coverage_hidden_counts_survive_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let v1 = Entry::new("a", EntryKind::Decision, "checkout tail");
+        store.create(&v1).unwrap();
+        let mut v2 = Entry::new("a", EntryKind::Decision, "checkout head");
+        v2.revises = Some(v1.id);
+        v2.verify("review", None);
+        store.create(&v2).unwrap();
+        let mut rb = Entry::new("a", EntryKind::Decision, "checkout rolled");
+        rb.mark_rolled_back("ops");
+        store.create(&rb).unwrap();
+        let counter = Entry::new("a", EntryKind::Observation, "counter evidence checkout");
+        store.create(&counter).unwrap();
+        let mut contradicted = Entry::new("a", EntryKind::Observation, "checkout contradicted");
+        contradicted.contradict(counter.id, "ops");
+        store.create(&contradicted).unwrap();
+        let extra = Entry::new("a", EntryKind::Decision, "checkout extra verified");
+        let mut extra = extra;
+        extra.verify("review", None);
+        store.create(&extra).unwrap();
+
+        let out = search_with_coverage(&store, &Query::new("checkout", 1).current()).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert!(out.coverage.verified >= 2);
+        assert_eq!(out.coverage.hidden_superseded, 1);
+        assert_eq!(out.coverage.hidden_rolled_back, 1);
+        assert_eq!(out.coverage.contradicted, 1);
+    }
+
+    #[test]
+    fn empty_and_stopword_query_yields_zero_coverage() {
+        let e = Entry::new("a", EntryKind::Decision, "the checkout query");
+        let (_d, store) = store_with(vec![e]);
+        let out = search_with_coverage(&store, &Query::new("the and", 10)).unwrap();
+        assert!(out.hits.is_empty());
+        assert_eq!(out.coverage, Coverage::default());
     }
 }

@@ -317,6 +317,11 @@ impl Gungnir {
         let mut all: Vec<Entry> = Vec::new();
         let codex_entries = self.codex()?.entries()?;
         r.codex_entries = codex_entries.len();
+        r.superseded = codex_entries
+            .iter()
+            .filter_map(|e| e.revises)
+            .collect::<HashSet<_>>()
+            .len();
         all.extend(codex_entries);
 
         let journal_base = self.root.join(JOURNAL);
@@ -349,7 +354,6 @@ impl Gungnir {
                 VerificationState::RolledBack => r.rolled_back += 1,
             }
         }
-        r.superseded = superseded_ids(&self.codex()?)?.len();
         r.stale_over_30d = all
             .iter()
             .filter(|e| {
@@ -671,10 +675,37 @@ mod tests {
         g.add_observation(&s, "scratch note about checkout")
             .unwrap();
 
+        let mut exactly_30 = Entry::new("a", EntryKind::Decision, "exactly thirty days old");
+        exactly_30.timestamp = now - chrono::Duration::days(30);
+        codex.create(&exactly_30).unwrap();
+
+        std::fs::create_dir_all(g.root().join(SCRATCH).join("empty-session")).unwrap();
+
         let st = g.stats(None).unwrap();
         assert_eq!(st.stale_over_30d, 1);
         assert_eq!(st.superseded, 1);
         assert_eq!(st.scratch_sessions, 1);
         assert_eq!(st.rolled_back, 1);
+        let decidable = st.verified + st.unverified + st.contradicted;
+        assert_eq!(st.verification_rate, st.verified as f64 / decidable as f64);
+        assert!(st.rolled_back > 0);
+        assert!(decidable > st.verified);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stats_skips_symlinks_and_unsanitized_journal_dirs() {
+        let (_d, g) = gng();
+        let journal = g.journal("builder").unwrap();
+        let e = Entry::new("builder", EntryKind::Observation, "real journal note");
+        journal.create(&e).unwrap();
+
+        let journal_base = g.root().join(JOURNAL);
+        std::os::unix::fs::symlink("/tmp", journal_base.join("link")).unwrap();
+        std::fs::create_dir_all(journal_base.join("bad!")).unwrap();
+
+        let st = g.stats(None).unwrap();
+        assert_eq!(st.journal_entries, 1);
+        assert!(g.locate(e.id).unwrap().is_some());
     }
 }

@@ -211,13 +211,7 @@ fn session_handle(id: String, agent: String) -> crate::Session {
 }
 
 fn layer_of(name: &str) -> Result<&'static str> {
-    match name {
-        "codex" => Ok(crate::layout::CODEX),
-        "journal" => Ok(crate::layout::JOURNAL),
-        other => Err(Error::Invalid(format!(
-            "unknown layer '{other}' (codex|journal)"
-        ))),
-    }
+    layout::parse_layer_name(Some(name)).map_err(Error::Invalid)
 }
 
 fn dispatch(cli: Cli) -> Result<()> {

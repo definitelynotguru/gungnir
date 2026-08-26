@@ -245,3 +245,31 @@ fn as_of_includes_entry_and_log_at_exact_cutoff() {
     assert!(before.hits.is_empty());
     assert_eq!(before.coverage, gungnir::Coverage::default());
 }
+
+#[test]
+fn as_of_plus_current_keeps_tail_when_later_revisions_are_in_the_future() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+
+    let mut v1 = Entry::new("a", EntryKind::Decision, "sessions use mysql");
+    v1.timestamp = h(10);
+    codex.create(&v1).unwrap();
+    let mut v2 = Entry::new("a", EntryKind::Observation, "interim migration note");
+    v2.timestamp = h(50);
+    v2.revises = Some(v1.id);
+    codex.create(&v2).unwrap();
+    let mut v3 = Entry::new("a", EntryKind::Decision, "sessions use postgres");
+    v3.timestamp = h(60);
+    v3.revises = Some(v2.id);
+    codex.create(&v3).unwrap();
+
+    let mid = g
+        .search_layer(
+            gungnir::Layer::Codex,
+            &Query::new("sessions use", 10).as_of(h(30)).current(),
+        )
+        .unwrap();
+    assert_eq!(mid.hits.len(), 1);
+    assert_eq!(mid.hits[0].entry.summary, "sessions use mysql");
+}

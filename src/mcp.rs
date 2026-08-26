@@ -27,12 +27,9 @@ enum LayerSel {
 }
 
 fn parse_layer(raw: Option<&str>) -> Result<LayerSel> {
-    match raw {
-        None | Some("codex") => Ok(LayerSel::Codex),
-        Some("journal") => Ok(LayerSel::Journal),
-        Some(other) => Err(Error::Invalid(format!(
-            "unknown layer '{other}' (codex|journal)"
-        ))),
+    match crate::layout::parse_layer_name(raw).map_err(Error::Invalid)? {
+        crate::layout::JOURNAL => Ok(LayerSel::Journal),
+        _ => Ok(LayerSel::Codex),
     }
 }
 
@@ -582,6 +579,44 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unknown layer"));
+    }
+
+    #[test]
+    fn recall_journal_requires_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":"x","layer":"journal"}}}"#,
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("agent required"));
+    }
+
+    #[test]
+    fn supersede_and_rollback_reject_malformed_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"supersede","arguments":{"id":"nope","agent":"a","summary":"x"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rollback","arguments":{"id":"nope","agent":"a"}}}"#,
+                "\n"
+            ),
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("bad id"));
+        assert_eq!(msgs[1]["result"]["isError"], true);
+        assert!(msgs[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("bad id"));
     }
 
     #[test]
