@@ -172,11 +172,20 @@ pub fn search_with_coverage(store: &Store, query: &Query) -> Result<SearchOutcom
 
     let mut matched: Vec<(Entry, f64, StateAt)> = Vec::new();
     let mut coverage = Coverage::default();
+    // Collect revises targets from every as-of-valid entry, not just
+    // topic-matched ones. Otherwise a chain A<-B<-C where B is off-topic
+    // leaves A visible next to C.
+    let mut revised: std::collections::HashSet<EntryId> = std::collections::HashSet::new();
 
     for entry in store.entries()? {
         if let Some(cutoff) = query.as_of {
             if entry.timestamp > cutoff {
                 continue;
+            }
+        }
+        if query.current_only {
+            if let Some(prev) = entry.revises {
+                revised.insert(prev);
             }
         }
         let s = score(&entry, &qtokens);
@@ -190,11 +199,7 @@ pub fn search_with_coverage(store: &Store, query: &Query) -> Result<SearchOutcom
         }
     }
 
-    // Chain-head resolution: any candidate revising another candidate's id
-    // demotes that target to a chain tail.
     if query.current_only {
-        let revised: std::collections::HashSet<EntryId> =
-            matched.iter().filter_map(|(e, _, _)| e.revises).collect();
         let before = matched.len();
         matched.retain(|(e, _, _)| !revised.contains(&e.id));
         coverage.hidden_superseded += before - matched.len();
@@ -330,5 +335,39 @@ mod tests {
         let out = search_with_coverage(&store, &Query::new("migrating redis", 10)).unwrap();
         assert!(out.hits[0].score > out.hits[1].score);
         assert_eq!(out.hits[0].entry.summary, "migrating off redis");
+    }
+
+    #[test]
+    fn current_only_hides_tail_when_middle_is_off_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let v1 = Entry::new("a", EntryKind::Decision, "sessions use mysql");
+        store.create(&v1).unwrap();
+        let mut v2 = Entry::new("a", EntryKind::Observation, "interim migration note");
+        v2.revises = Some(v1.id);
+        store.create(&v2).unwrap();
+        let mut v3 = Entry::new("a", EntryKind::Decision, "sessions use postgres");
+        v3.revises = Some(v2.id);
+        store.create(&v3).unwrap();
+
+        let out = search_with_coverage(&store, &Query::new("sessions use", 10).current()).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.summary, "sessions use postgres");
+        assert_eq!(out.coverage.hidden_superseded, 1);
+    }
+
+    #[test]
+    fn coverage_counts_the_pool_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for summary in ["alpha checkout", "beta checkout", "gamma checkout"] {
+            let mut e = Entry::new("a", EntryKind::Decision, summary);
+            e.verify("review", None);
+            store.create(&e).unwrap();
+        }
+        let out = search_with_coverage(&store, &Query::new("checkout", 1)).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.coverage.verified, 3);
+        assert_eq!(out.coverage.total_visible(), 3);
     }
 }

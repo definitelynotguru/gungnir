@@ -210,3 +210,38 @@ fn log_records_roundtrip_with_custom_timestamps() {
     let back: VerificationRecord = serde_yaml::from_str(&yaml).unwrap();
     assert_eq!(back, rec);
 }
+
+#[test]
+fn as_of_includes_entry_and_log_at_exact_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+
+    let mut e = Entry::new("a", EntryKind::Decision, "queue backed by redis");
+    e.timestamp = h(10);
+    codex.create(&e).unwrap();
+    let mut verified = e.clone();
+    verified.verify("human", None);
+    verified.verification_log[0].timestamp = h(10);
+    codex
+        .update_with(&verified, &|id| codex.exists(id))
+        .unwrap();
+
+    let at_cutoff = g
+        .search_layer(
+            gungnir::Layer::Codex,
+            &Query::new("queue redis", 10).as_of(h(10)),
+        )
+        .unwrap();
+    assert_eq!(at_cutoff.coverage.verified, 1);
+    assert_eq!(at_cutoff.hits.len(), 1);
+
+    let before = g
+        .search_layer(
+            gungnir::Layer::Codex,
+            &Query::new("queue redis", 10).as_of(h(9)),
+        )
+        .unwrap();
+    assert!(before.hits.is_empty());
+    assert_eq!(before.coverage, gungnir::Coverage::default());
+}

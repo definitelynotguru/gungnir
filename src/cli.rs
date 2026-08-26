@@ -188,6 +188,12 @@ pub fn run_from_env() -> i32 {
     }
 }
 
+fn parse_as_of(raw: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .map_err(|e| Error::Invalid(format!("bad --as-of: {e}")))
+}
+
 fn gng(root: &Option<PathBuf>) -> Result<Gungnir> {
     Gungnir::open(layout::resolve_root(root.clone()))
 }
@@ -277,10 +283,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 q = q.current();
             }
             if let Some(raw) = as_of {
-                let t = chrono::DateTime::parse_from_rfc3339(&raw)
-                    .map_err(|e| Error::Invalid(format!("bad --as-of: {e}")))?
-                    .with_timezone(&chrono::Utc);
-                q = q.as_of(t);
+                q = q.as_of(parse_as_of(&raw)?);
             }
             let out = match layer_of(&layer)? {
                 crate::layout::CODEX => g.search_layer(crate::gungnir::Layer::Codex, &q)?,
@@ -405,4 +408,37 @@ fn dispatch(cli: Cli) -> Result<()> {
         },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn as_of_rejects_garbage_and_accepts_rfc3339() {
+        let err = parse_as_of("not-rfc3339").unwrap_err().to_string();
+        assert!(err.contains("bad --as-of"), "{err}");
+        assert!(parse_as_of("2026-08-01T00:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn clap_accepts_current_and_as_of_together() {
+        let cli = Cli::try_parse_from([
+            "gungnir",
+            "recall",
+            "checkout",
+            "--current",
+            "--as-of",
+            "2026-08-01T00:00:00Z",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Recall { current, as_of, .. } => {
+                assert!(current);
+                assert_eq!(as_of.as_deref(), Some("2026-08-01T00:00:00Z"));
+            }
+            _ => panic!("expected Recall"),
+        }
+    }
 }

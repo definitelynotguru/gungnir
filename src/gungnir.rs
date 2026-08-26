@@ -315,22 +315,14 @@ impl Gungnir {
         };
 
         let mut all: Vec<Entry> = Vec::new();
-        r.codex_entries = self.codex()?.entries()?.len();
-        all.extend(self.codex()?.entries()?);
+        let codex_entries = self.codex()?.entries()?;
+        r.codex_entries = codex_entries.len();
+        all.extend(codex_entries);
 
         let journal_base = self.root.join(JOURNAL);
         let agents: Vec<_> = match agent {
             Some(a) => vec![layout::sanitize_component(a)],
-            None => {
-                if journal_base.exists() {
-                    std::fs::read_dir(&journal_base)?
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.file_name().to_string_lossy().into_owned())
-                        .collect()
-                } else {
-                    vec![]
-                }
-            }
+            None => layer_child_names(&journal_base)?,
         };
         for a in agents {
             let entries = Store::open(journal_base.join(a))?.entries()?;
@@ -339,16 +331,12 @@ impl Gungnir {
         }
 
         let scratch_base = self.root.join(SCRATCH);
-        if scratch_base.exists() {
-            for sess in std::fs::read_dir(&scratch_base)?.filter_map(|e| e.ok()) {
-                let n = Store::open(scratch_base.join(sess.file_name()))?
-                    .entries()?
-                    .len();
-                if n > 0 {
-                    r.scratch_sessions += 1;
-                }
-                all.extend(Store::open(scratch_base.join(sess.file_name()))?.entries()?);
+        for sess in layer_child_names(&scratch_base)? {
+            let entries = Store::open(scratch_base.join(&sess))?.entries()?;
+            if !entries.is_empty() {
+                r.scratch_sessions += 1;
             }
+            all.extend(entries);
         }
 
         use chrono::Utc;
@@ -424,16 +412,39 @@ pub enum Layer<'a> {
 }
 
 fn find_under(base: &Path, id: EntryId) -> Result<Option<PathBuf>> {
-    if !base.exists() {
-        return Ok(None);
-    }
-    for agent_dir in std::fs::read_dir(base)? {
-        let dir = base.join(agent_dir?.file_name());
+    for name in layer_child_names(base)? {
+        let dir = base.join(&name);
         if Store::open(&dir)?.exists(id)? {
             return Ok(Some(dir));
         }
     }
     Ok(None)
+}
+
+/// Directories under a layer root that look like Gungnir created them.
+/// Skips files, names that would not survive sanitization, and child
+/// symlinks so `stats`/`locate` do not walk out of the store.
+fn layer_child_names(base: &Path) -> Result<Vec<String>> {
+    if !base.exists() {
+        return Ok(vec![]);
+    }
+    let mut names = Vec::new();
+    for dent in std::fs::read_dir(base)? {
+        let dent = dent?;
+        let name = dent.file_name().to_string_lossy().into_owned();
+        if layout::sanitize_component(&name) != name {
+            continue;
+        }
+        let meta = match std::fs::symlink_metadata(dent.path()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        names.push(name);
+    }
+    Ok(names)
 }
 
 /// Ids that some newer entry revises, i.e. facts with a newer version.
@@ -626,5 +637,44 @@ mod tests {
         assert_eq!(scoped.journal_entries, 1);
         let other = g.stats(Some("nobody")).unwrap();
         assert_eq!(other.journal_entries, 0);
+    }
+
+    #[test]
+    fn stats_stale_excludes_rolled_back_and_superseded_is_codex_only() {
+        let (_d, g) = gng();
+        let now = chrono::Utc::now();
+        let codex = g.codex().unwrap();
+
+        let mut old = Entry::new("a", EntryKind::Decision, "old unverified checkout fact");
+        old.timestamp = now - chrono::Duration::days(31);
+        codex.create(&old).unwrap();
+
+        let mut ancient = Entry::new("a", EntryKind::Decision, "ancient rolled back fact");
+        ancient.timestamp = now - chrono::Duration::days(40);
+        ancient.mark_rolled_back("ops");
+        codex.create(&ancient).unwrap();
+
+        let v1 = Entry::new("a", EntryKind::Decision, "codex chain tail");
+        codex.create(&v1).unwrap();
+        let mut v2 = Entry::new("a", EntryKind::Decision, "codex chain head");
+        v2.revises = Some(v1.id);
+        codex.create(&v2).unwrap();
+
+        let journal = g.journal("builder").unwrap();
+        let j1 = Entry::new("builder", EntryKind::Observation, "journal tail");
+        journal.create(&j1).unwrap();
+        let mut j2 = Entry::new("builder", EntryKind::Observation, "journal head");
+        j2.revises = Some(j1.id);
+        journal.create(&j2).unwrap();
+
+        let s = g.start_session("builder", "open work");
+        g.add_observation(&s, "scratch note about checkout")
+            .unwrap();
+
+        let st = g.stats(None).unwrap();
+        assert_eq!(st.stale_over_30d, 1);
+        assert_eq!(st.superseded, 1);
+        assert_eq!(st.scratch_sessions, 1);
+        assert_eq!(st.rolled_back, 1);
     }
 }

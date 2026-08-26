@@ -21,6 +21,21 @@ use crate::{Error, Gungnir, Result};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+enum LayerSel {
+    Codex,
+    Journal,
+}
+
+fn parse_layer(raw: Option<&str>) -> Result<LayerSel> {
+    match raw {
+        None | Some("codex") => Ok(LayerSel::Codex),
+        Some("journal") => Ok(LayerSel::Journal),
+        Some(other) => Err(Error::Invalid(format!(
+            "unknown layer '{other}' (codex|journal)"
+        ))),
+    }
+}
+
 /// Open sessions by id, so agents only pass a session handle between calls.
 pub struct Server {
     g: Gungnir,
@@ -194,8 +209,8 @@ impl Server {
             "recall" => {
                 let query = arg("query").ok_or_else(|| Error::Invalid("query required".into()))?;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-                let hits = match arg("layer") {
-                    Some("journal") => {
+                let hits = match parse_layer(arg("layer"))? {
+                    LayerSel::Journal => {
                         let agent = arg("agent").ok_or_else(|| {
                             Error::Invalid("agent required for journal recall".into())
                         })?;
@@ -204,7 +219,7 @@ impl Server {
                             &Query::new(query, limit),
                         )?
                     }
-                    _ => self
+                    LayerSel::Codex => self
                         .g
                         .recall_layer(crate::gungnir::Layer::Codex, &Query::new(query, limit))?,
                 };
@@ -286,14 +301,14 @@ impl Server {
                             .join("\n")
                     }
                 };
-                match arg("layer") {
-                    Some("journal") => {
+                match parse_layer(arg("layer"))? {
+                    LayerSel::Journal => {
                         let agent = arg("agent").ok_or_else(|| {
                             Error::Invalid("agent required for journal list".into())
                         })?;
                         Ok(render(self.g.journal(agent)?.entries()?))
                     }
-                    _ => Ok(render(self.g.codex()?.entries()?)),
+                    LayerSel::Codex => Ok(render(self.g.codex()?.entries()?)),
                 }
             }
             "get" => {
@@ -510,5 +525,76 @@ mod tests {
             Gungnir::open(dir.path()).unwrap(),
         );
         assert_eq!(msgs[0]["result"]["isError"], true);
+    }
+
+    #[test]
+    fn promote_rejects_bad_id_and_missing_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gungnir::open(dir.path()).unwrap();
+        let msgs = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"promote","arguments":{"from":"nope","agent":"a","summary":"x"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"promote","arguments":{"from":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"a"}}}"#,
+                "\n"
+            ),
+            g,
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("bad id"));
+        assert_eq!(msgs[1]["result"]["isError"], true);
+        assert!(msgs[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("summary required"));
+    }
+
+    #[test]
+    fn list_journal_requires_agent_and_unknown_layer_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gungnir::open(dir.path()).unwrap();
+        let msgs = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list","arguments":{"layer":"journal"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list","arguments":{"layer":"scratch"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"query":"x","layer":"nope"}}}"#,
+                "\n"
+            ),
+            g,
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("agent required"));
+        assert_eq!(msgs[1]["result"]["isError"], true);
+        assert!(msgs[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown layer"));
+        assert_eq!(msgs[2]["result"]["isError"], true);
+        assert!(msgs[2]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown layer"));
+    }
+
+    #[test]
+    fn supersede_unknown_id_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"supersede","arguments":{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"a","summary":"x"}}}"#,
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not found"));
     }
 }

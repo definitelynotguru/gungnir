@@ -196,6 +196,26 @@ mod tests {
     }
 
     #[test]
+    fn abstention_still_fires_when_unverified_hits_exist() {
+        let e = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "maybe the cache is the problem",
+        );
+        let mut i = input();
+        i.codex_hits = vec![Hit {
+            entry: e,
+            score: 1.0,
+        }];
+        i.codex_coverage.unverified = 1;
+        let b = compile(i);
+        assert!(b
+            .markdown
+            .contains("No verified knowledge covers this task"));
+        assert!(b.markdown.contains("1 unverified"));
+    }
+
+    #[test]
     fn excerpt_surfaces_transcript_detail() {
         let mut e = Entry::new("a", EntryKind::Session, "cache helped");
         e.body = "# Task\nfix slow checkout\n\n# Transcript\n- attempt: added checkout cache [succeeded]\n".to_string();
