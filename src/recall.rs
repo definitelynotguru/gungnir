@@ -11,7 +11,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::entry::{Entry, VerificationState};
+use crate::entry::{Entry, EntryKind, VerificationState};
 use crate::{Result, Store};
 
 #[derive(Clone, Debug)]
@@ -185,8 +185,9 @@ pub fn search_with_coverage(store: &Store, query: &Query) -> Result<SearchOutcom
         }
         let state = state_at(&entry, query.as_of);
         // A rolled-back head must not hide its predecessor. Current view
-        // should fall back to the last live revision.
-        if query.current_only && state != StateAt::RolledBack {
+        // should fall back to the last live revision. A rollback record's
+        // `revises` marks the ancestor it restores, so it is not a revision.
+        if query.current_only && state != StateAt::RolledBack && entry.kind != EntryKind::Rollback {
             if let Some(prev) = entry.revises {
                 revised.insert(prev);
             }

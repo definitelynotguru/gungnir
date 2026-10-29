@@ -273,3 +273,50 @@ fn as_of_plus_current_keeps_tail_when_later_revisions_are_in_the_future() {
     assert_eq!(mid.hits.len(), 1);
     assert_eq!(mid.hits[0].entry.summary, "sessions use mysql");
 }
+
+#[test]
+fn rollback_restores_ancestor_without_superseding_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+
+    // v1 verified, superseded by v2, then v2 rolled back. The rollback
+    // record's `revises` points at v1 to restore it — it must not count
+    // as another revision superseding v1.
+    let mut v1 = Entry::new("a", EntryKind::Decision, "sessions use mysql");
+    v1.verify("human", None);
+    codex.create(&v1).unwrap();
+    let v2 = g
+        .supersede(v1.id, "a", "sessions use postgres", "migration done")
+        .unwrap();
+    g.rollback(v2, "a").unwrap();
+
+    // Current view falls back to v1, the last live revision, and hides
+    // the rolled-back v2.
+    let out = g
+        .search_layer(
+            gungnir::Layer::Codex,
+            &Query::new("sessions use", 10).current(),
+        )
+        .unwrap();
+    assert_eq!(out.hits.len(), 1);
+    assert_eq!(out.hits[0].entry.summary, "sessions use mysql");
+    assert_eq!(out.coverage.hidden_superseded, 0);
+    assert_eq!(out.coverage.hidden_rolled_back, 1);
+
+    // Nothing is superseded: not in the id set, not in brief labels,
+    // not in stats.
+    assert!(!gungnir::gungnir::superseded_ids(&codex)
+        .unwrap()
+        .contains(&v1.id));
+
+    let b = g.brief("a", "sessions use", 8).unwrap();
+    assert!(
+        b.markdown.contains("- [verified] sessions use mysql"),
+        "{}",
+        b.markdown
+    );
+
+    let stats = g.stats(None).unwrap();
+    assert_eq!(stats.superseded, 0);
+}

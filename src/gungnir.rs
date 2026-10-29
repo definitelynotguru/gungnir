@@ -319,6 +319,7 @@ impl Gungnir {
         r.codex_entries = codex_entries.len();
         r.superseded = codex_entries
             .iter()
+            .filter(supersedes)
             .filter_map(|e| e.revises)
             .collect::<HashSet<_>>()
             .len();
@@ -451,11 +452,21 @@ fn layer_child_names(base: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Ids that some newer entry revises, i.e. facts with a newer version.
+/// Whether `e` is a live revision whose `revises` link supersedes its
+/// target. A rollback record's `revises` points at the ancestor it
+/// restores — it revives that fact, not replaces it — and a rolled-back
+/// revision no longer stands, so neither hides its predecessor.
+fn supersedes(e: &&Entry) -> bool {
+    e.kind != EntryKind::Rollback && e.verification != VerificationState::RolledBack
+}
+
+/// Ids that some newer live entry revises, i.e. facts with a newer
+/// version still in force.
 pub fn superseded_ids(store: &Store) -> Result<HashSet<EntryId>> {
     Ok(store
         .entries()?
-        .into_iter()
+        .iter()
+        .filter(supersedes)
         .filter_map(|e| e.revises)
         .collect())
 }
