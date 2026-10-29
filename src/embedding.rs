@@ -134,11 +134,7 @@ pub fn rrf_fuse(rankings: &[Vec<usize>], pool_size: usize, k: f64) -> Vec<(usize
 
 /// Hybrid search: keyword ranking fused with embedding ranking via RRF.
 /// Entries with no vector (empty body and summary) fall back to keyword-only.
-pub fn hybrid_search(
-    store: &Store,
-    query: &Query,
-    embedder: &dyn Embedder,
-) -> Result<Vec<Hit>> {
+pub fn hybrid_search(store: &Store, query: &Query, embedder: &dyn Embedder) -> Result<Vec<Hit>> {
     let entries = store.entries()?;
     let visible: Vec<&Entry> = entries
         .iter()
@@ -152,10 +148,7 @@ pub fn hybrid_search(
         t.dedup();
         t
     };
-    let kw_scores: Vec<f64> = visible
-        .iter()
-        .map(|e| recall::score(e, &qtokens))
-        .collect();
+    let kw_scores: Vec<f64> = visible.iter().map(|e| recall::score(e, &qtokens)).collect();
     let mut kw_rank: Vec<usize> = (0..visible.len()).collect();
     kw_rank.sort_by(|a, b| kw_scores[*b].total_cmp(&kw_scores[*a]));
 
@@ -214,7 +207,11 @@ mod tests {
                     FAKE_TOKENS
                         .iter()
                         .map(|tok| {
-                            if t.to_lowercase().contains(tok) { 1.0 } else { 0.0 }
+                            if t.to_lowercase().contains(tok) {
+                                1.0
+                            } else {
+                                0.0
+                            }
                         })
                         .collect()
                 })
@@ -239,13 +236,19 @@ mod tests {
     #[test]
     fn cache_hits_avoid_embedder_calls() {
         let dir = tempfile::tempdir().unwrap();
-        let fake = Fake { calls: Mutex::new(0) };
+        let fake = Fake {
+            calls: Mutex::new(0),
+        };
         let cached = CachedEmbedder::new(fake, dir.path());
 
         let v1 = cached.embed(&["postgres index".into()]).unwrap();
         let v2 = cached.embed(&["postgres   INDEX".into()]).unwrap(); // normalized equal
         assert_eq!(v1, v2);
-        assert_eq!(*cached.inner.calls.lock().unwrap(), 1, "second call served from cache");
+        assert_eq!(
+            *cached.inner.calls.lock().unwrap(),
+            1,
+            "second call served from cache"
+        );
 
         // Cache file exists under model partition with content-derived name.
         let files: Vec<_> = walkdir::WalkDir::new(dir.path().join(".cache"))
@@ -270,14 +273,11 @@ mod tests {
         store.create(&match_both).unwrap();
         store.create(&silent).unwrap();
 
-        let fake = Fake { calls: Mutex::new(0) };
+        let fake = Fake {
+            calls: Mutex::new(0),
+        };
         let embedder = CachedEmbedder::new(fake, dir.path());
-        let hits = hybrid_search(
-            &store,
-            &Query::new("postgres checkout", 10),
-            &embedder,
-        )
-        .unwrap();
+        let hits = hybrid_search(&store, &Query::new("postgres checkout", 10), &embedder).unwrap();
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry.summary, "postgres connection reuse");

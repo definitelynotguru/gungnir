@@ -75,13 +75,26 @@ Body: free-form markdown after the closing `---`.
 ## Recall
 
 Default mode: keyword scoring — token overlap across `summary` + body,
-case-folded, split on non-alphanumerics. Filtering happens before scoring.
-Sort key: `(verification_bucket, score)` where bucket orders
-verified > unverified > {contradicted, rolled_back}; contradicted and
-rolled_back are excluded unless explicitly requested.
+case-folded, split on non-alphanumerics; summary hits weigh double over body
+hits. Filtering happens before scoring. Sort key: `(verification_bucket,
+score)` where bucket orders verified > unverified > contradicted;
+rolled-back entries are always hidden.
 
-Hybrid mode (feature flag `embeddings`): fuse keyword ranks with embedding
-cosine ranks via reciprocal rank fusion (k = 60). Vector cache keyed by
+Temporal modes:
+
+- `as_of <instant>`: candidate pool limited to entries created at or before
+  the instant, and each entry's verification state evaluated from its
+  append-only verification log as it stood then.
+- `current_only`: every revises chain resolves to its head; superseded tails
+  and contradicted facts are excluded from hits and counted in coverage.
+
+Every search reports topic-scoped coverage counts (verified / unverified /
+contradicted, plus hidden superseded and rolled-back totals). Callers use
+coverage to abstain: when zero verified facts match a topic, briefings say
+"No verified knowledge covers this task" instead of staying silent.
+
+Hybrid mode (pluggable embedder): fuse keyword ranks with embedding cosine
+ranks via reciprocal rank fusion (k = 60). Vector cache keyed by
 `(model, sha256(normalized text))` — content-addressed, immune to mtime skew.
 
 ## Rollback (non-destructive)

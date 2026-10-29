@@ -52,8 +52,7 @@ impl Store {
         // ULID timestamp is ms since UNIX epoch — decode via datetime.
         let secs = (id.timestamp_ms() / 1000) as i64;
         let nanos = (id.timestamp_ms() % 1000) as u32 * 1_000_000;
-        let dt = DateTime::<Utc>::from_timestamp(secs, nanos)
-            .unwrap_or_else(Utc::now);
+        let dt = DateTime::<Utc>::from_timestamp(secs, nanos).unwrap_or_else(Utc::now);
         use chrono::Datelike;
         self.root
             .join(format!("{:04}", dt.year()))
@@ -137,9 +136,7 @@ impl Store {
             }
         }
         ids.sort();
-        ids.into_iter()
-            .map(|id| self.require(id))
-            .collect()
+        ids.into_iter().map(|id| self.require(id)).collect()
     }
 
     // -- internals ----------------------------------------------------------
@@ -151,8 +148,10 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
 
-        let mut frontmatter = serde_yaml::to_string(entry)
-            .map_err(|source| Error::Yaml { path: path.clone(), source })?;
+        let mut frontmatter = serde_yaml::to_string(entry).map_err(|source| Error::Yaml {
+            path: path.clone(),
+            source,
+        })?;
         // serde_yaml ends with "\n"; normalize to exactly one blank line
         // between frontmatter and body.
         while frontmatter.ends_with("\n\n") {
@@ -160,11 +159,7 @@ impl Store {
         }
         let file = format!("---\n{frontmatter}---\n\n{}\n", entry.body);
 
-        let tmp = path.with_file_name(format!(
-            "{TMP_PREFIX}{}-{}",
-            std::process::id(),
-            entry.id
-        ));
+        let tmp = path.with_file_name(format!("{TMP_PREFIX}{}-{}", std::process::id(), entry.id));
         {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(file.as_bytes())?;
@@ -222,8 +217,10 @@ fn parse_entry_file(path: &Path) -> Result<Entry> {
         .split_once("\n---\n")
         .ok_or_else(|| Error::Invalid(format!("{}: missing frontmatter closer", path.display())))?;
 
-    let mut entry: Entry = serde_yaml::from_str(yaml)
-        .map_err(|source| Error::Yaml { path: path.into(), source })?;
+    let mut entry: Entry = serde_yaml::from_str(yaml).map_err(|source| Error::Yaml {
+        path: path.into(),
+        source,
+    })?;
     entry.body = body.trim_start_matches('\n').trim_end().to_string();
     Ok(entry)
 }

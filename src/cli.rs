@@ -32,13 +32,19 @@ enum Cmd {
 
     /// Add an entry to a persistent layer.
     Add {
-        #[arg(long)] agent: String,
-        #[arg(long)] kind: EntryKind,
-        #[arg(long)] summary: String,
-        #[arg(long, default_value = "")] body: String,
-        #[arg(long)] project: Option<String>,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        kind: EntryKind,
+        #[arg(long)]
+        summary: String,
+        #[arg(long, default_value = "")]
+        body: String,
+        #[arg(long)]
+        project: Option<String>,
         /// Target layer: codex (default) or journal
-        #[arg(long, default_value = "codex")] into: String,
+        #[arg(long, default_value = "codex")]
+        into: String,
     },
 
     /// Show one entry from any layer.
@@ -46,59 +52,90 @@ enum Cmd {
 
     /// List entries in a layer.
     Ls {
-        #[arg(long, default_value = "codex")] layer: String,
-        #[arg(long)] agent: Option<String>,
+        #[arg(long, default_value = "codex")]
+        layer: String,
+        #[arg(long)]
+        agent: Option<String>,
     },
 
     /// Keyword recall within a layer.
     Recall {
         query: String,
-        #[arg(long, default_value = "codex")] layer: String,
-        #[arg(long)] agent: Option<String>,
-        #[arg(long, default_value_t = 10)] limit: usize,
+        #[arg(long, default_value = "codex")]
+        layer: String,
+        #[arg(long)]
+        agent: Option<String>,
+        /// Resolve supersession chains to heads; drop contradicted facts.
+        #[arg(long)]
+        current: bool,
+        /// Evaluate facts as they stood at this instant (RFC3339).
+        #[arg(long)]
+        as_of: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
     },
 
     /// Mark an entry verified.
     Verify {
         id: EntryId,
-        #[arg(long, default_value = "human")] verifier: String,
-        #[arg(long)] note: Option<String>,
+        #[arg(long, default_value = "human")]
+        verifier: String,
+        #[arg(long)]
+        note: Option<String>,
     },
 
     /// Write a revision of an entry (supersession chain).
     Supersede {
         id: EntryId,
-        #[arg(long)] agent: String,
-        #[arg(long)] summary: String,
-        #[arg(long, default_value = "")] body: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long, default_value = "")]
+        body: String,
     },
 
     /// Non-destructive rollback to the first verified ancestor.
     Rollback {
         id: EntryId,
-        #[arg(long)] agent: String,
+        #[arg(long)]
+        agent: String,
     },
 
     /// Copy a finding into the Codex with provenance linked to `from`.
     Promote {
         from: EntryId,
-        #[arg(long)] agent: String,
-        #[arg(long, default_value = "decision")] kind: EntryKind,
-        #[arg(long)] summary: String,
-        #[arg(long, default_value = "")] body: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long, default_value = "decision")]
+        kind: EntryKind,
+        #[arg(long)]
+        summary: String,
+        #[arg(long, default_value = "")]
+        body: String,
     },
 
     /// Compile the pre-task briefing for an agent.
     Brief {
-        #[arg(long)] agent: String,
+        #[arg(long)]
+        agent: String,
         task: String,
-        #[arg(long, default_value_t = 8)] limit: usize,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
     },
 
     /// Working-session lifecycle.
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,
+    },
+
+    /// Memory health summary.
+    Stats {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run the MCP server on stdio (for Claude Code, Cursor, etc.).
@@ -109,28 +146,34 @@ enum Cmd {
 enum SessionCmd {
     /// Begin a working session; prints its id.
     Start {
-        #[arg(long)] agent: String,
+        #[arg(long)]
+        agent: String,
         task: String,
     },
     /// Record an observation into the session's scratch.
     Obs {
         session_id: String,
-        #[arg(long)] agent: String,
+        #[arg(long)]
+        agent: String,
         text: String,
     },
     /// Record an attempt (and whether it worked) into scratch.
     Attempt {
         session_id: String,
-        #[arg(long)] agent: String,
+        #[arg(long)]
+        agent: String,
         text: String,
-        #[arg(long = "ok")] succeeded: bool,
+        #[arg(long = "ok")]
+        succeeded: bool,
     },
     /// Archive scratch into the Journal and clear it.
     End {
         /// Session id printed by `session start`.
         session_id: String,
-        #[arg(long)] agent: String,
-        #[arg(long)] summary: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        summary: String,
     },
 }
 
@@ -143,6 +186,12 @@ pub fn run_from_env() -> i32 {
             1
         }
     }
+}
+
+fn parse_as_of(raw: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .map_err(|e| Error::Invalid(format!("bad --as-of: {e}")))
 }
 
 fn gng(root: &Option<PathBuf>) -> Result<Gungnir> {
@@ -162,11 +211,7 @@ fn session_handle(id: String, agent: String) -> crate::Session {
 }
 
 fn layer_of(name: &str) -> Result<&'static str> {
-    match name {
-        "codex" => Ok(crate::layout::CODEX),
-        "journal" => Ok(crate::layout::JOURNAL),
-        other => Err(Error::Invalid(format!("unknown layer '{other}' (codex|journal)"))),
-    }
+    layout::parse_layer_name(Some(name)).map_err(Error::Invalid)
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
@@ -175,7 +220,14 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.cmd {
         C::Init => println!("initialized {}", g.root().display()),
 
-        C::Add { agent, kind, summary, body, project, into } => {
+        C::Add {
+            agent,
+            kind,
+            summary,
+            body,
+            project,
+            into,
+        } => {
             let mut e = crate::Entry::new(&agent, kind, summary);
             e.body = body;
             e.project_id = project;
@@ -201,9 +253,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             let entries = match layer_of(&layer)? {
                 crate::layout::CODEX => g.codex()?.entries()?,
                 _ => {
-                    let a = agent.as_deref().ok_or_else(|| {
-                        Error::Invalid("ls journal requires --agent".into())
-                    })?;
+                    let a = agent
+                        .as_deref()
+                        .ok_or_else(|| Error::Invalid("ls journal requires --agent".into()))?;
                     g.journal(a)?.entries()?
                 }
             };
@@ -212,18 +264,44 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         }
 
-        C::Recall { query, layer, agent, limit } => {
-            let hits = match layer_of(&layer)? {
-                crate::layout::CODEX => g.recall_layer(crate::gungnir::Layer::Codex, &Query::new(&query, limit))?,
+        C::Recall {
+            query,
+            layer,
+            agent,
+            current,
+            as_of,
+            limit,
+        } => {
+            let mut q = Query::new(&query, limit);
+            if current {
+                q = q.current();
+            }
+            if let Some(raw) = as_of {
+                q = q.as_of(parse_as_of(&raw)?);
+            }
+            let out = match layer_of(&layer)? {
+                crate::layout::CODEX => g.search_layer(crate::gungnir::Layer::Codex, &q)?,
                 _ => {
-                    let a = agent.as_deref().ok_or_else(|| {
-                        Error::Invalid("recall journal requires --agent".into())
-                    })?;
-                    g.recall_layer(crate::gungnir::Layer::Journal { agent: a }, &Query::new(&query, limit))?
+                    let a = agent
+                        .as_deref()
+                        .ok_or_else(|| Error::Invalid("recall journal requires --agent".into()))?;
+                    g.search_layer(crate::gungnir::Layer::Journal { agent: a }, &q)?
                 }
             };
-            for h in hits {
+            for h in &out.hits {
                 println!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary);
+            }
+            if out.hits.is_empty() && out.coverage.total_visible() == 0 {
+                println!("(no knowledge covers this topic)");
+            } else {
+                println!(
+                    "coverage: {} verified, {} unverified, {} contradicted ({} superseded, {} rolled back hidden)",
+                    out.coverage.verified,
+                    out.coverage.unverified,
+                    out.coverage.contradicted,
+                    out.coverage.hidden_superseded,
+                    out.coverage.hidden_rolled_back
+                );
             }
         }
 
@@ -232,7 +310,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             println!("verified {id}");
         }
 
-        C::Supersede { id, agent, summary, body } => {
+        C::Supersede {
+            id,
+            agent,
+            summary,
+            body,
+        } => {
             let new_id = g.supersede(id, &agent, summary, body)?;
             println!("{new_id}");
         }
@@ -242,7 +325,13 @@ fn dispatch(cli: Cli) -> Result<()> {
             println!("rollback entry: {rb}");
         }
 
-        C::Promote { from, agent, kind, summary, body } => {
+        C::Promote {
+            from,
+            agent,
+            kind,
+            summary,
+            body,
+        } => {
             let id = g.promote(from, &agent, kind, summary, body)?;
             println!("{id}");
         }
@@ -250,6 +339,24 @@ fn dispatch(cli: Cli) -> Result<()> {
         C::Brief { agent, task, limit } => {
             let b = g.brief(&agent, &task, limit)?;
             print!("{}", b.markdown);
+        }
+
+        C::Stats { agent, json } => {
+            let r = g.stats(agent.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("codex entries      {}", r.codex_entries);
+                println!("journal entries    {}", r.journal_entries);
+                println!("scratch sessions   {}", r.scratch_sessions);
+                println!("verified           {}", r.verified);
+                println!("unverified         {}", r.unverified);
+                println!("contradicted       {}", r.contradicted);
+                println!("rolled back        {}", r.rolled_back);
+                println!("superseded         {}", r.superseded);
+                println!("stale (>30d)       {}", r.stale_over_30d);
+                println!("verification rate  {:.0}%", r.verification_rate * 100.0);
+            }
         }
 
         C::Mcp => {
@@ -264,17 +371,30 @@ fn dispatch(cli: Cli) -> Result<()> {
                 let s = g.start_session(agent, task);
                 println!("{}", s.id);
             }
-            SessionCmd::Obs { session_id, agent, text } => {
+            SessionCmd::Obs {
+                session_id,
+                agent,
+                text,
+            } => {
                 let s = session_handle(session_id, agent);
                 let id = g.add_observation(&s, text)?;
                 println!("{id}");
             }
-            SessionCmd::Attempt { session_id, agent, text, succeeded } => {
+            SessionCmd::Attempt {
+                session_id,
+                agent,
+                text,
+                succeeded,
+            } => {
                 let s = session_handle(session_id, agent);
                 let id = g.add_attempt(&s, text, succeeded)?;
                 println!("{id}");
             }
-            SessionCmd::End { session_id, agent, summary } => {
+            SessionCmd::End {
+                session_id,
+                agent,
+                summary,
+            } => {
                 let s = session_handle(session_id, agent);
                 let report = g.end_session(&s, summary, vec![])?;
                 println!("archived {}", report.journal_id);
@@ -282,4 +402,37 @@ fn dispatch(cli: Cli) -> Result<()> {
         },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn as_of_rejects_garbage_and_accepts_rfc3339() {
+        let err = parse_as_of("not-rfc3339").unwrap_err().to_string();
+        assert!(err.contains("bad --as-of"), "{err}");
+        assert!(parse_as_of("2026-08-01T00:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn clap_accepts_current_and_as_of_together() {
+        let cli = Cli::try_parse_from([
+            "gungnir",
+            "recall",
+            "checkout",
+            "--current",
+            "--as-of",
+            "2026-08-01T00:00:00Z",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Recall { current, as_of, .. } => {
+                assert!(current);
+                assert_eq!(as_of.as_deref(), Some("2026-08-01T00:00:00Z"));
+            }
+            _ => panic!("expected Recall"),
+        }
+    }
 }

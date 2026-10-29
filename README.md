@@ -44,11 +44,20 @@ CID=$(gungnir promote ${JID%.md} --agent builder --kind decision \
 
 # Mark it verified once a human confirms.
 gungnir verify $CID --verifier team-review --note "confirmed in PR 42"
+
+# What do we believe right now, and how healthy is the memory?
+gungnir recall "checkout" --current
+gungnir stats
 ```
 
 The next agent that runs `session start` on a related task gets that fact in
-its briefing, tagged `[verified]`. Failed attempts stay private to the agent
-that tried them.
+its briefing, tagged `[verified]`, with a coverage line confirming verified
+knowledge exists. Failed attempts stay private to the agent that tried them.
+Point-in-time questions work too:
+
+```bash
+gungnir recall "deploys" --as-of 2026-08-01T00:00:00Z
+```
 
 ## How it works
 
@@ -77,8 +86,12 @@ Key behaviors:
   rollback entry. No file is ever deleted.
 - **Recall you can reason about.** Keyword scoring over summary (2x) and body,
   ordered by verification bucket: verified > unverified > contradicted;
-  rolled-back entries hidden. Hybrid vector+keyword fusion via reciprocal rank
-  fusion is available by plugging in an embedder (`src/embedding.rs`).
+  rolled-back entries hidden. `--current` resolves supersession chains to
+  their heads and drops contradicted facts. `--as-of <RFC3339>` evaluates
+  history from the verification log, no schema change required. Every search
+  reports coverage, and briefings say plainly when no verified knowledge
+  covers a task. Hybrid vector+keyword fusion via reciprocal rank fusion is
+  available by plugging in an embedder (`src/embedding.rs`).
 
 ## Library
 
@@ -124,7 +137,8 @@ Protocol:
 ```
 
 Tools: `start_session`, `add_observation`, `add_attempt`, `end_session`,
-`recall`, `brief`, `verify`, `get`.
+`recall`, `brief`, `verify`, `promote`, `supersede`, `rollback`, `list`,
+`get`. Agents drive the full correction lifecycle over the wire.
 
 ## Design notes
 
@@ -143,13 +157,15 @@ Tools: `start_session`, `add_observation`, `add_attempt`, `end_session`,
 | [docs/DESIGN.md](docs/DESIGN.md)  | Why it is built this way                        |
 | [docs/PROVENANCE.md](docs/PROVENANCE.md) | Evidence, verification, supersession, trust boundaries |
 | [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) | Claude Code / Cursor / Cline setup, library usage, embeddings |
+| [docs/EXTRACTION-THREAT-MODEL.md](docs/EXTRACTION-THREAT-MODEL.md) | Design gate for future auto-extraction |
 | [CHANGELOG.md](CHANGELOG.md)      | Release history                                 |
 | [examples/quickstart.rs](examples/quickstart.rs) | Runnable end-to-end tour          |
 
 ## Status
 
-Early but tested: 48 tests including an MCP subprocess handshake against the
-real binary. API may still move before 1.0. See
+Early but tested: 59 tests including a 16-check accuracy bench across five
+abilities and an MCP subprocess handshake driving the full correction
+lifecycle against the real binary. API may still move before 1.0. See
 [CHANGELOG.md](CHANGELOG.md) for what shipped and when.
 
 ## License

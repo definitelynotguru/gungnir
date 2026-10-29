@@ -8,7 +8,8 @@ is safe; every write goes through the same validation and locking.
 
 The server speaks newline-delimited JSON-RPC over stdio per the Model Context
 Protocol. Tools: `start_session`, `add_observation`, `add_attempt`,
-`end_session`, `recall`, `brief`, `verify`, `get`.
+`end_session`, `recall`, `brief`, `verify`, `promote`, `supersede`,
+`rollback`, `list`, `get`.
 
 Build first:
 
@@ -47,12 +48,14 @@ Recommended agent workflow once connected:
 
 1. Call `start_session` with your agent name and task. The result carries a
    session id plus a briefing of relevant Codex facts and your own prior
-   attempts.
+   attempts, with a coverage line saying whether verified knowledge exists.
 2. Record observations and attempts as you work.
 3. Call `end_session` with a one-line summary when done. Scratch clears,
    the transcript archives to your private journal.
-4. When a finding deserves sharing, promote it through the CLI (below) so it
-   lands in the Codex with provenance linked to its journal source.
+4. When a finding deserves sharing, call `promote` so it lands in the Codex
+   with provenance linked to its journal source.
+5. When a shared fact turns out wrong or outdated, call `supersede` (new
+   generation) or `rollback` (restore the last verified ancestor).
 
 ## CLI
 

@@ -4,7 +4,7 @@
 //! so the same rules govern single-store writes and cross-layer writes
 //! (e.g. Codex evidence pointing at a Journal archive entry).
 
-use crate::entry::{Evidence, EntryKind, VerificationState};
+use crate::entry::{EntryKind, Evidence, VerificationState};
 use crate::{Entry, EntryId, Result};
 
 pub const MAX_SUMMARY_LEN: usize = 200;
@@ -28,7 +28,9 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>) -> Result<()> {
     }
 
     if entry.kind == EntryKind::Review && entry.review_of.is_none() {
-        return Err(crate::Error::Invalid("review entries require review_of".into()));
+        return Err(crate::Error::Invalid(
+            "review entries require review_of".into(),
+        ));
     }
 
     if let VerificationState::Contradicted { by } = entry.verification {

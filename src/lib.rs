@@ -22,10 +22,10 @@ pub mod rollback;
 pub mod store;
 pub mod validate;
 
-pub use briefing::Briefing;
+pub use briefing::{Briefing, BriefingInput};
 pub use entry::{Entry, EntryKind, Evidence, Status, VerificationRecord, VerificationState};
 pub use error::{Error, Result};
-pub use gungnir::{Gungnir, Promotion, Session};
+pub use gungnir::{Gungnir, Layer, Promotion, Session, StatsReport};
 pub use id::EntryId;
-pub use recall::{Hit, Query};
+pub use recall::{Coverage, Hit, Query, SearchOutcome};
 pub use store::Store;
