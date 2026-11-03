@@ -143,3 +143,32 @@ fn update_rejects_newly_introduced_dangling_reference() {
     // A reference already present on the stored entry still writes through.
     store.update(&e).unwrap();
 }
+
+#[test]
+fn update_rejects_newly_introduced_dangling_wikilink() {
+    // The delta rule covers every reference kind, not just evidence refs:
+    // a fresh [[id]] body link to nothing must fail update the same way.
+    let (_d, store) = setup();
+    let e = Entry::new("a", EntryKind::Decision, "plain decision");
+    store.create(&e).unwrap();
+
+    let mut edited = store.require(e.id).unwrap();
+    edited.body = format!("builds on [[{}]]", gungnir::EntryId::generate());
+    assert!(matches!(
+        store.update(&edited),
+        Err(gungnir::Error::Invalid(_))
+    ));
+
+    // And a fresh review_of pointing at nothing fails too.
+    let mut edited = store.require(e.id).unwrap();
+    edited.review_of = Some(gungnir::EntryId::generate());
+    assert!(matches!(
+        store.update(&edited),
+        Err(gungnir::Error::Invalid(_))
+    ));
+
+    // The stored entry is untouched by the rejected edits.
+    let stored = store.require(e.id).unwrap();
+    assert!(stored.body.is_empty());
+    assert!(stored.review_of.is_none());
+}

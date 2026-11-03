@@ -236,7 +236,14 @@ pub fn format_report(r: &EntryReport, since: Option<DateTime<Utc>>) -> String {
 
     let mentions = r.entry.entity_mentions();
     if !mentions.is_empty() {
-        out.push_str(&format!("\nentities  {}\n", mentions.join(", ")));
+        out.push_str(&format!(
+            "\nentities  {}\n",
+            mentions
+                .iter()
+                .map(|m| one_line(m))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     let links = r.entry.wikilink_ids();
     if !links.is_empty() {
@@ -405,7 +412,10 @@ pub struct Snapshot {
 /// Ids hidden by a live, non-rollback successor at `as_of` (None = now).
 /// Same rule `current_only` applies: a rolled-back head reveals its tail,
 /// and a rollback record's revises pointer restores, not replaces.
-fn superseded_ids(entries: &[Located], as_of: Option<DateTime<Utc>>) -> HashMap<EntryId, EntryId> {
+pub fn superseded_ids(
+    entries: &[Located],
+    as_of: Option<DateTime<Utc>>,
+) -> HashMap<EntryId, EntryId> {
     let mut latest: HashMap<EntryId, Entry> = HashMap::new();
     for l in entries {
         if let Some(t) = as_of {
@@ -669,6 +679,9 @@ pub fn format_blame(r: &EntryReport) -> String {
         None if matches!(e.verification, VerificationState::RolledBack) => {
             out.push_str("replaced by: nothing — retracted\n")
         }
+        None if matches!(e.verification, VerificationState::Contradicted { .. }) => {
+            out.push_str("replaced by: nothing — contradicted\n")
+        }
         None => out.push_str("replaced by: nothing — still current\n"),
     }
 
@@ -698,7 +711,14 @@ pub fn format_blame(r: &EntryReport) -> String {
 
     let mentions = e.entity_mentions();
     if !mentions.is_empty() {
-        out.push_str(&format!("entities: {}\n", mentions.join(", ")));
+        out.push_str(&format!(
+            "entities: {}\n",
+            mentions
+                .iter()
+                .map(|m| one_line(m))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     out
 }
@@ -828,7 +848,7 @@ pub fn format_entities(all: &[Located], name: Option<&str>) -> String {
             }
             let mut out = String::new();
             for (name, n) in counts {
-                out.push_str(&format!("{name}\t{n}\n"));
+                out.push_str(&format!("{}\t{n}\n", one_line(&name)));
             }
             out
         }

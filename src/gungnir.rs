@@ -622,6 +622,7 @@ impl Gungnir {
 
         let scratch_ids: std::collections::HashSet<EntryId> =
             scan.entries.iter().map(|e| e.id).collect();
+        let resolves = |id: EntryId| self.exists_anywhere(id).unwrap_or(false);
         let mut transcript = String::new();
         for e in &scan.entries {
             // Prefer the structured field; fall back to the legacy
@@ -642,7 +643,7 @@ impl Gungnir {
             transcript.push_str(&format!(
                 "- {}: {}{}\n",
                 e.kind,
-                demote_scratch_links(&e.summary, &scratch_ids),
+                demote_scratch_links(&e.summary, &scratch_ids, &resolves),
                 outcome
             ));
         }
@@ -669,12 +670,12 @@ impl Gungnir {
         let mut journal_entry = Entry::new(
             &session.agent,
             EntryKind::Session,
-            demote_scratch_links(summary, &scratch_ids),
+            demote_scratch_links(summary, &scratch_ids, &resolves),
         );
         journal_entry.session_id = Some(session.id.clone());
         journal_entry.body = format!(
             "# Task\n{}\n\n# Transcript\n{}",
-            demote_scratch_links(&task, &scratch_ids),
+            demote_scratch_links(&task, &scratch_ids, &resolves),
             transcript
         );
         let journal_store = self.journal(&session.agent)?;
@@ -849,12 +850,27 @@ impl Gungnir {
                 open_conflicts += 1;
             }
         }
+
+        // The `[superseded]` tags must agree with the hits' as_of state:
+        // audit's rule hides a tail only while its successor was live at
+        // the queried instant, where the now-state helper would tag a fact
+        // superseded before its revision existed.
+        let codex_superseded =
+            crate::audit::superseded_ids(&located("codex", codex.entries()?), q.as_of)
+                .into_keys()
+                .collect();
+        let journal_superseded = crate::audit::superseded_ids(
+            &located(&format!("journal/{agent}"), journal.entries()?),
+            q.as_of,
+        )
+        .into_keys()
+        .collect();
         Ok(briefing::compile(BriefingInput {
             task: q.text.clone(),
             codex_hits: codex_out.hits,
             journal_hits: journal_out.hits,
-            codex_superseded: superseded_ids(&codex)?,
-            journal_superseded: superseded_ids(&journal)?,
+            codex_superseded,
+            journal_superseded,
             codex_coverage: codex_out.coverage,
             journal_coverage: journal_out.coverage,
             codex_skipped: codex_out.skipped,
@@ -1187,7 +1203,13 @@ impl Gungnir {
         let prev = store.require(old)?;
         let mut next = Entry::new(agent, prev.kind, summary);
         next.revises = Some(old);
-        next.project_id = prev.project_id.clone();
+        // A project stored before the single-line rule can't reach the new
+        // revision verbatim — create rejects it — so it normalizes the way
+        // rollback::apply does.
+        next.project_id = prev
+            .project_id
+            .clone()
+            .map(|p| crate::validate::one_line(&p));
         next.session_id = prev.session_id.clone();
         next.review_of = prev.review_of;
         // Carry evidence forward — but only refs that still resolve. Stores
@@ -1579,10 +1601,29 @@ pub fn superseded_ids(store: &Store) -> Result<HashSet<EntryId>> {
         .collect())
 }
 
-/// Rewrite `[[id]]` links that point into `scratch_ids` as their bare id:
-/// a scratch target stops existing at session end, and a link that can only
-/// dangle reads better as plain text in the durable journal archive.
-fn demote_scratch_links(text: &str, scratch_ids: &std::collections::HashSet<EntryId>) -> String {
+/// Wrap bare entries in `Located` for audit helpers that ignore the
+/// partition field.
+fn located(partition: &str, entries: Vec<Entry>) -> Vec<crate::audit::Located> {
+    entries
+        .into_iter()
+        .map(|entry| crate::audit::Located {
+            partition: partition.to_string(),
+            entry,
+        })
+        .collect()
+}
+
+/// Rewrite `[[id]]` links as their bare id when the target cannot resolve in
+/// the archived store: this session's own scratch entries (which stop
+/// existing at session end) plus any id-shaped span `exists` says is absent
+/// (a teammate's entry, an id from another store, a doc example). A session
+/// task is captured verbatim at start, so a dangling `[[id]]` would
+/// otherwise brick `end_session`'s journal write on every retry.
+fn demote_scratch_links(
+    text: &str,
+    scratch_ids: &std::collections::HashSet<EntryId>,
+    exists: &dyn Fn(EntryId) -> bool,
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find("[[") {
@@ -1591,11 +1632,11 @@ fn demote_scratch_links(text: &str, scratch_ids: &std::collections::HashSet<Entr
         match after_open[..line_end].find("]]") {
             Some(close) => {
                 let target = after_open[..close].trim();
-                if target
-                    .parse::<EntryId>()
-                    .ok()
-                    .is_some_and(|id| scratch_ids.contains(&id))
-                {
+                let demote = match target.parse::<EntryId>() {
+                    Ok(id) => scratch_ids.contains(&id) || !exists(id),
+                    Err(_) => false,
+                };
+                if demote {
                     out.push_str(&rest[..open]);
                     out.push_str(target);
                 } else {
@@ -1778,6 +1819,23 @@ mod tests {
             "{}",
             archived[0].body
         );
+    }
+
+    #[test]
+    fn end_session_demotes_dangling_foreign_id_links() {
+        // A task carrying an id-shaped span that resolves nowhere in this
+        // store (a teammate's entry, a doc example) must still archive —
+        // the link demotes to its bare id instead of bricking every retry.
+        let (_d, g) = gng();
+        let foreign = EntryId::generate().to_string();
+        let s = g.start_session("builder", &format!("port fix from [[ {foreign} ]]"));
+        g.add_observation(&s, "first observation").unwrap();
+        g.end_session(&s, "done", vec![]).unwrap();
+
+        let archived = g.journal("builder").unwrap().entries().unwrap();
+        let body = &archived[0].body;
+        assert!(!body.contains("]]"), "{body}");
+        assert!(body.contains(&foreign), "{body}");
     }
 
     #[test]

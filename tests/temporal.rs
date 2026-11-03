@@ -462,3 +462,30 @@ fn require_verified_as_of_reports_the_state_it_filtered_on() {
         gungnir::VerificationState::Contradicted { .. }
     ));
 }
+
+#[test]
+fn require_verified_current_abstains_on_superseded_verified_tail() {
+    // require_verified and current must filter the same pool: a verified
+    // tail hidden behind an unverified head yields no hits and an honest
+    // zero-coverage abstention, never a silent empty answer.
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+
+    let mut v1 = Entry::new("a", EntryKind::Decision, "sessions use postgres pooling");
+    v1.timestamp = h(1);
+    codex.create(&v1).unwrap();
+    g.verify(v1.id, "team", None).unwrap();
+    g.supersede(v1.id, "a", "sessions use redis pooling", "")
+        .unwrap();
+
+    let out = g
+        .search_layer(
+            gungnir::Layer::Codex,
+            &Query::new("sessions use", 10).current().require_verified(),
+        )
+        .unwrap();
+    assert!(out.hits.is_empty(), "{:?}", out.hits);
+    assert_eq!(out.coverage.verified, 0);
+    assert_eq!(out.coverage.hidden_superseded, 1);
+}
