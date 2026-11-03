@@ -503,3 +503,55 @@ fn semantic_candidates_are_bounded() {
         .unwrap();
     assert_eq!(out.conflicts.len(), 64);
 }
+
+#[test]
+fn semantic_channel_flags_same_summary_when_bodies_disagree() {
+    use gungnir::embedding::Embedder;
+
+    struct Constant;
+    impl Embedder for Constant {
+        fn model(&self) -> &str {
+            "constant"
+        }
+        fn embed(&self, texts: &[String]) -> gungnir::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    let (_d, g) = gng();
+    let mut old = Entry::new("a", EntryKind::Decision, "sessions use mysql");
+    old.body = "production runs mysql".into();
+    old.verify("review", None);
+    g.add(old.clone(), Layer::Codex).unwrap();
+
+    // Same summary, disagreeing body: corroboration is judged over the
+    // full embedded text, so this still flags as a candidate.
+    let mut e = Entry::new("a", EntryKind::Decision, "sessions use mysql");
+    e.body = "production no longer runs mysql".into();
+    let out = g.add_semantic(e, Layer::Codex, &Constant).unwrap();
+    assert_eq!(out.conflicts.len(), 1);
+    assert!(out.conflicts[0]
+        .signals
+        .contains(&gungnir::ConflictSignal::SemanticOverlap));
+}
+
+#[test]
+fn briefing_warns_on_candidates_whose_entries_left_the_hits() {
+    let (_d, g) = gng();
+    let old = write_verified(&g, "sessions use mysql");
+    let out = add_entry(&g, "sessions use postgres");
+    assert_eq!(out.conflicts.len(), 1);
+
+    // Supersede both endpoints behind off-topic revisions: under the
+    // current view neither entry can be a briefing hit anymore, so only
+    // the candidate's recorded summaries still match the task — the
+    // warning must come from the snapshots, not the hit list.
+    g.supersede(old.id, "a", "vacuum cadence weekly", "")
+        .unwrap();
+    g.supersede(out.id, "a", "vacuum cadence daily", "")
+        .unwrap();
+
+    let briefing = g.brief("a", "sessions", 5).unwrap();
+    let text = format!("{briefing:?}");
+    assert!(text.contains("conflict"), "briefing must warn: {text}");
+}

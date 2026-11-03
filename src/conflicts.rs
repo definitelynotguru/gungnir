@@ -292,6 +292,30 @@ impl Conflicts {
         self.persist_locked(rec)
     }
 
+    /// Resolve `id` under one lock: re-read, require Open, run `mutate`
+    /// (the caller's entry edits), then persist the closure. Two resolvers
+    /// can no longer both observe Open and leave a record that says
+    /// dismissed over an entry that was superseded. `mutate` must not call
+    /// back into the queue — the flock is held and is not reentrant.
+    pub fn resolve_locked(
+        &self,
+        id: ConflictId,
+        mutate: impl FnOnce(&ConflictRecord) -> Result<ConflictRecord>,
+    ) -> Result<ConflictRecord> {
+        fs::create_dir_all(&self.dir)?;
+        let _guard = self.lock()?;
+        let rec = self.require(id)?;
+        if rec.status != ConflictStatus::Open {
+            return Err(Error::Invalid(format!(
+                "conflict {id} is already {status}",
+                status = rec.status
+            )));
+        }
+        let rec = mutate(&rec)?;
+        self.persist_locked(&rec)?;
+        Ok(rec)
+    }
+
     pub fn get(&self, id: ConflictId) -> Result<Option<ConflictRecord>> {
         let path = self.path_for(id);
         if !path.exists() {
@@ -373,6 +397,7 @@ impl Conflicts {
     }
 
     fn lock(&self) -> Result<fs::File> {
+        fs::create_dir_all(&self.dir)?;
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -525,7 +550,10 @@ pub fn detect(
             )));
         }
         let qv = &vectors[vectors.len() - 1];
-        let new_t: HashSet<String> = recall::tokenize(&entry.summary).into_iter().collect();
+        let new_t: HashSet<String> =
+            recall::tokenize(&format!("{}\n{}", entry.summary, entry.body))
+                .into_iter()
+                .collect();
         for (cand, vec) in pool.iter().zip(&vectors) {
             if cand.state != StateAt::Verified
                 || revised.contains(&cand.entry.id)
@@ -539,8 +567,13 @@ pub fn detect(
             // Same guard lexical_signals applies on the keyword channel: an
             // identical stemmed token set is corroboration, never a
             // candidate — identical text always embeds above the floor.
+            // Compared over summary + body, the text that was embedded: a
+            // same-summary pair whose bodies disagree can be a real
+            // contradiction the keyword channel can't see.
             let cand_t: HashSet<String> =
-                recall::tokenize(&cand.entry.summary).into_iter().collect();
+                recall::tokenize(&format!("{}\n{}", cand.entry.summary, cand.entry.body))
+                    .into_iter()
+                    .collect();
             if cand_t == new_t {
                 continue;
             }
