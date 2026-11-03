@@ -382,3 +382,124 @@ fn contradict_is_exposed_and_logged() {
         VerificationState::Contradicted { by: out.id }
     );
 }
+
+#[test]
+fn resolve_by_contradict_refuses_to_replace_an_earlier_refutation() {
+    let (_d, g) = gng();
+    let old = write_verified(&g, "sessions use mysql");
+    let first = add_entry(&g, "sessions use postgres");
+    let second = add_entry(&g, "sessions use sqlite");
+    assert_eq!(first.conflicts.len(), 1);
+    assert_eq!(second.conflicts.len(), 1);
+
+    g.resolve_conflict(first.conflicts[0].id, ConflictVerb::Contradict, "ops")
+        .unwrap();
+
+    // A second candidate against the same fact cannot silently swap the
+    // contradicted_by link — same policy as supersede's relink refusal.
+    let err = g
+        .resolve_conflict(second.conflicts[0].id, ConflictVerb::Contradict, "ops")
+        .unwrap_err();
+    assert!(err.to_string().contains("already contradicted"));
+
+    let codex = g.codex().unwrap();
+    let entry = codex.require(old.id).unwrap();
+    match entry.verification {
+        VerificationState::Contradicted { by } => assert_eq!(by, first.id),
+        ref other => panic!("expected contradicted, got {other:?}"),
+    }
+}
+
+#[test]
+fn write_still_lands_when_the_queue_cannot_record() {
+    let (d, g) = gng();
+    write_verified(&g, "sessions use mysql");
+    // A regular file where the queue wants its directory: every record
+    // call fails, and the write must still succeed (SPEC: advisory only).
+    std::fs::write(d.path().join(".conflicts"), "not a directory").unwrap();
+
+    let outcome = add_entry(&g, "sessions use postgres");
+    assert!(outcome.conflicts.is_empty());
+    assert!(!outcome.warnings.is_empty());
+    assert!(g.codex().unwrap().exists(outcome.id).unwrap());
+}
+
+#[test]
+fn conflicts_listing_reports_corrupt_records() {
+    let (d, g) = gng();
+    write_verified(&g, "sessions use mysql");
+    let out = add_entry(&g, "sessions use postgres");
+    let path = d
+        .path()
+        .join(".conflicts")
+        .join(format!("{}.md", out.conflicts[0].id));
+    std::fs::write(&path, "no frontmatter here").unwrap();
+
+    // The audit surface must report corruption, not skip it; the lenient
+    // read briefings use is what tolerates it.
+    assert!(g.open_conflicts().is_err());
+    assert!(g.all_conflicts().is_err());
+    assert!(g.open_conflicts_lenient().unwrap().is_empty());
+}
+
+#[test]
+fn semantic_restatement_is_corroboration() {
+    use gungnir::embedding::Embedder;
+
+    // Every text embeds to the same vector: cosine 1.0 for any pair, so a
+    // verbatim restatement would flag unless the identical-token guard
+    // skips it the way the keyword channel does.
+    struct Constant;
+    impl Embedder for Constant {
+        fn model(&self) -> &str {
+            "constant"
+        }
+        fn embed(&self, texts: &[String]) -> gungnir::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    let (_d, g) = gng();
+    write_verified(&g, "sessions use mysql");
+
+    let out = g
+        .add_semantic(
+            Entry::new("a", EntryKind::Decision, "sessions use mysql"),
+            Layer::Codex,
+            &Constant,
+        )
+        .unwrap();
+    assert!(out.conflicts.is_empty());
+    assert!(g.open_conflicts().unwrap().is_empty());
+}
+
+#[test]
+fn semantic_candidates_are_bounded() {
+    use gungnir::embedding::Embedder;
+
+    struct Constant;
+    impl Embedder for Constant {
+        fn model(&self) -> &str {
+            "constant"
+        }
+        fn embed(&self, texts: &[String]) -> gungnir::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    let (_d, g) = gng();
+    // 70 verified facts on a topic the new claim shares no tokens with:
+    // only the semantic channel can flag them, and the pool is unbounded.
+    for i in 0..70 {
+        write_verified(&g, &format!("retention policy variant {i} keeps journals"));
+    }
+
+    let out = g
+        .add_semantic(
+            Entry::new("a", EntryKind::Decision, "cache backend uses memcached"),
+            Layer::Codex,
+            &Constant,
+        )
+        .unwrap();
+    assert_eq!(out.conflicts.len(), 64);
+}

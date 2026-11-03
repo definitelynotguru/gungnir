@@ -35,8 +35,12 @@ fn parse_layer(raw: Option<&str>) -> Result<LayerSel> {
 
 /// Conflict candidates a write raised, appended to the tool's normal reply
 /// so agents see them without a second call.
-fn conflict_note(base: String, conflicts: &[crate::conflicts::ConflictRecord]) -> String {
-    if conflicts.is_empty() {
+fn conflict_note(
+    base: String,
+    conflicts: &[crate::conflicts::ConflictRecord],
+    warnings: &[String],
+) -> String {
+    if conflicts.is_empty() && warnings.is_empty() {
         return base;
     }
     let mut out = base;
@@ -45,6 +49,9 @@ fn conflict_note(base: String, conflicts: &[crate::conflicts::ConflictRecord]) -
             "\nconflict candidate {}: \"{}\" vs verified \"{}\" ({}) — resolve_conflict to close",
             c.id, c.new_summary, c.conflicting_summary, c.layer
         ));
+    }
+    for w in warnings {
+        out.push_str(&format!("\nwarning: {w}"));
     }
     out
 }
@@ -272,7 +279,11 @@ impl Server {
                     Ok(format!("already ended (archive {})", report.journal_id))
                 } else {
                     self.sessions.remove(&s.id);
-                    Ok(format!("archived {}", report.journal_id))
+                    Ok(conflict_note(
+                        format!("archived {}", report.journal_id),
+                        &report.conflicts,
+                        &report.warnings,
+                    ))
                 }
             }
             "recall" => {
@@ -392,6 +403,7 @@ impl Server {
                 Ok(conflict_note(
                     format!("promoted to {}", outcome.id),
                     &outcome.conflicts,
+                    &outcome.warnings,
                 ))
             }
             "supersede" => {
@@ -408,6 +420,7 @@ impl Server {
                 Ok(conflict_note(
                     format!("revision {} supersedes {id}", outcome.id),
                     &outcome.conflicts,
+                    &outcome.warnings,
                 ))
             }
             "conflicts" => {

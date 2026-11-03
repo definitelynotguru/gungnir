@@ -9,7 +9,7 @@ use crate::entry::EntryKind;
 use crate::id::EntryId;
 use crate::layout;
 use crate::recall::Query;
-use crate::{Error, Gungnir, Result, WriteOutcome};
+use crate::{Error, Gungnir, Result};
 
 #[derive(Parser)]
 #[command(
@@ -356,14 +356,17 @@ fn embedder_for(_g: &Gungnir) -> Result<()> {
     ))
 }
 
-/// Advisory only: the write already landed, so candidates go to stderr and
-/// never change exit codes or the id printed on stdout.
-fn note_conflicts(outcome: &WriteOutcome) {
-    for c in &outcome.conflicts {
+/// Advisory only: the write already landed, so candidates and detection
+/// warnings go to stderr and never change exit codes or the id on stdout.
+fn note_conflicts(conflicts: &[crate::conflicts::ConflictRecord], warnings: &[String]) {
+    for c in conflicts {
         eprintln!(
             "conflict candidate {}: \"{}\" vs verified \"{}\" ({}) — `gungnir conflicts` to resolve",
             c.id, c.new_summary, c.conflicting_summary, c.layer
         );
+    }
+    for w in warnings {
+        eprintln!("warning: {w}");
     }
 }
 
@@ -408,7 +411,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 g.add(e, layer)?
             };
-            note_conflicts(&outcome);
+            note_conflicts(&outcome.conflicts, &outcome.warnings);
             println!("{}", outcome.id);
         }
 
@@ -610,7 +613,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 g.supersede(id, &agent, summary, body)?
             };
-            note_conflicts(&outcome);
+            note_conflicts(&outcome.conflicts, &outcome.warnings);
             println!("{}", outcome.id);
         }
 
@@ -641,7 +644,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 g.promote(from, &agent, kind, summary, body)?
             };
-            note_conflicts(&outcome);
+            note_conflicts(&outcome.conflicts, &outcome.warnings);
             println!("{}", outcome.id);
         }
 
@@ -782,6 +785,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             } => {
                 let s = session_handle(&g, session_id, agent)?;
                 let report = g.end_session(&s, summary, vec![])?;
+                note_conflicts(&report.conflicts, &report.warnings);
                 if report.already_ended {
                     println!("already ended (archive {})", report.journal_id);
                 } else {

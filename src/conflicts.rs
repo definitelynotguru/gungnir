@@ -272,8 +272,8 @@ impl Conflicts {
     }
 
     /// Persist a new candidate. Called from the write path after the entry
-    /// has landed — a failure here fails the caller's write result but never
-    /// rolls the entry back.
+    /// has landed, so callers turn a failure into a warning — the entry
+    /// stands either way and candidates are advisory.
     pub fn record(&self, rec: &ConflictRecord) -> Result<()> {
         fs::create_dir_all(&self.dir)?;
         let _guard = self.lock()?;
@@ -478,6 +478,9 @@ pub fn detect(
     };
 
     let mut signals_by_id: BTreeMap<EntryId, Vec<ConflictSignal>> = BTreeMap::new();
+    // Record order for the candidate cap: keyword hits by rank first, then
+    // semantic-only matches in pool order.
+    let mut order: Vec<EntryId> = Vec::new();
     let mut summaries: HashMap<EntryId, String> = HashMap::new();
 
     // Keyword channel: BM25-lite topic match under the `current` view, so
@@ -497,6 +500,7 @@ pub fn detect(
         if signals.is_empty() {
             continue;
         }
+        order.push(hit.entry.id);
         signals_by_id.insert(hit.entry.id, signals);
     }
 
@@ -521,6 +525,7 @@ pub fn detect(
             )));
         }
         let qv = &vectors[vectors.len() - 1];
+        let new_t: HashSet<String> = recall::tokenize(&entry.summary).into_iter().collect();
         for (cand, vec) in pool.iter().zip(&vectors) {
             if cand.state != StateAt::Verified
                 || revised.contains(&cand.entry.id)
@@ -531,12 +536,23 @@ pub fn detect(
             if embedding::cosine(qv, vec) < SEMANTIC_CONFLICT_FLOOR {
                 continue;
             }
+            // Same guard lexical_signals applies on the keyword channel: an
+            // identical stemmed token set is corroboration, never a
+            // candidate — identical text always embeds above the floor.
+            let cand_t: HashSet<String> =
+                recall::tokenize(&cand.entry.summary).into_iter().collect();
+            if cand_t == new_t {
+                continue;
+            }
             summaries
                 .entry(cand.entry.id)
                 .or_insert_with(|| cand.entry.summary.clone());
             let mut signals = lexical_signals(&entry.summary, &cand.entry.summary);
             signals.push(ConflictSignal::SemanticOverlap);
             let existing = signals_by_id.entry(cand.entry.id).or_default();
+            if existing.is_empty() {
+                order.push(cand.entry.id);
+            }
             for s in signals {
                 if !existing.contains(&s) {
                     existing.push(s);
@@ -547,8 +563,10 @@ pub fn detect(
     }
 
     let now = Utc::now();
-    Ok(signals_by_id
+    Ok(order
         .into_iter()
+        .take(CANDIDATE_LIMIT)
+        .filter_map(|id| signals_by_id.remove(&id).map(|signals| (id, signals)))
         .map(|(conflicting_entry, signals)| ConflictRecord {
             id: ConflictId::generate(),
             layer: layer.to_string(),
