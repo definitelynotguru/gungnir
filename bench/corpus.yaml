@@ -1,0 +1,97 @@
+# gungnir-bench corpus v1.
+#
+# A fixed, small world a memory store must load before the checks in
+# checks.yaml run. Modeled on LongMemEval's five abilities; this is a
+# self-benchmark, not LongMemEval. Vendor scores are not comparable to it.
+#
+# Time: all `at_hours` offsets are hours added to `epoch_base` (seconds
+# since the UNIX epoch). A runner must map this fixed clock onto its store
+# however it can: entries whose timestamp matters (the supersession chain,
+# the verified-then-rolled-back fact) carry an offset.
+#
+# Two agents exist: builder (two sessions, one failed then one promoted
+# success) and scout (one journal-only session that must never leak into
+# builder's view).
+
+epoch_base: 1767225600 # 2026-01-01T00:00:00Z
+
+# Working sessions, in order. `promote` lists findings the runner must push
+# into the shared layer with provenance evidence pointing at the session's
+# journal archive entry.
+sessions:
+  - agent: builder
+    task: fix slow checkout query
+    transcript:
+      - kind: observation
+        text: "EXPLAIN shows seq scan on orders_archive"
+      - kind: attempt
+        text: "added index on orders.user_id"
+        outcome: failed
+    journal_summary: "index hint did not help"
+    promote: []
+
+  - agent: builder
+    task: rewrite checkout query
+    transcript:
+      - kind: attempt
+        text: "rewrote query to use orders_archive_idx"
+        outcome: succeeded
+    journal_summary: "rewrote checkout query successfully"
+    promote:
+      - label: checkout_decision
+        kind: decision
+        summary: "checkout queries must use orders_archive_idx"
+        body: "seq scan on orders_archive was the bottleneck"
+        verify_as: team-review
+
+  - agent: scout
+    task: investigate deploy timeouts
+    transcript:
+      - kind: observation
+        text: "deploy pipeline timeout in github actions runners"
+    journal_summary: "runner timeouts documented"
+    promote: []
+
+# Shared-layer entries written outside sessions. Order matters: a revises
+# link refers to an earlier label. `at_hours` pins the entry timestamp and
+# `verify_at` the verification record's timestamp; omitted means the
+# runner's clock at ingest.
+facts:
+  - label: budget_q3
+    agent: ops
+    kind: decision
+    summary: "budget reviews happen in q3"
+    body: ""
+    at_hours: 10
+    verify_as: ops-lead
+    verify_at: 10
+
+  - label: budget_q1
+    agent: ops
+    kind: decision
+    summary: "budget reviews moved to q1"
+    body: ""
+    at_hours: 100
+    revises: budget_q3
+    # Deliberately left unverified: the head of the chain is hearsay even
+    # though the tail it replaced was verified.
+
+  - label: flags_ld
+    agent: ops
+    kind: decision
+    summary: "feature flags live in launchdarkly"
+    body: ""
+    at_hours: 20
+    # Verified at hour 30, marked rolled back at hour 40. Checks interrogate
+    # the recorded log, not the current state.
+    verify_as: ops-lead
+    verify_at: 30
+    mark_rolled_back_as: ops
+    mark_rolled_back_at: 40
+
+  - label: hera_room
+    agent: hr
+    kind: decision
+    summary: "meeting room hera seats eight"
+    body: "bookings through the calendar"
+    verify_as: office-manager
