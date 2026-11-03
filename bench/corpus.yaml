@@ -49,6 +49,11 @@ sessions:
     transcript:
       - kind: observation
         text: "deploy pipeline timeout in github actions runners"
+      # Canary: shares tokens with the builder brief query so a buggy brief
+      # that searches every journal would rank this entry; checks assert the
+      # phrase never surfaces in builder's briefing.
+      - kind: observation
+        text: "the checkout rewrite raised deploy timeouts"
     journal_summary: "runner timeouts documented"
     promote: []
 

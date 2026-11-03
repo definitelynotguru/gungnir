@@ -59,6 +59,9 @@ All notable changes to Gungnir are documented here. The format follows
 - **Evidence revalidation.** `verify --evidence <path>` records a file's
   SHA-256 and excerpt at verify time; `verify --revalidate <id>` (or
   `--all`) re-hashes evidence files and flags drifted or missing ones.
+  Paths under the store root are stored root-relative so the codex stays
+  portable; `--all` reports corrupt entry files as `UNREADABLE` rows
+  instead of aborting the sweep.
   Read-only; exits non-zero on drift.
 - **Cross-agent coverage counts.** `stats --topic <topic>` and the briefing
   coverage section report aggregate counts over other agents' journals

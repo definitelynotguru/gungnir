@@ -27,7 +27,9 @@ pub use entry::{
     Entry, EntryKind, Evidence, RecordStatus, Status, VerificationRecord, VerificationState,
 };
 pub use error::{Error, Result};
-pub use gungnir::{EvidenceCheck, Gungnir, Layer, PeerCoverage, Promotion, Session, StatsReport};
+pub use gungnir::{
+    EvidenceCheck, Gungnir, Layer, PeerCoverage, Promotion, RevalidateReport, Session, StatsReport,
+};
 pub use id::EntryId;
 pub use recall::{Coverage, Hit, Query, SearchOutcome};
 pub use store::{Scan, Skipped, Store};

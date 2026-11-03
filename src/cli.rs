@@ -87,8 +87,10 @@ enum Cmd {
         /// Entry to verify (or, with --revalidate, to check). Omit with
         /// --revalidate --all.
         id: Option<EntryId>,
-        #[arg(long, default_value = "human")]
-        verifier: String,
+        /// Who is vouching. Defaults to "human"; not accepted with
+        /// --revalidate, which records nothing.
+        #[arg(long)]
+        verifier: Option<String>,
         #[arg(long)]
         note: Option<String>,
         /// Record file evidence at verify time: hash the file's content
@@ -444,12 +446,20 @@ fn dispatch(cli: Cli) -> Result<()> {
                         "--evidence only applies when verifying, not --revalidate".into(),
                     ));
                 }
+                if verifier.is_some() || note.is_some() {
+                    return Err(Error::Invalid(
+                        "--verifier/--note only apply when verifying, not --revalidate".into(),
+                    ));
+                }
                 if id.is_some() && all {
                     return Err(Error::Invalid("pass an entry id or --all, not both".into()));
                 }
-                let checks = match (id, all) {
+                let report = match (id, all) {
                     (_, true) => g.revalidate_all()?,
-                    (Some(id), false) => g.revalidate(id)?,
+                    (Some(id), false) => crate::RevalidateReport {
+                        checks: g.revalidate(id)?,
+                        unreadable: Vec::new(),
+                    },
                     (None, false) => {
                         return Err(Error::Invalid(
                             "--revalidate needs an entry id or --all".into(),
@@ -457,7 +467,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     }
                 };
                 let mut intact = 0usize;
-                for c in &checks {
+                for c in &report.checks {
                     match &c.actual_sha256 {
                         Some(_) if c.intact() => intact += 1,
                         Some(actual) => println!(
@@ -470,10 +480,14 @@ fn dispatch(cli: Cli) -> Result<()> {
                         None => println!("MISSING {} {}", c.entry, c.path),
                     }
                 }
-                let drifted = checks.iter().filter(|c| !c.intact()).count();
-                println!("{intact} intact, {drifted} drifted or missing");
-                if drifted > 0 {
-                    return Err(Error::Drift(drifted));
+                for path in &report.unreadable {
+                    println!("UNREADABLE {}", path.display());
+                }
+                let drifted = report.checks.iter().filter(|c| !c.intact()).count();
+                let failed = drifted + report.unreadable.len();
+                println!("{intact} intact, {failed} drifted, missing, or unreadable");
+                if failed > 0 {
+                    return Err(Error::Drift(failed));
                 }
             } else {
                 let id = id.ok_or_else(|| Error::Invalid("verify needs an entry id".into()))?;
@@ -482,6 +496,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                         "--all only applies with --revalidate".into(),
                     ));
                 }
+                let verifier = verifier.unwrap_or_else(|| "human".into());
                 if evidence.is_empty() {
                     g.verify(id, &verifier, note)?;
                 } else {
@@ -644,6 +659,79 @@ mod tests {
         let err = parse_as_of("not-rfc3339").unwrap_err().to_string();
         assert!(err.contains("bad --as-of"), "{err}");
         assert!(parse_as_of("2026-08-01T00:00:00Z").is_ok());
+    }
+
+    fn verify_cli(root: &std::path::Path, cmd: Cmd) -> Cli {
+        Cli {
+            root: Some(root.to_path_buf()),
+            cmd,
+        }
+    }
+
+    #[test]
+    fn verify_revalidate_reports_drift_and_rejects_verify_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("adr.md");
+        std::fs::write(&doc, "decision: use postgres").unwrap();
+
+        let g = Gungnir::open(dir.path()).unwrap();
+        let e = crate::Entry::new("ops", EntryKind::Decision, "use postgres");
+        g.codex().unwrap().create(&e).unwrap();
+        g.verify_with_evidence(e.id, "team", None, std::slice::from_ref(&doc))
+            .unwrap();
+        drop(g);
+
+        let revalidate = || Cmd::Verify {
+            id: Some(e.id),
+            verifier: None,
+            note: None,
+            evidence: Vec::new(),
+            revalidate: true,
+            all: false,
+        };
+
+        // Intact: exit path stays clean.
+        dispatch(verify_cli(dir.path(), revalidate())).unwrap();
+
+        // Drift: the CLI contract is Error::Drift → non-zero exit.
+        std::fs::write(&doc, "decision: use sqlite").unwrap();
+        match dispatch(verify_cli(dir.path(), revalidate())) {
+            Err(Error::Drift(1)) => {}
+            other => panic!("expected Error::Drift(1), got {other:?}"),
+        }
+
+        // Verification flags are rejected, never silently dropped.
+        for cmd in [
+            Cmd::Verify {
+                id: Some(e.id),
+                verifier: None,
+                note: None,
+                evidence: vec![doc.clone()],
+                revalidate: true,
+                all: false,
+            },
+            Cmd::Verify {
+                id: Some(e.id),
+                verifier: Some("team-review".into()),
+                note: None,
+                evidence: Vec::new(),
+                revalidate: true,
+                all: false,
+            },
+            Cmd::Verify {
+                id: Some(e.id),
+                verifier: None,
+                note: Some("confirmed".into()),
+                evidence: Vec::new(),
+                revalidate: true,
+                all: false,
+            },
+        ] {
+            match dispatch(verify_cli(dir.path(), cmd)) {
+                Err(Error::Invalid(_)) => {}
+                other => panic!("expected Error::Invalid, got {other:?}"),
+            }
+        }
     }
 
     #[test]
