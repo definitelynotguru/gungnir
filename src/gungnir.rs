@@ -1470,7 +1470,12 @@ mod tests {
             _ => panic!("expected file evidence"),
         });
         assert_eq!(paths.next().unwrap(), PathBuf::from("adr-inside.md"));
-        assert_eq!(paths.next().unwrap(), outside);
+        // Outside paths keep the canonicalized absolute form (verbatim
+        // `\\?\` and 8.3 names on Windows), not the spelling passed in.
+        assert_eq!(
+            paths.next().unwrap(),
+            std::fs::canonicalize(&outside).unwrap()
+        );
 
         // A root-relative record still revalidates: resolution goes through
         // the store root, not the caller's cwd.
