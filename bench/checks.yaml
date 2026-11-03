@@ -46,7 +46,7 @@ abilities:
 
       - name: other agent's journal excluded
         run: {brief: "slow checkout rewrite", agent: builder, limit: 10}
-        expect: {markdown_not_contains: "github actions timeout"}
+        expect: {markdown_not_contains: "raised deploy timeouts"}
 
       - name: verified promotion leads codex hits
         run: {brief: "slow checkout rewrite", agent: builder, limit: 10}

@@ -86,13 +86,17 @@ it.
 
 ## Revalidation
 
-File evidence records `sha256` at citation time. `verify --revalidate`
-re-hashes every file evidence path on an entry (or `--all` for the whole
-store) and reports three outcomes per link: intact, drifted (the file
-exists but hashes differently), or missing. It is read-only: drift is a
-finding to act on, not a state the store rewrites. Ref evidence is skipped:
-entry links resolve live, and the verification log already tracks their
-state.
+File evidence records `sha256` at citation time. Paths inside the store
+root are recorded relative to it, so a committed codex stays portable
+across machines and clones; files outside the root keep their absolute
+path. `verify --revalidate` re-hashes every file evidence path on an entry
+(or `--all` for the whole store) and reports outcomes per link: intact,
+drifted (the file exists but hashes differently), or missing. `--all` also
+reports `UNREADABLE` rows for entry files that fail to parse and keeps
+going — one corrupt file doesn't hide the rest of the report. It is
+read-only: drift is a finding to act on, not a state the store rewrites.
+Ref evidence is skipped: entry links resolve live, and the verification
+log already tracks their state.
 
 ## Peer coverage
 

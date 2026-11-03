@@ -90,6 +90,16 @@ impl EvidenceCheck {
     }
 }
 
+/// What a `revalidate_all` sweep found. A corrupt entry file aborts
+/// nothing: it lands in `unreadable` while the rest of the store still
+/// reports, matching the per-partition tolerance peer coverage uses.
+#[derive(Clone, Debug, Default)]
+pub struct RevalidateReport {
+    pub checks: Vec<EvidenceCheck>,
+    /// Entry files that failed to parse during the sweep.
+    pub unreadable: Vec<PathBuf>,
+}
+
 /// Memory health snapshot: counts by layer and verification state,
 /// supersession depth, staleness. Powers `gungnir stats`.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -118,6 +128,13 @@ impl Gungnir {
     /// lazily, so read commands never touch the filesystem.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
+        for sub in [CODEX, JOURNAL, SCRATCH] {
+            std::fs::create_dir_all(root.join(sub))?;
+        }
+        // Canonicalize once the directories exist so evidence paths can be
+        // recorded relative to the store (and still resolved from it later)
+        // no matter how the root was spelled.
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
         Ok(Self { root })
     }
 
@@ -576,24 +593,23 @@ impl Gungnir {
     pub fn revalidate(&self, id: EntryId) -> Result<Vec<EvidenceCheck>> {
         let store = self.locate(id)?.ok_or(Error::NotFound(id))?;
         let entry = store.require(id)?;
-        Ok(check_evidence(&entry))
+        Ok(check_evidence(&self.root, &entry))
     }
 
-    /// [`Self::revalidate`] over every entry in every layer.
-    pub fn revalidate_all(&self) -> Result<Vec<EvidenceCheck>> {
-        let mut checks = Vec::new();
-        for e in self.codex()?.entries()? {
-            checks.extend(check_evidence(&e));
-        }
+    /// [`Self::revalidate`] over every entry in every layer. Entry files
+    /// that fail to parse are collected in `unreadable` rather than
+    /// aborting the sweep: one corrupt file must not hide the drift report
+    /// for everything else.
+    pub fn revalidate_all(&self) -> Result<RevalidateReport> {
+        let mut report = RevalidateReport::default();
+        sweep_store(&self.codex()?, &self.root, &mut report);
         for base_name in [JOURNAL, SCRATCH] {
             let base = self.root.join(base_name);
             for name in layer_child_names(&base)? {
-                for e in Store::open(base.join(&name))?.entries()? {
-                    checks.extend(check_evidence(&e));
-                }
+                sweep_store(&Store::open(base.join(&name))?, &self.root, &mut report);
             }
         }
-        Ok(checks)
+        Ok(report)
     }
 
     /// Search one layer with coverage accounting.
@@ -670,9 +686,15 @@ impl Gungnir {
             while !text.is_char_boundary(end) {
                 end -= 1;
             }
-            // Canonicalize so a citation recorded as a relative path still
-            // revalidates when later commands run from another directory.
-            let recorded = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            // Canonicalize first so a relative citation still resolves; then
+            // prefer a root-relative path so a committed codex stays
+            // portable across machines and clones. Files outside the store
+            // keep their absolute path.
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            let recorded = canonical
+                .strip_prefix(&self.root)
+                .map(|p| p.to_path_buf())
+                .unwrap_or(canonical);
             entry.evidence.push(Evidence::File {
                 path: recorded.display().to_string(),
                 excerpt: text[..end].to_string(),
@@ -933,16 +955,40 @@ fn failed_attempt(h: &crate::recall::Hit) -> bool {
                 .any(|l| l.trim_start().starts_with("- attempt:") && l.ends_with("[failed]")))
 }
 
+/// Check one store's entries into `report`. Entry files that fail to parse
+/// land in `unreadable` and the sweep continues: one corrupt file is a row
+/// to report, not a reason to hide the rest of the store.
+fn sweep_store(store: &Store, root: &Path, report: &mut RevalidateReport) {
+    match store.scan() {
+        Ok(scan) => {
+            for entry in &scan.entries {
+                report.checks.extend(check_evidence(root, entry));
+            }
+            report
+                .unreadable
+                .extend(scan.skipped.into_iter().map(|s| s.path));
+        }
+        Err(_) => report.unreadable.push(store.root().to_path_buf()),
+    }
+}
+
 /// Revalidate one entry's file-evidence links; entry refs skip straight
 /// through. A missing file reports `None` rather than erroring; drift is
-/// data, not a failure of the revalidation itself.
-fn check_evidence(entry: &Entry) -> Vec<EvidenceCheck> {
+/// data, not a failure of the revalidation itself. Paths stored relative
+/// to the store root resolve against `root`; absolute ones are used as-is.
+fn check_evidence(root: &Path, entry: &Entry) -> Vec<EvidenceCheck> {
     entry
         .evidence
         .iter()
         .filter_map(|ev| match ev {
             Evidence::File { path, sha256, .. } => {
-                let actual = std::fs::read(path)
+                let file = Path::new(path);
+                let file = if file.is_absolute() {
+                    file.to_path_buf()
+                } else {
+                    root.join(file)
+                };
+                let actual = std::fs::read(&file)
                     .ok()
                     .map(|raw| format!("{:x}", sha2::Sha256::digest(&raw)));
                 Some(EvidenceCheck {
@@ -1353,10 +1399,11 @@ mod tests {
         g.verify_with_evidence(report.promoted[0], "team", None, &[adr])
             .unwrap();
 
-        let checks = g.revalidate_all().unwrap();
-        assert_eq!(checks.len(), 1);
-        assert!(checks[0].intact());
-        assert_eq!(checks[0].entry, report.promoted[0]);
+        let report_all = g.revalidate_all().unwrap();
+        assert_eq!(report_all.checks.len(), 1);
+        assert!(report_all.checks[0].intact());
+        assert_eq!(report_all.checks[0].entry, report.promoted[0]);
+        assert!(report_all.unreadable.is_empty());
     }
 
     #[test]
@@ -1399,13 +1446,43 @@ mod tests {
     }
 
     #[test]
-    fn evidence_paths_are_canonicalized_at_record_time() {
-        // A citation written as a relative path is stored absolute, so a
-        // later revalidate from any cwd still finds the file.
+    fn evidence_paths_inside_the_store_are_recorded_relative() {
+        // A committed codex must stay portable: paths under the store root
+        // are recorded relative to it (absolute would leak the workstation
+        // layout and break revalidation on a clone), paths outside it keep
+        // the absolute form.
         let (d, g) = gng();
-        let sub = d.path().join("proj");
-        std::fs::create_dir(&sub).unwrap();
-        let adr = sub.join("adr.md");
+        let inside = d.path().join("adr-inside.md");
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("adr-outside.md");
+        std::fs::write(&inside, "decision").unwrap();
+        std::fs::write(&outside, "decision").unwrap();
+
+        let codex = g.codex().unwrap();
+        let e = Entry::new("ops", EntryKind::Decision, "use postgres");
+        codex.create(&e).unwrap();
+        g.verify_with_evidence(e.id, "team", None, &[inside, outside.clone()])
+            .unwrap();
+
+        let entry = codex.require(e.id).unwrap();
+        let mut paths = entry.evidence.iter().map(|ev| match ev {
+            Evidence::File { path, .. } => PathBuf::from(path),
+            _ => panic!("expected file evidence"),
+        });
+        assert_eq!(paths.next().unwrap(), PathBuf::from("adr-inside.md"));
+        assert_eq!(paths.next().unwrap(), outside);
+
+        // A root-relative record still revalidates: resolution goes through
+        // the store root, not the caller's cwd.
+        assert!(g.revalidate(e.id).unwrap().iter().all(|c| c.intact()));
+    }
+
+    #[test]
+    fn revalidate_all_reports_unreadable_entries_instead_of_aborting() {
+        // Same error contract as peer coverage: one corrupt entry file is a
+        // reported row, not a reason to hide the rest of the store.
+        let (d, g) = gng();
+        let adr = d.path().join("adr.md");
         std::fs::write(&adr, "decision").unwrap();
 
         let codex = g.codex().unwrap();
@@ -1414,11 +1491,12 @@ mod tests {
         g.verify_with_evidence(e.id, "team", None, std::slice::from_ref(&adr))
             .unwrap();
 
-        let entry = codex.require(e.id).unwrap();
-        let Evidence::File { path, .. } = &entry.evidence[0] else {
-            panic!("expected file evidence")
-        };
-        assert!(Path::new(path).is_absolute(), "stored path: {path}");
+        let corrupt_path = codex.path_for(e.id);
+        std::fs::write(&corrupt_path, "not an entry file").unwrap();
+
+        let report = g.revalidate_all().unwrap();
+        assert!(report.checks.is_empty());
+        assert_eq!(report.unreadable, vec![corrupt_path]);
     }
 
     #[test]
