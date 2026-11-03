@@ -13,6 +13,12 @@ categories = ["command-line-utilities", "development-tools"]
 # `--semantic` recall and briefings. Default build stays zero-network:
 # the model downloads on first semantic use only, into `<root>/.cache`.
 embed = ["dep:fastembed"]
+# Test-only: lets `GUNGNIR_TEST_EMBEDDER=1` swap the shipped model for the
+# uniform-vector `embedding::Uniform`, so semantic dispatch runs offline.
+# Never enable for a release binary — it makes --semantic fabricate
+# matches. CI's embed test leg enables it; release builds ship `embed`
+# alone, where the env var is compiled out.
+test-embedder = ["embed"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
