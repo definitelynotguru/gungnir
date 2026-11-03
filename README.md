@@ -177,12 +177,21 @@ the wire.
 | [CHANGELOG.md](CHANGELOG.md)      | Release history                                 |
 | [examples/quickstart.rs](examples/quickstart.rs) | Runnable end-to-end tour          |
 
+## gungnir-bench
+
+[`bench/`](bench/README.md) is a public, deterministic accuracy harness:
+fixed corpus, 19 exact-match checks across five abilities, no LLM judge.
+Any memory store can run it. The corpus and checks are YAML data, the
+reference runner is `tests/bench.rs`, and CI keeps the artifact in sync
+with what gungnir actually scores.
+
 ## Status
 
-Early but tested: 59 tests including a 16-check accuracy bench across five
-abilities and an MCP subprocess handshake driving the full correction
-lifecycle against the real binary. API may still move before 1.0. See
-[CHANGELOG.md](CHANGELOG.md) for what shipped and when.
+Early but tested: 92 tests including the gungnir-bench harness across five
+abilities plus a paraphrase-recall suite, and an MCP subprocess handshake
+driving the full correction lifecycle against the real binary. API may
+still move before 1.0. See [CHANGELOG.md](CHANGELOG.md) for what shipped
+and when.
 
 ## License
 
