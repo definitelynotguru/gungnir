@@ -67,7 +67,7 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>, enforce_refs: bool) -> 
         ));
     }
 
-    for name in declared_and_mentioned_names(entry) {
+    for name in declared_names(entry) {
         if !valid_entity_name(&name) {
             return Err(crate::Error::Invalid(format!(
                 "entity names are 1..{MAX_ENTITY_LEN} printable chars; got '{name}'"
@@ -185,17 +185,14 @@ fn reference_ids(entry: &Entry) -> std::collections::HashSet<EntryId> {
     out
 }
 
-/// Every entity name a create claims: declared frontmatter as stored plus
-/// body mentions. Declared names are validated raw — `entity_mentions`
-/// trims, lowercases, and drops empties for indexing, which would let a
-/// blank or overlong declaration slip past the shape rule.
-fn declared_and_mentioned_names(entry: &Entry) -> Vec<String> {
-    entry
-        .entities
-        .iter()
-        .cloned()
-        .chain(entry.entity_mentions())
-        .collect()
+/// The entity names a caller declares in frontmatter, validated as stored.
+/// `entity_mentions` is the index view — it trims, lowercases, and drops
+/// empties — so checking it both lets blank declarations slip and rejects
+/// valid names whose normalized form differs (`İ` lowers to two chars).
+/// Body `[[name]]` spans are not checked here: a span that fails
+/// `valid_entity_name` is prose filtered by `entity_mentions`, not a claim.
+fn declared_names(entry: &Entry) -> &[String] {
+    &entry.entities
 }
 
 /// Shape checks for an update, grandfathering values already on record.
@@ -244,14 +241,9 @@ pub fn validate_update(new: &Entry, old: &Entry) -> Result<()> {
             "review entries require review_of".into(),
         ));
     }
-    let old_names: std::collections::HashSet<String> = old
-        .entities
-        .iter()
-        .chain(old.entity_mentions().iter())
-        .map(|n| n.trim().to_lowercase())
-        .collect();
-    for name in declared_and_mentioned_names(new) {
-        if !old_names.contains(&name.trim().to_lowercase()) && !valid_entity_name(&name) {
+    let old_names: std::collections::HashSet<&String> = old.entities.iter().collect();
+    for name in declared_names(new) {
+        if !old_names.contains(name) && !valid_entity_name(name) {
             return Err(crate::Error::Invalid(format!(
                 "entity names are 1..{MAX_ENTITY_LEN} printable chars; got '{name}'"
             )));

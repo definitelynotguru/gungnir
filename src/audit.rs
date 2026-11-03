@@ -295,7 +295,9 @@ pub enum EventKind {
 pub struct AuditEvent {
     pub when: DateTime<Utc>,
     pub kind: EventKind,
-    /// `entry.agent` for creation, `record.verifier` for transitions.
+    /// `entry.agent` for creation, `record.verifier` for transitions —
+    /// the stored name, unsanitized, so `--agent` filters on identity.
+    /// `one_line` is applied where events print.
     pub actor: String,
     pub partition: String,
     pub id: EntryId,
@@ -328,7 +330,7 @@ pub fn scan_events(
         push(AuditEvent {
             when: l.entry.timestamp,
             kind: EventKind::Created,
-            actor: one_line(&l.entry.agent),
+            actor: l.entry.agent.clone(),
             partition: l.partition.clone(),
             id: l.entry.id,
             summary: one_line(&l.entry.summary),
@@ -344,7 +346,7 @@ pub fn scan_events(
             push(AuditEvent {
                 when: rec.timestamp,
                 kind,
-                actor: one_line(&rec.verifier),
+                actor: rec.verifier.clone(),
                 partition: l.partition.clone(),
                 id: l.entry.id,
                 summary: one_line(&l.entry.summary),
@@ -376,7 +378,7 @@ pub fn format_events(events: &[AuditEvent]) -> String {
             fmt_time(ev.when),
             event_label(ev.kind),
             ev.partition,
-            ev.actor,
+            one_line(&ev.actor),
             ev.id,
             ev.summary,
         ));
