@@ -271,9 +271,15 @@ fn layer_of(name: &str) -> Result<&'static str> {
     layout::parse_layer_name(Some(name)).map_err(Error::Invalid)
 }
 
-/// First 8 hex chars of a digest, enough to identify drift at a glance.
+/// First 8 chars of a digest, enough to identify drift at a glance.
+/// Char-bounded, not byte-bounded: sha256 is a free string field and a
+/// hand-edited value must not panic the report.
 fn short(sha: &str) -> &str {
-    &sha[..8.min(sha.len())]
+    let mut end = 8.min(sha.len());
+    while !sha.is_char_boundary(end) {
+        end -= 1;
+    }
+    &sha[..end]
 }
 
 /// The shipped local embedder (fastembed bge-small-en-v1.5), wrapped in the
@@ -433,6 +439,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             all,
         } => {
             if revalidate {
+                if !evidence.is_empty() {
+                    return Err(Error::Invalid(
+                        "--evidence only applies when verifying, not --revalidate".into(),
+                    ));
+                }
+                if id.is_some() && all {
+                    return Err(Error::Invalid("pass an entry id or --all, not both".into()));
+                }
                 let checks = match (id, all) {
                     (_, true) => g.revalidate_all()?,
                     (Some(id), false) => g.revalidate(id)?,

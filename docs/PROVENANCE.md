@@ -75,7 +75,9 @@ audit. See [DESIGN.md](DESIGN.md#rollback) for the full contract.
 
 Privacy is enforced by directory partitioning rather than runtime checks.
 Briefings assemble Codex hits plus the requesting agent's Journal hits only;
-another agent's failures never leak into your context. This property is covered
+another agent's failures never leak into your context — the one exception is
+counts-only peer coverage (below), which reports *that* peers attempted a
+topic without surfacing what they wrote. This property is covered
 by test: agent B's journal entries do not appear in agent A's briefing.
 
 What lands in the Codex is a deliberate act (`promote`), linked back to its

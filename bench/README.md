@@ -38,6 +38,11 @@ deterministic checks:
 
 19 checks. A score is `passes / 19` plus the per-ability breakdown.
 
+The reference runner also executes a Rust-only `paraphrase recall` suite
+(18 checks over retrieval machinery: BM25-lite vs hybrid fusion) in the
+same run, so its printed total is 19 + 18 = 37. The public score is the
+YAML side — `checks.yaml` is the whole contract.
+
 ## The contract
 
 A runner adapts its store to five operations, then executes checks in order
