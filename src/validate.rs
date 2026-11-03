@@ -68,7 +68,7 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>, enforce_refs: bool) -> 
     }
 
     for name in declared_names(entry) {
-        if !valid_entity_name(&name) {
+        if !valid_entity_name(name) {
             return Err(crate::Error::Invalid(format!(
                 "entity names are 1..{MAX_ENTITY_LEN} printable chars; got '{name}'"
             )));
