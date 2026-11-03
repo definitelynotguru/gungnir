@@ -46,6 +46,13 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>, enforce_refs: bool) -> 
             "agent is a single printable name; no control characters".into(),
         ));
     }
+    if let Some(project) = &entry.project_id {
+        if has_control(project) {
+            return Err(crate::Error::Invalid(
+                "project_id is a single printable line; no control characters".into(),
+            ));
+        }
+    }
     for rec in &entry.verification_log {
         if has_control(&rec.verifier) {
             return Err(crate::Error::Invalid(
@@ -60,7 +67,7 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>, enforce_refs: bool) -> 
         ));
     }
 
-    for name in entity_names(entry) {
+    for name in declared_and_mentioned_names(entry) {
         if !valid_entity_name(&name) {
             return Err(crate::Error::Invalid(format!(
                 "entity names are 1..{MAX_ENTITY_LEN} printable chars; got '{name}'"
@@ -178,12 +185,92 @@ fn reference_ids(entry: &Entry) -> std::collections::HashSet<EntryId> {
     out
 }
 
-/// Every entity name an entry claims. Frontmatter is a declaration and is
-/// validated strictly; body `[[name]]` targets pass through
-/// `entity_mentions`, which keeps only names that meet `valid_entity_name`
-/// — a `[[` span in free text is prose, not an entity claim.
-fn entity_names(entry: &Entry) -> Vec<String> {
-    entry.entity_mentions()
+/// Every entity name a create claims: declared frontmatter as stored plus
+/// body mentions. Declared names are validated raw — `entity_mentions`
+/// trims, lowercases, and drops empties for indexing, which would let a
+/// blank or overlong declaration slip past the shape rule.
+fn declared_and_mentioned_names(entry: &Entry) -> Vec<String> {
+    entry
+        .entities
+        .iter()
+        .cloned()
+        .chain(entry.entity_mentions())
+        .collect()
+}
+
+/// Shape checks for an update, grandfathering values already on record.
+/// Rules only govern what the write changes: an entry stored before a
+/// rule existed must still accept state transitions (verify, contradict,
+/// rollback) and other fields' edits without a rewrite of its history.
+/// Reference existence lives in [`validate_new_refs`].
+pub fn validate_update(new: &Entry, old: &Entry) -> Result<()> {
+    if new.summary != old.summary && new.summary.len() > MAX_SUMMARY_LEN {
+        return Err(crate::Error::Invalid(format!(
+            "summary is {} chars; cap is {MAX_SUMMARY_LEN}",
+            new.summary.len()
+        )));
+    }
+    if new.summary != old.summary && has_control(&new.summary) {
+        return Err(crate::Error::Invalid(
+            "summary is a single printable line; no control characters".into(),
+        ));
+    }
+    if new.agent != old.agent && has_control(&new.agent) {
+        return Err(crate::Error::Invalid(
+            "agent is a single printable name; no control characters".into(),
+        ));
+    }
+    if new.project_id != old.project_id {
+        if let Some(project) = &new.project_id {
+            if has_control(project) {
+                return Err(crate::Error::Invalid(
+                    "project_id is a single printable line; no control characters".into(),
+                ));
+            }
+        }
+    }
+    for rec in &new.verification_log {
+        if !old.verification_log.contains(rec) && has_control(&rec.verifier) {
+            return Err(crate::Error::Invalid(
+                "verifier is a single printable name; no control characters".into(),
+            ));
+        }
+    }
+    if (new.kind != old.kind || new.review_of != old.review_of)
+        && new.kind == EntryKind::Review
+        && new.review_of.is_none()
+    {
+        return Err(crate::Error::Invalid(
+            "review entries require review_of".into(),
+        ));
+    }
+    let old_names: std::collections::HashSet<String> = old
+        .entities
+        .iter()
+        .chain(old.entity_mentions().iter())
+        .map(|n| n.trim().to_lowercase())
+        .collect();
+    for name in declared_and_mentioned_names(new) {
+        if !old_names.contains(&name.trim().to_lowercase()) && !valid_entity_name(&name) {
+            return Err(crate::Error::Invalid(format!(
+                "entity names are 1..{MAX_ENTITY_LEN} printable chars; got '{name}'"
+            )));
+        }
+    }
+    for ev in &new.evidence {
+        if old.evidence.contains(ev) {
+            continue;
+        }
+        if let Evidence::File { excerpt, .. } = ev {
+            if excerpt.len() > MAX_EXCERPT_LEN {
+                return Err(crate::Error::Invalid(format!(
+                    "evidence excerpt is {} chars; cap is {MAX_EXCERPT_LEN}",
+                    excerpt.len()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Names are single-line printable text, 1..MAX_ENTITY_LEN *characters*.
