@@ -62,9 +62,9 @@ pub struct Coverage {
     /// Chain tails excluded by `current_only`.
     pub hidden_superseded: usize,
     pub hidden_rolled_back: usize,
-    /// Every non-rolled-back entry in scope (after the `as_of` filter),
-    /// matched or not. Distinguishes "the layer is empty" from "entries
-    /// exist but none matched the topic".
+    /// Every entry in scope (after the `as_of` filter), matched or not —
+    /// rolled-back entries included. Distinguishes "the layer is empty"
+    /// from "entries exist but none matched the topic".
     pub total: usize,
 }
 

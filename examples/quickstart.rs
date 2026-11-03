@@ -29,6 +29,7 @@ fn main() -> gungnir::Result<()> {
             kind: EntryKind::Decision,
             summary: "checkout queries must use orders_archive_idx".into(),
             body: "seq scan on orders_archive was the bottleneck".into(),
+            review_of: None,
         }],
     )?;
     println!("archived journal entry : {}", report.journal_id);

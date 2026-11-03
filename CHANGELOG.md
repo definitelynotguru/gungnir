@@ -40,6 +40,12 @@ All notable changes to Gungnir are documented here. The format follows
   evidence refs are checked across layers.
 - **The `STATUS_*` string constants are gone**; `VerificationRecord.status`
   is now the typed `RecordStatus` enum.
+- **`Promotion` gains a `review_of` field** (required for `kind: Review`
+  promotions, which previously stranded the session by failing validation
+  after the archive was written).
+- **Concurrent `end_session` calls are serialized** by a lock file under
+  the agent's journal; a second end now reports `already_ended` instead of
+  writing a duplicate archive.
 - **`add_observation`/`add_attempt` reject an already-ended session.**
   Previously the write succeeded and the next `end_session` deleted the
   notes unarchived. (MCP step-level behavior changes accordingly.)

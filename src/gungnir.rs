@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
+
 use chrono::Utc;
 
 use crate::briefing::{self, Briefing, BriefingInput};
@@ -38,6 +40,8 @@ pub struct Promotion {
     pub kind: EntryKind,
     pub summary: String,
     pub body: String,
+    /// Target when `kind` is `Review`; required by write-time validation.
+    pub review_of: Option<EntryId>,
 }
 
 #[derive(Clone, Debug)]
@@ -261,6 +265,27 @@ impl Gungnir {
         promotions: Vec<Promotion>,
     ) -> Result<EndReport> {
         let summary = summary.as_ref();
+        // Serialize the check-archive-and-write-archive sequence across
+        // processes: without a session lock two concurrent ends both see
+        // "no archive" and write duplicate journal entries. The lock file
+        // lives in the journal, which outlives scratch cleanup.
+        let journal_root = self
+            .root
+            .join(JOURNAL)
+            .join(layout::sanitize_component(&session.agent));
+        std::fs::create_dir_all(&journal_root)?;
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(journal_root.join(format!(
+                ".end-{}.lock",
+                layout::sanitize_component(&session.id)
+            )))?;
+        lock_file.lock_exclusive()?;
+        let _end_lock = lock_file;
+
         let dir = self.session_dir(&session.id);
         let scratch_exists = dir.exists();
         let archive = self.find_archive(&session.agent, &session.id)?;
@@ -352,27 +377,29 @@ impl Gungnir {
         promotions: Vec<Promotion>,
     ) -> Result<Vec<EntryId>> {
         let codex = self.codex()?;
-        // Dedupe on (kind, summary): two different findings can share a
-        // summary, and a retry re-listing a promotion under a different
-        // kind must land it rather than alias the landed one.
-        let mut by_key: HashMap<(EntryKind, String), EntryId> = codex
+        // Dedupe on (kind, summary, body): two different findings can
+        // share a summary, and a retry re-listing a promotion must land
+        // it rather than alias the landed one — but only when the body
+        // also matches, so distinct findings keep their own text.
+        let mut by_key: HashMap<(EntryKind, String, String), EntryId> = codex
             .entries()?
             .into_iter()
             .filter(|e| e.session_id.as_deref() == Some(session_id))
-            .map(|e| ((e.kind, e.summary), e.id))
+            .map(|e| ((e.kind, e.summary, e.body), e.id))
             .collect();
         let mut promoted_ids = Vec::new();
         for p in promotions {
-            if let Some(&existing) = by_key.get(&(p.kind, p.summary.clone())) {
+            if let Some(&existing) = by_key.get(&(p.kind, p.summary.clone(), p.body.clone())) {
                 promoted_ids.push(existing);
                 continue;
             }
             let mut c = Entry::new(agent, p.kind, p.summary);
             c.session_id = Some(session_id.to_string());
             c.body = p.body;
+            c.review_of = p.review_of;
             c.evidence.push(Evidence::Ref { id: archive });
             codex.create_with(&c, &|id| self.exists_anywhere(id))?;
-            by_key.insert((c.kind, c.summary.clone()), c.id);
+            by_key.insert((c.kind, c.summary.clone(), c.body.clone()), c.id);
             promoted_ids.push(c.id);
         }
         Ok(promoted_ids)
@@ -467,6 +494,7 @@ impl Gungnir {
         next.revises = Some(old);
         next.project_id = prev.project_id.clone();
         next.session_id = prev.session_id.clone();
+        next.review_of = prev.review_of;
         // Carry evidence forward — but only refs that still resolve. Stores
         // written before promote was journal-only can hold refs to deleted
         // scratch entries; refusing to revise those entries would brick the
@@ -537,7 +565,11 @@ impl Gungnir {
         let scratch_base = self.root.join(SCRATCH);
         for sess in layer_child_names(&scratch_base)? {
             let scan = Store::open(scratch_base.join(&sess))?.scan()?;
-            if !scan.entries.is_empty() {
+            // A started-but-empty session still counts: `.session.yaml`
+            // is written before the first note, so entries alone
+            // under-report live sessions.
+            let sess_dir = scratch_base.join(&sess);
+            if !scan.entries.is_empty() || sess_dir.join(".session.yaml").exists() {
                 r.scratch_sessions += 1;
             }
             all.extend(scan.entries);
@@ -717,6 +749,7 @@ mod tests {
                     kind: EntryKind::Decision,
                     summary: "checkout queries must use orders_archive_idx".into(),
                     body: "seq scan on orders_archive was the bottleneck".into(),
+                    review_of: None,
                 }],
             )
             .unwrap();
@@ -842,6 +875,7 @@ mod tests {
                     kind: EntryKind::Decision,
                     summary: "checkout cache sized at 512mb".into(),
                     body: "measured hit rate gain".into(),
+                    review_of: None,
                 }],
             )
             .unwrap();
