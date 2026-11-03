@@ -738,6 +738,7 @@ pub fn review_queue(all: &[Located]) -> Vec<ReviewItem> {
                 .entry
                 .project_id
                 .clone()
+                .map(|p| one_line(&p))
                 .unwrap_or_else(|| "(no project)".into()),
             extracted: l.entry.source_tool.is_some(),
             entry: l.entry.clone(),

@@ -112,7 +112,7 @@ impl Store {
     /// fresh dangling links past validation.
     pub fn update_with(&self, entry: &Entry, exists: validate::Exists<'_>) -> Result<()> {
         let prev = self.require(entry.id)?;
-        validate::validate_entry(entry, exists, false)?;
+        validate::validate_update(entry, &prev)?;
         validate::validate_new_refs(entry, &prev, exists)?;
         let _guard = self.lock()?;
         self.persist_locked(entry)

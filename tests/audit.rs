@@ -920,3 +920,98 @@ fn add_rejects_control_characters_in_single_line_fields() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn declared_entities_validate_as_stored() {
+    // The entity shape rule sees the declared list as stored: a blank or
+    // overlong declaration is invalid even though the index view would
+    // normalize or drop it.
+    let (_d, store) = root();
+    for bad in ["   ", ""] {
+        let out = run(
+            &store,
+            &[
+                "add",
+                "--agent",
+                "a",
+                "--kind",
+                "observation",
+                "--summary",
+                "s",
+                "--entities",
+                bad,
+            ],
+        );
+        assert_eq!(out.status.code(), Some(1), "blank declared name {bad:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("entity names"));
+    }
+}
+
+#[test]
+fn project_id_is_a_single_line_field() {
+    // The review printer renders project_id raw inside brackets, so the
+    // write must reject multi-line projects.
+    let (_d, store) = root();
+    let out = run(
+        &store,
+        &[
+            "add",
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "s",
+            "--project",
+            "proj\nother",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("control characters"));
+}
+
+#[test]
+fn legacy_entries_with_bad_fields_still_change_state() {
+    // Entries written before the control-character rule must not be
+    // bricked: verify/rollback touch no single-line field, so updates
+    // grandfather the stored values.
+    let (_d, store) = root();
+    let id = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "plain summary",
+        ],
+    );
+
+    // Tamper the stored file to carry a multi-line summary, as a legacy
+    // entry would.
+    let g = Gungnir::open(&store).unwrap();
+    let codex = g.codex().unwrap();
+    let pid: gungnir::EntryId = id.parse().unwrap();
+    let path = codex.path_for(pid);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("summary: plain summary"), "{text}");
+    std::fs::write(
+        &path,
+        text.replacen("summary: plain summary", "summary: \"line1\\nline2\"", 1),
+    )
+    .unwrap();
+    let loaded = codex.require(pid).unwrap();
+    assert!(loaded.summary.contains('\n'), "{}", loaded.summary);
+
+    // State transitions do not rewrite summary/agent: they must pass.
+    ok(&store, &["verify", &id, "--verifier", "team"]);
+    let out = ok(&store, &["blame", &id]);
+    assert!(out.contains("belief state: verified"), "{out}");
+    assert!(out.contains("line1"), "{out}");
+
+    // But writing a *new* bad value is still rejected.
+    let mut e = codex.require(pid).unwrap();
+    e.agent = "a\nb".into();
+    assert!(codex.update(&e).is_err());
+}
