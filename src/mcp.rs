@@ -413,10 +413,14 @@ impl Server {
     /// `embed` build the honest answer is an error, not a silent keyword
     /// search dressed as semantic.
     fn semantic_enabled(&self, args: &Value) -> Result<bool> {
-        let on = args
-            .get("semantic")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let on = match args.get("semantic") {
+            None => false,
+            Some(v) => v.as_bool().ok_or_else(|| {
+                // A mistyped flag must error rather than read as false and
+                // silently downgrade a semantic request to keyword.
+                Error::Invalid("`semantic` must be a boolean".into())
+            })?,
+        };
         #[cfg(not(feature = "embed"))]
         if on {
             return Err(Error::Invalid(
