@@ -1015,3 +1015,62 @@ fn legacy_entries_with_bad_fields_still_change_state() {
     e.agent = "a\nb".into();
     assert!(codex.update(&e).is_err());
 }
+
+#[test]
+fn unicode_expansion_does_not_reject_valid_declared_names() {
+    // `İ` lowercases to two chars, so checking the normalized index form
+    // would reject a declaration that fits the cap. The rule sees the
+    // declared name as stored.
+    let (_d, store) = root();
+    let idot = "\u{130}".repeat(64);
+    let out = run(
+        &store,
+        &[
+            "add",
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "unicode name",
+            "--entities",
+            &idot,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn log_agent_filter_matches_stored_actor() {
+    // --agent filters on actor identity, not sanitized display text: a
+    // legacy multi-line agent is matched by its stored name and never by
+    // its collapsed form.
+    let (_d, store) = root();
+    let id = add(
+        &store,
+        &["--agent", "team", "--kind", "decision", "--summary", "s"],
+    );
+
+    let g = Gungnir::open(&store).unwrap();
+    let codex = g.codex().unwrap();
+    let pid: gungnir::EntryId = id.parse().unwrap();
+    let path = codex.path_for(pid);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("agent: team"), "{text}");
+    std::fs::write(
+        &path,
+        text.replacen("agent: team", "agent: \"team\\nevil\"", 1),
+    )
+    .unwrap();
+    assert!(codex.require(pid).unwrap().agent.contains('\n'));
+
+    // The collapsed form does not match; the stored name does.
+    let out = ok(&store, &["log", "--agent", "team evil"]);
+    assert!(!out.contains(&id), "{out}");
+    let out = ok(&store, &["log", "--agent", "team\nevil"]);
+    assert!(out.contains(&id), "{out}");
+}
