@@ -33,6 +33,22 @@ fn parse_layer(raw: Option<&str>) -> Result<LayerSel> {
     }
 }
 
+/// Conflict candidates a write raised, appended to the tool's normal reply
+/// so agents see them without a second call.
+fn conflict_note(base: String, conflicts: &[crate::conflicts::ConflictRecord]) -> String {
+    if conflicts.is_empty() {
+        return base;
+    }
+    let mut out = base;
+    for c in conflicts {
+        out.push_str(&format!(
+            "\nconflict candidate {}: \"{}\" vs verified \"{}\" ({}) — resolve_conflict to close",
+            c.id, c.new_summary, c.conflicting_summary, c.layer
+        ));
+    }
+    out
+}
+
 /// Open sessions by id, so agents only pass a session handle between calls.
 pub struct Server {
     g: Gungnir,
@@ -167,6 +183,31 @@ impl Server {
                     "id": {"type": "string"},
                     "agent": {"type": "string"}
                 }), &["id", "agent"])
+            },
+            {
+                "name": "contradict",
+                "description": "Mark an entry contradicted by another entry (the newer evidence).",
+                "inputSchema": schema(json!({
+                    "id": {"type": "string"},
+                    "by": {"type": "string"},
+                    "verifier": {"type": "string"}
+                }), &["id", "by"])
+            },
+            {
+                "name": "conflicts",
+                "description": "List open conflict candidates. all: include resolved and dismissed.",
+                "inputSchema": schema(json!({
+                    "all": {"type": "boolean"}
+                }), &[])
+            },
+            {
+                "name": "resolve_conflict",
+                "description": "Close a conflict candidate. verb: supersede (newer truth, links the revision chain), contradict (verified entry is wrong), or dismiss (not a conflict).",
+                "inputSchema": schema(json!({
+                    "id": {"type": "string"},
+                    "verb": {"type": "string", "enum": ["supersede", "contradict", "dismiss"]},
+                    "agent": {"type": "string"}
+                }), &["id", "verb"])
             },
             {
                 "name": "list",
@@ -345,10 +386,13 @@ impl Server {
                 };
                 let summary =
                     arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
-                let id = self
-                    .g
-                    .promote(from, agent, kind, summary, arg("body").unwrap_or(""))?;
-                Ok(format!("promoted to {id}"))
+                let outcome =
+                    self.g
+                        .promote(from, agent, kind, summary, arg("body").unwrap_or(""))?;
+                Ok(conflict_note(
+                    format!("promoted to {}", outcome.id),
+                    &outcome.conflicts,
+                ))
             }
             "supersede" => {
                 let id: EntryId = arg("id")
@@ -358,10 +402,63 @@ impl Server {
                 let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let summary =
                     arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
-                let new_id = self
+                let outcome = self
                     .g
                     .supersede(id, agent, summary, arg("body").unwrap_or(""))?;
-                Ok(format!("revision {new_id} supersedes {id}"))
+                Ok(conflict_note(
+                    format!("revision {} supersedes {id}", outcome.id),
+                    &outcome.conflicts,
+                ))
+            }
+            "conflicts" => {
+                let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+                let records = if all {
+                    self.g.all_conflicts()?
+                } else {
+                    self.g.open_conflicts()?
+                };
+                if records.is_empty() {
+                    return Ok(if all {
+                        "(no conflict candidates)".into()
+                    } else {
+                        "(no open conflict candidates)".into()
+                    });
+                }
+                Ok(records
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}  {}  {} vs {}  [{}]\n    new:    \"{}\"\n    claims: \"{}\"",
+                            c.id,
+                            c.status,
+                            c.new_entry,
+                            c.conflicting_entry,
+                            c.layer,
+                            c.new_summary,
+                            c.conflicting_summary
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            "resolve_conflict" => {
+                let id: crate::conflicts::ConflictId = arg("id")
+                    .ok_or_else(|| Error::Invalid("id required".into()))?
+                    .parse()
+                    .map_err(|e| Error::Invalid(format!("bad conflict id: {e}")))?;
+                let verb = match arg("verb") {
+                    Some("supersede") => crate::conflicts::ConflictVerb::Supersede,
+                    Some("contradict") => crate::conflicts::ConflictVerb::Contradict,
+                    Some("dismiss") => crate::conflicts::ConflictVerb::Dismiss,
+                    other => {
+                        return Err(Error::Invalid(format!(
+                            "verb must be supersede|contradict|dismiss, got {other:?}"
+                        )))
+                    }
+                };
+                let actor = arg("agent").unwrap_or("agent");
+                let rec = self.g.resolve_conflict(id, verb, actor)?;
+                Ok(format!("{} resolved: {}", rec.id, rec.status))
             }
             "rollback" => {
                 let id: EntryId = arg("id")

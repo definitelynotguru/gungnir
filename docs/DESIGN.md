@@ -134,6 +134,52 @@ against corrupted chains.
 Plan and apply are separate functions, so tooling can preview a rollback
 before executing it.
 
+## Conflict candidates
+
+A write that disagrees with a live verified fact used to coexist with it
+silently. Now every claim write (`add`, `supersede`, `promote`, and the
+promotions inside `end_session`) lands first, then the store scans for
+conflict candidates: *advisory* records under `<root>/.conflicts/`, one
+markdown file per candidate. Detection never blocks a write — a conflict is
+a queue item, not an error.
+
+**What counts as a candidate.** Only a *live verified* fact can be
+conflicted with — superseded tails, contradicted, and rolled-back entries
+are out, which falls straight out of running detection under the same
+`current` temporal view recall uses. The write is scanned against its home
+layer plus the Codex (a journal fact disagreeing with a verified Codex
+claim is exactly what the loop exists to surface; one agent's journal never
+scans another's). Scratch observations never raise candidates — they are
+working memory, not claims — and neither do `Session` archives or
+`Rollback` records.
+
+**The signals are deterministic and documented on the record.** Over
+stemmed summary tokens: `shared_frame` (≥2 shared topic tokens and private
+content on both sides — "sessions use mysql" vs "sessions use postgres"),
+`negation_asymmetry` (one side negates), and `numeric_mismatch` (different
+digit-bearing tokens). Each record carries the signal that raised it, so a
+reviewer sees *why* the candidate exists. The trade is deliberate: flag the
+same-frame divergence and let people dismiss the noise, rather than miss a
+real contradiction. Near-duplicates never flag — an identical token set is
+corroboration. With the `embed` build, `--semantic` on `add`/`supersede`/
+`promote` adds a fourth signal, `semantic_overlap` (cosine ≥ 0.70), which
+catches paraphrased contradictions at a higher false-positive cost.
+
+**Resolution is the trust model's existing vocabulary, not a new state.**
+`gungnir conflicts resolve <id> --supersede|--contradict|--dismiss`:
+supersede links the new entry as the revision of the conflicting one (the
+same end state write-time `supersede` produces); contradict marks the
+verified entry `contradicted_by` the new claim through the same logged
+transition; dismiss closes the record without touching entries. Resolution
+is recorded on the candidate (`resolved_by`, `resolved_at`), and a resolved
+record can never be re-resolved.
+
+**Why files and not virtual state.** A candidate has a lifecycle:
+`dismissed` and `resolved-*` are terminal states no scan can reconstruct.
+A `.conflicts/` markdown queue persists them in the substrate the product
+already sells — git-diffable, human-editable — rather than hiding them in a
+derived index.
+
 ## Concurrency and durability
 
 Writes go to a temporary sibling then `rename` into place, atomic on POSIX and

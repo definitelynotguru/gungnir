@@ -34,6 +34,8 @@ pub struct BriefingInput {
     /// Cross-journal topic counts, excluding the requesting agent. Counts
     /// only: peer summaries and bodies never reach the briefing.
     pub peers: PeerCoverage,
+    /// Open conflict candidates touching this briefing's hits.
+    pub open_conflicts: usize,
 }
 
 fn label(hit: &Hit, superseded: &HashSet<EntryId>, task_tokens: &[String]) -> String {
@@ -179,6 +181,13 @@ pub fn compile(input: BriefingInput) -> Briefing {
         ));
     }
 
+    if input.open_conflicts > 0 {
+        md.push_str(&format!(
+            "\nWarning: {} unresolved conflict candidate(s) on this topic — see `gungnir conflicts`.\n",
+            input.open_conflicts
+        ));
+    }
+
     let mut skipped = input.codex_skipped;
     skipped.extend(input.journal_skipped);
 
@@ -207,6 +216,7 @@ mod tests {
             codex_skipped: vec![],
             journal_skipped: vec![],
             peers: PeerCoverage::default(),
+            open_conflicts: 0,
         }
     }
 

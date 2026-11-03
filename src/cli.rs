@@ -4,11 +4,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::conflicts::{ConflictId, ConflictVerb};
 use crate::entry::EntryKind;
 use crate::id::EntryId;
 use crate::layout;
 use crate::recall::Query;
-use crate::{Error, Gungnir, Result};
+use crate::{Error, Gungnir, Result, WriteOutcome};
 
 #[derive(Parser)]
 #[command(
@@ -48,6 +49,10 @@ enum Cmd {
         /// Target layer: codex (default) or journal
         #[arg(long, default_value = "codex")]
         into: String,
+        /// Fuse embedding similarity into conflict detection (requires the
+        /// `embed` feature).
+        #[arg(long)]
+        semantic: bool,
     },
 
     /// Show one entry from any layer.
@@ -108,6 +113,7 @@ enum Cmd {
 
     /// Mark an entry contradicted by another entry.
     Contradict {
+        /// The entry to mark contradicted.
         id: EntryId,
         /// The entry that contradicts `id`
         #[arg(long)]
@@ -128,6 +134,10 @@ enum Cmd {
         summary: String,
         #[arg(long, default_value = "")]
         body: String,
+        /// Fuse embedding similarity into conflict detection (requires the
+        /// `embed` feature).
+        #[arg(long)]
+        semantic: bool,
     },
 
     /// Non-destructive rollback to the first verified ancestor.
@@ -148,6 +158,19 @@ enum Cmd {
         summary: String,
         #[arg(long, default_value = "")]
         body: String,
+        /// Fuse embedding similarity into conflict detection (requires the
+        /// `embed` feature).
+        #[arg(long)]
+        semantic: bool,
+    },
+
+    /// List conflict candidates; `resolve` closes one with a verb.
+    Conflicts {
+        /// Include resolved and dismissed candidates.
+        #[arg(long)]
+        all: bool,
+        #[command(subcommand)]
+        cmd: Option<ConflictsCmd>,
     },
 
     /// Compile the pre-task briefing for an agent.
@@ -184,6 +207,28 @@ enum Cmd {
 
     /// Run the MCP server on stdio (for Claude Code, Cursor, etc.).
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum ConflictsCmd {
+    /// Close a conflict candidate with one resolution verb.
+    Resolve {
+        /// The candidate id, printed by `gungnir conflicts`.
+        id: ConflictId,
+        /// The new entry is the newer truth: link it as the revision of the
+        /// conflicting entry, so current views hide the old claim.
+        #[arg(long)]
+        supersede: bool,
+        /// The verified entry is wrong: mark it contradicted by the new one.
+        #[arg(long)]
+        contradict: bool,
+        /// Not actually a conflict: close the candidate, touch nothing else.
+        #[arg(long)]
+        dismiss: bool,
+        /// Who is resolving, recorded on the candidate.
+        #[arg(long, default_value = "human")]
+        actor: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -311,6 +356,17 @@ fn embedder_for(_g: &Gungnir) -> Result<()> {
     ))
 }
 
+/// Advisory only: the write already landed, so candidates go to stderr and
+/// never change exit codes or the id printed on stdout.
+fn note_conflicts(outcome: &WriteOutcome) {
+    for c in &outcome.conflicts {
+        eprintln!(
+            "conflict candidate {}: \"{}\" vs verified \"{}\" ({}) — `gungnir conflicts` to resolve",
+            c.id, c.new_summary, c.conflicting_summary, c.layer
+        );
+    }
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
     use Cmd as C;
     let g = gng(&cli.root)?;
@@ -328,18 +384,32 @@ fn dispatch(cli: Cli) -> Result<()> {
             project,
             review_of,
             into,
+            semantic,
         } => {
             let mut e = crate::Entry::new(&agent, kind, summary);
             e.body = body;
             e.project_id = project;
             e.review_of = review_of;
-            let store = match layer_of(&into)? {
-                crate::layout::CODEX => g.codex()?,
-                _ => g.journal(&agent)?,
+            let layer = match layer_of(&into)? {
+                crate::layout::CODEX => crate::gungnir::Layer::Codex,
+                _ => crate::gungnir::Layer::Journal { agent: &agent },
             };
-            // Cross-layer resolver so a journal review can cite a codex target.
-            store.create_with(&e, &|id| Ok(g.locate(id)?.is_some()))?;
-            println!("{}", e.id);
+            let outcome = if semantic {
+                #[cfg(feature = "embed")]
+                {
+                    let emb = embedder_for(&g)?;
+                    g.add_semantic(e, layer, &emb)?
+                }
+                #[cfg(not(feature = "embed"))]
+                {
+                    embedder_for(&g)?;
+                    unreachable!("--semantic errors without the embed feature")
+                }
+            } else {
+                g.add(e, layer)?
+            };
+            note_conflicts(&outcome);
+            println!("{}", outcome.id);
         }
 
         C::Get { id } => {
@@ -524,9 +594,24 @@ fn dispatch(cli: Cli) -> Result<()> {
             agent,
             summary,
             body,
+            semantic,
         } => {
-            let new_id = g.supersede(id, &agent, summary, body)?;
-            println!("{new_id}");
+            let outcome = if semantic {
+                #[cfg(feature = "embed")]
+                {
+                    let emb = embedder_for(&g)?;
+                    g.supersede_semantic(id, &agent, summary, body, &emb)?
+                }
+                #[cfg(not(feature = "embed"))]
+                {
+                    embedder_for(&g)?;
+                    unreachable!("--semantic errors without the embed feature")
+                }
+            } else {
+                g.supersede(id, &agent, summary, body)?
+            };
+            note_conflicts(&outcome);
+            println!("{}", outcome.id);
         }
 
         C::Rollback { id, agent } => {
@@ -540,10 +625,66 @@ fn dispatch(cli: Cli) -> Result<()> {
             kind,
             summary,
             body,
+            semantic,
         } => {
-            let id = g.promote(from, &agent, kind, summary, body)?;
-            println!("{id}");
+            let outcome = if semantic {
+                #[cfg(feature = "embed")]
+                {
+                    let emb = embedder_for(&g)?;
+                    g.promote_semantic(from, &agent, kind, summary, body, &emb)?
+                }
+                #[cfg(not(feature = "embed"))]
+                {
+                    embedder_for(&g)?;
+                    unreachable!("--semantic errors without the embed feature")
+                }
+            } else {
+                g.promote(from, &agent, kind, summary, body)?
+            };
+            note_conflicts(&outcome);
+            println!("{}", outcome.id);
         }
+
+        C::Conflicts { all, cmd } => match cmd {
+            None => {
+                let records = if all {
+                    g.all_conflicts()?
+                } else {
+                    g.open_conflicts()?
+                };
+                if records.is_empty() {
+                    println!("(no {}conflict candidates)", if all { "" } else { "open " });
+                }
+                for c in records {
+                    println!(
+                        "{}  {:<22}  {}  vs  {}  [{}]",
+                        c.id, c.status, c.new_entry, c.conflicting_entry, c.layer
+                    );
+                    println!("    new:    \"{}\"", c.new_summary);
+                    println!("    claims: \"{}\"", c.conflicting_summary);
+                }
+            }
+            Some(ConflictsCmd::Resolve {
+                id,
+                supersede,
+                contradict,
+                dismiss,
+                actor,
+            }) => {
+                let verb = match (supersede, contradict, dismiss) {
+                    (true, false, false) => ConflictVerb::Supersede,
+                    (false, true, false) => ConflictVerb::Contradict,
+                    (false, false, true) => ConflictVerb::Dismiss,
+                    _ => {
+                        return Err(Error::Invalid(
+                            "pick exactly one of --supersede, --contradict, --dismiss".into(),
+                        ))
+                    }
+                };
+                let rec = g.resolve_conflict(id, verb, &actor)?;
+                println!("{} resolved: {}", rec.id, rec.status);
+            }
+        },
 
         C::Brief {
             agent,

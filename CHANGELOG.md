@@ -69,6 +69,22 @@ All notable changes to Gungnir are documented here. The format follows
   entries) so a second agent stops repeating a documented failure. Counts
   only; peer summaries, bodies, and ids never leave their journal. Topic
   existence per agent is the documented leak.
+- **Conflict candidates.** Claim writes (`add`, `supersede`, `promote`,
+  `end_session` promotions) now scan for disagreement with live verified
+  facts after landing and record candidates under `.conflicts/` — advisory,
+  never blocking. Detection is deterministic: BM25-lite topic match plus
+  lexical signals (`shared_frame`, `negation_asymmetry`,
+  `numeric_mismatch`), with an opt-in `semantic_overlap` channel on the
+  `embed` build (`--semantic` on `add`/`supersede`/`promote`).
+  `gungnir conflicts` lists the queue;
+  `gungnir conflicts resolve <id> --supersede|--contradict|--dismiss`
+  closes it through the existing trust verbs; briefings warn on open
+  candidates touching the topic.
+- **`contradict` on CLI and MCP.** `gungnir contradict <id> --by <id>` and
+  the `contradict`/`conflicts`/`resolve_conflict` MCP tools expose the
+  contradiction lifecycle that previously existed only in the Rust API.
+- `Gungnir::add`, `supersede`, `promote`, and `end_session` now return
+  outcomes carrying any conflict candidates the write raised.
 
 ### Changed (breaking)
 

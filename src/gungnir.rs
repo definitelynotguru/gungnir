@@ -14,9 +14,10 @@ use chrono::Utc;
 use sha2::Digest as _;
 
 use crate::briefing::{self, Briefing, BriefingInput};
+use crate::conflicts::{self, ConflictId, ConflictRecord, ConflictStatus, ConflictVerb, Conflicts};
 use crate::entry::{Entry, EntryKind, Evidence, VerificationState};
 use crate::id::EntryId;
-use crate::layout::{self, CODEX, JOURNAL, SCRATCH};
+use crate::layout::{self, CODEX, CONFLICTS, JOURNAL, SCRATCH};
 use crate::recall::{self, Hit, Query, SearchOutcome};
 use crate::rollback;
 use crate::store::Skipped;
@@ -51,6 +52,19 @@ pub struct EndReport {
     pub promoted: Vec<EntryId>,
     /// The session had already been archived: this end was a no-op.
     pub already_ended: bool,
+    /// Conflict candidates the promoted claims raised against verified
+    /// Codex facts. The journal archive itself is session bookkeeping and
+    /// never raises.
+    pub conflicts: Vec<ConflictRecord>,
+}
+
+/// What a claim write produced: the entry id plus any conflict candidates
+/// it raised against live verified facts. Candidates are advisory — the
+/// write already landed; the queue just waits for a resolution verb.
+#[derive(Clone, Debug)]
+pub struct WriteOutcome {
+    pub id: EntryId,
+    pub conflicts: Vec<ConflictRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +190,107 @@ impl Gungnir {
                 .join(SCRATCH)
                 .join(layout::sanitize_component(session_id)),
         )
+    }
+
+    /// The conflict-candidate queue under `<root>/.conflicts/`.
+    fn conflicts_queue(&self) -> Conflicts {
+        Conflicts::open(self.root.join(CONFLICTS))
+    }
+
+    /// Every recorded conflict candidate, oldest first.
+    pub fn all_conflicts(&self) -> Result<Vec<ConflictRecord>> {
+        self.conflicts_queue().list()
+    }
+
+    /// Candidates still awaiting a resolution verb. Reads past records that
+    /// fail to parse — the strict, corruption-reporting view is
+    /// [`Self::all_conflicts`].
+    pub fn open_conflicts(&self) -> Result<Vec<ConflictRecord>> {
+        self.conflicts_queue().open_lenient()
+    }
+
+    /// Stores scanned for conflicts after a claim write lands in `home`:
+    /// always the write's own layer, plus the shared Codex when the write
+    /// lands in a Journal — journal facts are private, but disagreeing with
+    /// a verified Codex claim is exactly what the loop exists to surface.
+    /// One agent's journal never scans another's, and scratch is working
+    /// memory, not claims, so it never scans at all. Labels come from the
+    /// store path, not the writer's name: a supersede can land a revision
+    /// in another agent's journal.
+    fn conflict_scopes(&self, home: &Store) -> Result<Vec<(Store, String)>> {
+        let codex_root = self.root.join(CODEX);
+        if home.root() == codex_root {
+            return Ok(vec![(home.clone(), "codex".to_string())]);
+        }
+        if let Ok(rel) = home.root().strip_prefix(self.root.join(JOURNAL)) {
+            let mut scopes = vec![(home.clone(), format!("journal/{}", rel.display()))];
+            scopes.push((Store::open(&codex_root)?, "codex".to_string()));
+            return Ok(scopes);
+        }
+        Ok(vec![])
+    }
+
+    /// Detect + record conflict candidates for `entry` across its scopes.
+    /// Detection runs after the write lands and can only add records — a
+    /// detection error surfaces to the caller but the entry stays written.
+    fn scan_and_record(
+        &self,
+        home: &Store,
+        entry: &Entry,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> Result<Vec<ConflictRecord>> {
+        let queue = self.conflicts_queue();
+        let mut records = Vec::new();
+        for (store, layer) in self.conflict_scopes(home)? {
+            for rec in conflicts::detect(&store, &layer, entry, embedder)? {
+                queue.record(&rec)?;
+                records.push(rec);
+            }
+        }
+        Ok(records)
+    }
+
+    // -- writes --------------------------------------------------------------
+
+    /// Write a claim into `layer` (Codex or the agent's Journal), then scan
+    /// for conflict candidates against live verified facts. The write always
+    /// lands first: conflicts are advisory records in `.conflicts/`, never a
+    /// gate.
+    pub fn add(&self, entry: Entry, layer: Layer<'_>) -> Result<WriteOutcome> {
+        self.add_inner(entry, layer, None)
+    }
+
+    /// `add` with the semantic channel fused into conflict detection.
+    pub fn add_semantic(
+        &self,
+        entry: Entry,
+        layer: Layer<'_>,
+        embedder: &dyn crate::embedding::Embedder,
+    ) -> Result<WriteOutcome> {
+        self.add_inner(entry, layer, Some(embedder))
+    }
+
+    fn add_inner(
+        &self,
+        entry: Entry,
+        layer: Layer<'_>,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> Result<WriteOutcome> {
+        let store = match layer {
+            Layer::Codex => self.codex()?,
+            Layer::Journal { agent } => self.journal(agent)?,
+            Layer::Scratch { .. } => {
+                return Err(Error::Invalid(
+                    "claims land in codex or journal; scratch is session working memory".into(),
+                ))
+            }
+        };
+        store.create_with(&entry, &|id| self.exists_anywhere(id))?;
+        let conflicts = self.scan_and_record(&store, &entry, embedder)?;
+        Ok(WriteOutcome {
+            id: entry.id,
+            conflicts,
+        })
     }
 
     // -- session lifecycle ---------------------------------------------------
@@ -355,6 +470,27 @@ impl Gungnir {
         summary: impl AsRef<str>,
         promotions: Vec<Promotion>,
     ) -> Result<EndReport> {
+        self.end_session_inner(session, summary, promotions, None)
+    }
+
+    /// `end_session` with semantic conflict detection over the promotions.
+    pub fn end_session_semantic(
+        &self,
+        session: &Session,
+        summary: impl AsRef<str>,
+        promotions: Vec<Promotion>,
+        embedder: &dyn crate::embedding::Embedder,
+    ) -> Result<EndReport> {
+        self.end_session_inner(session, summary, promotions, Some(embedder))
+    }
+
+    fn end_session_inner(
+        &self,
+        session: &Session,
+        summary: impl AsRef<str>,
+        promotions: Vec<Promotion>,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> Result<EndReport> {
         let summary = summary.as_ref();
         // Serialize the check-archive-and-write-archive sequence across
         // processes and against add_scratch: without a session lock two
@@ -376,7 +512,7 @@ impl Gungnir {
             // A crashed end can leave pending promotions and scratch behind;
             // finish the promotions (skipping the ones that landed) and
             // converge by clearing scratch.
-            let promoted =
+            let (promoted, _fresh) =
                 self.finish_promotions(archive, &session.id, &session.agent, promotions)?;
             if scratch_exists {
                 std::fs::remove_dir_all(&dir)?;
@@ -385,6 +521,7 @@ impl Gungnir {
                 journal_id: archive,
                 promoted,
                 already_ended: true,
+                conflicts: vec![],
             });
         }
 
@@ -446,17 +583,30 @@ impl Gungnir {
         // finish_promotions must not leave scratch behind to keep
         // accepting notes a retry would delete unarchived. The
         // tombstone covers a crash inside remove_dir_all itself.
+        let dir = self
+            .root
+            .join(SCRATCH)
+            .join(layout::sanitize_component(&session.id));
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
 
-        let promoted =
+        let (promoted, fresh) =
             self.finish_promotions(journal_entry.id, &session.id, &session.agent, promotions)?;
+
+        // Scan the freshly landed promotions: entries deduped on retry
+        // were already scanned by the end that created them.
+        let codex = self.codex()?;
+        let mut conflicts = Vec::new();
+        for c in &fresh {
+            conflicts.extend(self.scan_and_record(&codex, c, embedder)?);
+        }
 
         Ok(EndReport {
             journal_id: journal_entry.id,
             promoted,
             already_ended: false,
+            conflicts,
         })
     }
 
@@ -464,13 +614,16 @@ impl Gungnir {
     /// evidence. Retries dedupe on `session_id` + `summary`, so a crash or
     /// validation failure mid-loop leaves the next end_session able to
     /// finish the set without duplicating what landed.
+    /// Returns every promoted id plus the entries this call created —
+    /// deduped retries report the id but skip the conflict scan the
+    /// first end already ran on the landed entry.
     fn finish_promotions(
         &self,
         archive: EntryId,
         session_id: &str,
         agent: &str,
         promotions: Vec<Promotion>,
-    ) -> Result<Vec<EntryId>> {
+    ) -> Result<(Vec<EntryId>, Vec<Entry>)> {
         let codex = self.codex()?;
         // Dedupe on (kind, summary, body): two different findings can
         // share a summary, and a retry re-listing a promotion must land
@@ -483,6 +636,7 @@ impl Gungnir {
             .map(|e| ((e.kind, e.summary, e.body), e.id))
             .collect();
         let mut promoted_ids = Vec::new();
+        let mut fresh = Vec::new();
         for p in promotions {
             if let Some(&existing) = by_key.get(&(p.kind, p.summary.clone(), p.body.clone())) {
                 promoted_ids.push(existing);
@@ -496,8 +650,9 @@ impl Gungnir {
             codex.create_with(&c, &|id| self.exists_anywhere(id))?;
             by_key.insert((c.kind, c.summary.clone(), c.body.clone()), c.id);
             promoted_ids.push(c.id);
+            fresh.push(c);
         }
-        Ok(promoted_ids)
+        Ok((promoted_ids, fresh))
     }
 
     // -- reading -------------------------------------------------------------
@@ -541,6 +696,20 @@ impl Gungnir {
         };
         let codex_out = search(&codex, &q)?;
         let journal_out = search(&journal, &q)?;
+        // Open conflict candidates touching this topic's hits warn in the
+        // briefing — the same role the CONTRADICTED warning plays, one step
+        // earlier in the lifecycle.
+        let hit_ids: HashSet<EntryId> = codex_out
+            .hits
+            .iter()
+            .chain(&journal_out.hits)
+            .map(|h| h.entry.id)
+            .collect();
+        let open_conflicts = self
+            .open_conflicts()?
+            .iter()
+            .filter(|c| hit_ids.contains(&c.new_entry) || hit_ids.contains(&c.conflicting_entry))
+            .count();
         Ok(briefing::compile(BriefingInput {
             task: task.to_string(),
             codex_hits: codex_out.hits,
@@ -552,6 +721,7 @@ impl Gungnir {
             codex_skipped: codex_out.skipped,
             journal_skipped: journal_out.skipped,
             peers: self.peer_coverage_inner(Some(agent), task, embedder)?,
+            open_conflicts,
         }))
     }
 
@@ -747,16 +917,132 @@ impl Gungnir {
         store.update_with(&entry, &|id| self.exists_anywhere(id))
     }
 
-    /// Write a revision of `old`: same kind, project, and evidence, linked
-    /// by `revises`. The parent's evidence carries forward — a revision of
-    /// a fact still stands on the record that proved it.
+    /// Close a conflict candidate with one of the three resolution verbs.
+    ///
+    /// - `Supersede` ("I'm newer"): link `new_entry.revises` to the
+    ///   conflicting entry. The verified fact stays `verified` but is now
+    ///   superseded, so `current` views hide it — the same end state the
+    ///   write-time `supersede` verb produces. Refuses to relink when the
+    ///   new entry already revises something else, and refuses across
+    ///   layers: supersession only hides the parent under the store that
+    ///   holds the revision, so a journal revision cannot supersede a codex
+    ///   fact (contradict or dismiss instead).
+    /// - `Contradict` ("it's wrong"): mark the verified entry contradicted
+    ///   by the new one, through the same logged transition `contradict`
+    ///   uses everywhere.
+    /// - `Dismiss` ("not a conflict"): close the record; entries untouched.
+    ///
+    /// Entry mutations run first and the record closes last, so a crash
+    /// leaves the candidate open rather than resolved-but-unapplied.
+    pub fn resolve_conflict(
+        &self,
+        id: ConflictId,
+        verb: ConflictVerb,
+        actor: &str,
+    ) -> Result<ConflictRecord> {
+        let queue = self.conflicts_queue();
+        let mut rec = queue.require(id)?;
+        if rec.status != ConflictStatus::Open {
+            return Err(Error::Invalid(format!(
+                "conflict {id} is already {status}",
+                status = rec.status
+            )));
+        }
+
+        match verb {
+            ConflictVerb::Supersede => {
+                let store = self
+                    .locate(rec.new_entry)?
+                    .ok_or(Error::NotFound(rec.new_entry))?;
+                let old_store = self
+                    .locate(rec.conflicting_entry)?
+                    .ok_or(Error::NotFound(rec.conflicting_entry))?;
+                if old_store.root() != store.root() {
+                    return Err(Error::Invalid(
+                        "supersede cannot span layers: the revision would not hide the superseded fact (use --contradict or --dismiss)".into(),
+                    ));
+                }
+                let mut entry = store.require(rec.new_entry)?;
+                match entry.revises {
+                    None => {
+                        entry.revises = Some(rec.conflicting_entry);
+                        store.update_with(&entry, &|id| self.exists_anywhere(id))?;
+                    }
+                    Some(prev) if prev == rec.conflicting_entry => {}
+                    Some(prev) => {
+                        return Err(Error::Invalid(format!(
+                            "{} already revises {prev}; refusing to relink",
+                            rec.new_entry
+                        )));
+                    }
+                }
+            }
+            ConflictVerb::Contradict => {
+                if !self.exists_anywhere(rec.new_entry)? {
+                    return Err(Error::NotFound(rec.new_entry));
+                }
+                let store = self
+                    .locate(rec.conflicting_entry)?
+                    .ok_or(Error::NotFound(rec.conflicting_entry))?;
+                let mut entry = store.require(rec.conflicting_entry)?;
+                if entry.verification == VerificationState::RolledBack {
+                    return Err(Error::Invalid(format!(
+                        "{} is rolled back; contradict applies to live facts",
+                        rec.conflicting_entry
+                    )));
+                }
+                if entry.verification != (VerificationState::Contradicted { by: rec.new_entry }) {
+                    entry.contradict(rec.new_entry, actor, None);
+                    store.update_with(&entry, &|id| self.exists_anywhere(id))?;
+                }
+            }
+            ConflictVerb::Dismiss => {}
+        }
+
+        rec.status = match verb {
+            ConflictVerb::Supersede => ConflictStatus::ResolvedSuperseded,
+            ConflictVerb::Contradict => ConflictStatus::ResolvedContradicted,
+            ConflictVerb::Dismiss => ConflictStatus::Dismissed,
+        };
+        rec.resolved_by = Some(actor.to_string());
+        rec.resolved_at = Some(Utc::now());
+        queue.update(&rec)?;
+        Ok(rec)
+    }
+
+    /// Write a revision of `old`: same kind and project, linked by `revises`.
+    /// The new claim is still scanned for conflicts — revising one fact does
+    /// not clear it of disagreeing with a *different* verified fact.
     pub fn supersede(
         &self,
         old: EntryId,
         agent: &str,
         summary: impl Into<String>,
         body: impl Into<String>,
-    ) -> Result<EntryId> {
+    ) -> Result<WriteOutcome> {
+        self.supersede_inner(old, agent, summary, body, None)
+    }
+
+    /// `supersede` with the semantic channel fused into conflict detection.
+    pub fn supersede_semantic(
+        &self,
+        old: EntryId,
+        agent: &str,
+        summary: impl Into<String>,
+        body: impl Into<String>,
+        embedder: &dyn crate::embedding::Embedder,
+    ) -> Result<WriteOutcome> {
+        self.supersede_inner(old, agent, summary, body, Some(embedder))
+    }
+
+    fn supersede_inner(
+        &self,
+        old: EntryId,
+        agent: &str,
+        summary: impl Into<String>,
+        body: impl Into<String>,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> Result<WriteOutcome> {
         let store = self.locate(old)?.ok_or(Error::NotFound(old))?;
         let prev = store.require(old)?;
         let mut next = Entry::new(agent, prev.kind, summary);
@@ -781,7 +1067,11 @@ impl Gungnir {
         next.evidence = evidence;
         next.body = body.into();
         store.create_with(&next, &|id| self.exists_anywhere(id))?;
-        Ok(next.id)
+        let conflicts = self.scan_and_record(&store, &next, embedder)?;
+        Ok(WriteOutcome {
+            id: next.id,
+            conflicts,
+        })
     }
 
     pub fn rollback(&self, target: EntryId, agent: &str) -> Result<EntryId> {
@@ -873,7 +1163,8 @@ impl Gungnir {
     /// Promote a Journal entry's finding into the Codex with a provenance
     /// link back to `from`. Sources must live in the Journal: a Codex
     /// source would cite its own layer, and a Scratch source would cite a
-    /// file that `end_session` deletes.
+    /// file that `end_session` deletes. The promoted claim is scanned for
+    /// conflicts against live verified Codex facts.
     pub fn promote(
         &self,
         from: EntryId,
@@ -881,7 +1172,32 @@ impl Gungnir {
         kind: EntryKind,
         summary: impl Into<String>,
         body: impl Into<String>,
-    ) -> Result<EntryId> {
+    ) -> Result<WriteOutcome> {
+        self.promote_inner(from, agent, kind, summary, body, None)
+    }
+
+    /// `promote` with the semantic channel fused into conflict detection.
+    pub fn promote_semantic(
+        &self,
+        from: EntryId,
+        agent: &str,
+        kind: EntryKind,
+        summary: impl Into<String>,
+        body: impl Into<String>,
+        embedder: &dyn crate::embedding::Embedder,
+    ) -> Result<WriteOutcome> {
+        self.promote_inner(from, agent, kind, summary, body, Some(embedder))
+    }
+
+    fn promote_inner(
+        &self,
+        from: EntryId,
+        agent: &str,
+        kind: EntryKind,
+        summary: impl Into<String>,
+        body: impl Into<String>,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> Result<WriteOutcome> {
         let store = self.locate(from)?.ok_or(Error::NotFound(from))?;
         if !store.root().starts_with(self.root.join(JOURNAL)) {
             return Err(Error::Invalid(format!(
@@ -896,7 +1212,11 @@ impl Gungnir {
             c.review_of = Some(from);
         }
         codex.create_with(&c, &|id| self.exists_anywhere(id))?;
-        Ok(c.id)
+        let conflicts = self.scan_and_record(&codex, &c, embedder)?;
+        Ok(WriteOutcome {
+            id: c.id,
+            conflicts,
+        })
     }
 
     /// Find which layer partition holds `id`. Cheap because paths are
@@ -1218,7 +1538,8 @@ mod tests {
 
         let v2 = g
             .supersede(v1.id, "a", "use postgres", "migration done")
-            .unwrap();
+            .unwrap()
+            .id;
         let stored = codex.require(v2).unwrap();
         assert_eq!(stored.revises, Some(v1.id));
 
@@ -1261,7 +1582,8 @@ mod tests {
                 "cache tuning worked",
                 "hit rate now 40%",
             )
-            .unwrap();
+            .unwrap()
+            .id;
         g.verify(cid, "team", None).unwrap();
 
         let stored = g.codex().unwrap().require(cid).unwrap();
