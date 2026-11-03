@@ -150,6 +150,31 @@ impl Gungnir {
             .join(layout::sanitize_component(session_id))
     }
 
+    /// The journal root for `agent` plus an exclusive per-session lock
+    /// file under it. end_session and add_scratch both take it, so a
+    /// note's check-and-write never interleaves with an end's
+    /// archive-and-delete. The file lives in the journal, which outlives
+    /// scratch cleanup; Store::scan only reads ULID-named .md files, so
+    /// dotfiles are invisible to it.
+    fn session_lock(&self, agent: &str, session_id: &str) -> Result<(PathBuf, std::fs::File)> {
+        let journal_root = self
+            .root
+            .join(JOURNAL)
+            .join(layout::sanitize_component(agent));
+        std::fs::create_dir_all(&journal_root)?;
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(journal_root.join(format!(
+                ".end-{}.lock",
+                layout::sanitize_component(session_id)
+            )))?;
+        lock_file.lock_exclusive()?;
+        Ok((journal_root, lock_file))
+    }
+
     fn session_meta_path(&self, session_id: &str) -> PathBuf {
         self.session_dir(session_id).join(".session.yaml")
     }
@@ -225,14 +250,27 @@ impl Gungnir {
         text: String,
         outcome: Option<bool>,
     ) -> Result<EntryId> {
+        // The session lock serializes this check-and-write against
+        // end_session's archive-and-delete: an add accepted while an end
+        // runs is either scanned into the archive or rejected, never
+        // deleted unseen.
+        let (journal_root, _end_lock) = self.session_lock(&session.agent, &session.id)?;
         let dir_exists = self.session_dir(&session.id).exists();
         // Scratch existing means the session is live: a successful end
         // deletes it, so its presence is the cheap signal that skips the
-        // journal parse on every write. Only when scratch is absent does
-        // the journal decide — an archive found there means the session
-        // is done and a write accepted now would be deleted unarchived
-        // on the next end.
-        if !dir_exists && self.find_archive(&session.agent, &session.id)?.is_some() {
+        // journal parse on every write. The `.ended-<id>` tombstone,
+        // written before the archive and surviving a crashed scratch
+        // cleanup, demotes a dead session's leftover scratch back to the
+        // journal check — otherwise a partially ended session would keep
+        // accepting notes the next end deletes unarchived.
+        let tombstoned = journal_root
+            .join(format!(
+                ".ended-{}",
+                layout::sanitize_component(&session.id)
+            ))
+            .exists();
+        if (!dir_exists || tombstoned) && self.find_archive(&session.agent, &session.id)?.is_some()
+        {
             return Err(Error::Invalid(format!(
                 "session {} already ended; its notes are archived and new ones cannot be added",
                 session.id
@@ -266,25 +304,11 @@ impl Gungnir {
     ) -> Result<EndReport> {
         let summary = summary.as_ref();
         // Serialize the check-archive-and-write-archive sequence across
-        // processes: without a session lock two concurrent ends both see
-        // "no archive" and write duplicate journal entries. The lock file
-        // lives in the journal, which outlives scratch cleanup.
-        let journal_root = self
-            .root
-            .join(JOURNAL)
-            .join(layout::sanitize_component(&session.agent));
-        std::fs::create_dir_all(&journal_root)?;
-        let lock_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(journal_root.join(format!(
-                ".end-{}.lock",
-                layout::sanitize_component(&session.id)
-            )))?;
-        lock_file.lock_exclusive()?;
-        let _end_lock = lock_file;
+        // processes and against add_scratch: without a session lock two
+        // concurrent ends both see "no archive" and write duplicate
+        // journal entries, and a concurrent add can be accepted into
+        // scratch the delete then removes unseen.
+        let (journal_root, _end_lock) = self.session_lock(&session.agent, &session.id)?;
 
         let dir = self.session_dir(&session.id);
         let scratch_exists = dir.exists();
@@ -347,16 +371,34 @@ impl Gungnir {
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| session.task.clone());
 
+        // The tombstone goes down before the archive so an end that
+        // fails between them still leaves a marker telling add_scratch
+        // to consult the journal instead of trusting leftover scratch.
+        std::fs::write(
+            journal_root.join(format!(
+                ".ended-{}",
+                layout::sanitize_component(&session.id)
+            )),
+            b"",
+        )?;
+
         let mut journal_entry = Entry::new(&session.agent, EntryKind::Session, summary);
         journal_entry.session_id = Some(session.id.clone());
         journal_entry.body = format!("# Task\n{task}\n\n# Transcript\n{transcript}");
         let journal_store = self.journal(&session.agent)?;
         journal_store.create(&journal_entry)?;
 
+        // Scratch goes before promotions: once the archive exists the
+        // session is ended, and a crash or validation failure in
+        // finish_promotions must not leave scratch behind to keep
+        // accepting notes a retry would delete unarchived. The
+        // tombstone covers a crash inside remove_dir_all itself.
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+
         let promoted =
             self.finish_promotions(journal_entry.id, &session.id, &session.agent, promotions)?;
-
-        std::fs::remove_dir_all(&dir)?;
 
         Ok(EndReport {
             journal_id: journal_entry.id,
