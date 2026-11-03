@@ -550,7 +550,13 @@ impl Gungnir {
             if Some(&name) == exclude.as_ref() {
                 continue;
             }
-            let out = recall::search_with_coverage(&Store::open(base.join(&name))?, &q)?;
+            // Best-effort: a corrupt file in a peer's journal must not fail
+            // this agent's briefing. Skipped partitions simply don't count.
+            let Ok(out) =
+                Store::open(base.join(&name)).and_then(|s| recall::search_with_coverage(&s, &q))
+            else {
+                continue;
+            };
             if out.hits.is_empty() {
                 continue;
             }
@@ -664,8 +670,11 @@ impl Gungnir {
             while !text.is_char_boundary(end) {
                 end -= 1;
             }
+            // Canonicalize so a citation recorded as a relative path still
+            // revalidates when later commands run from another directory.
+            let recorded = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
             entry.evidence.push(Evidence::File {
-                path: path.display().to_string(),
+                path: recorded.display().to_string(),
                 excerpt: text[..end].to_string(),
                 sha256: digest,
             });
@@ -912,11 +921,16 @@ fn supersedes(e: &&Entry) -> bool {
 
 /// Whether an entry records a failed attempt. Attempt bodies open with
 /// `outcome: failed` (written by [`Gungnir::add_attempt`]); a session
-/// archive carries the same fact as a `[failed]` transcript tag.
+/// archive carries the same fact on transcript lines that read
+/// `- attempt: <summary> [failed]`. A raw substring match would count task
+/// text or a summary that merely mentions "[failed]".
 fn failed_attempt(h: &crate::recall::Hit) -> bool {
     let e = &h.entry;
     e.body.starts_with("outcome: failed")
-        || (e.kind == EntryKind::Session && e.body.contains("[failed]"))
+        || (e.kind == EntryKind::Session
+            && e.body
+                .lines()
+                .any(|l| l.trim_start().starts_with("- attempt:") && l.ends_with("[failed]")))
 }
 
 /// Revalidate one entry's file-evidence links; entry refs skip straight
@@ -1343,6 +1357,87 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(checks[0].intact());
         assert_eq!(checks[0].entry, report.promoted[0]);
+    }
+
+    #[test]
+    fn peer_coverage_survives_a_corrupt_peer_journal() {
+        let (_d, g) = gng();
+        let scout = g.start_session("scout", "fix checkout latency");
+        g.add_attempt(&scout, "retried checkout", false).unwrap();
+        g.end_session(&scout, "checkout retry failed", vec![])
+            .unwrap();
+
+        // Corrupt one file inside scout's journal partition.
+        let scout_dir = g.root().join(JOURNAL).join("scout");
+        let first = walkdir::WalkDir::new(&scout_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_type().is_file() && e.file_name() != ".lock")
+            .unwrap();
+        std::fs::write(first.path(), "not an entry file").unwrap();
+
+        // Briefing must not die; it just counts what it can read.
+        let pc = g
+            .peer_coverage(Some("builder"), "checkout latency")
+            .unwrap();
+        assert_eq!(pc.agents_attempted, 0);
+        let b = g.brief("builder", "checkout latency", 10).unwrap();
+        assert!(!b.markdown.contains("Peers:"));
+    }
+
+    #[test]
+    fn session_task_mentioning_failed_does_not_count_as_failure() {
+        let (_d, g) = gng();
+        let scout = g.start_session("scout", "investigate [failed] checkout");
+        g.add_observation(&scout, "checkout note").unwrap();
+        g.end_session(&scout, "read the [failed] reports", vec![])
+            .unwrap();
+
+        let pc = g.peer_coverage(Some("builder"), "checkout").unwrap();
+        assert_eq!(pc.agents_attempted, 1);
+        assert_eq!(pc.agents_failed, 0);
+    }
+
+    #[test]
+    fn evidence_paths_are_canonicalized_at_record_time() {
+        // A citation written as a relative path is stored absolute, so a
+        // later revalidate from any cwd still finds the file.
+        let (d, g) = gng();
+        let sub = d.path().join("proj");
+        std::fs::create_dir(&sub).unwrap();
+        let adr = sub.join("adr.md");
+        std::fs::write(&adr, "decision").unwrap();
+
+        let codex = g.codex().unwrap();
+        let e = Entry::new("ops", EntryKind::Decision, "use postgres");
+        codex.create(&e).unwrap();
+        g.verify_with_evidence(e.id, "team", None, &[adr.clone()])
+            .unwrap();
+
+        let entry = codex.require(e.id).unwrap();
+        let Evidence::File { path, .. } = &entry.evidence[0] else {
+            panic!("expected file evidence")
+        };
+        assert!(Path::new(path).is_absolute(), "stored path: {path}");
+    }
+
+    #[test]
+    fn revalidate_reports_weird_sha256_without_panicking() {
+        let (d, g) = gng();
+        let f = d.path().join("file.txt");
+        std::fs::write(&f, "content").unwrap();
+
+        let codex = g.codex().unwrap();
+        let mut e = Entry::new("ops", EntryKind::Decision, "hand-edited hash");
+        e.evidence.push(Evidence::File {
+            path: f.display().to_string(),
+            excerpt: "content".into(),
+            sha256: "é-mørk-unicode-nonsense".into(),
+        });
+        codex.create(&e).unwrap();
+
+        let checks = g.revalidate(e.id).unwrap();
+        assert!(!checks[0].intact());
     }
 
     #[cfg(unix)]
