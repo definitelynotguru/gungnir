@@ -158,9 +158,11 @@ disk; recall hides them by default.
 ## Surfaces
 
 - **Library** (`gungnir` crate): everything above.
-- **CLI** (`gungnir` bin): `init`, `add`, `get`, `ls`, `recall`, `verify`,
-  `contradict`, `supersede`, `rollback`, `promote`, `brief`, `session`,
-  `stats` (`--topic` reports cross-journal coverage counts), `mcp`.
+- **CLI** (`gungnir` bin): `init`, `add`, `get`, `ls`, `recall`, `verify`
+  (`--evidence` records file hashes at verify time; `--revalidate` re-hashes
+  and flags drift, `--all` sweeps the store), `contradict`, `supersede`,
+  `rollback`, `promote`, `brief`, `session`, `stats` (`--topic` reports
+  cross-journal coverage counts), `mcp`.
 - **MCP server**: tools `start_session`, `end_session`, `add_observation`,
   `add_attempt`, `recall`, `brief`, `verify`, `contradict`, `promote`,
   `supersede`, `rollback`, `list`, `get`.

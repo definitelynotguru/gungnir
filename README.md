@@ -42,8 +42,12 @@ JID=$(find $GUNGNIR_ROOT/journal/builder -name '*.md' | head -1)
 CID=$(gungnir promote ${JID%.md} --agent builder --kind decision \
   --summary "checkout queries must use orders_archive_idx")
 
-# Mark it verified once a human confirms.
-gungnir verify $CID --verifier team-review --note "confirmed in PR 42"
+# Mark it verified once a human confirms, citing the ADR's content hash.
+gungnir verify $CID --verifier team-review --note "confirmed in PR 42" \
+  --evidence docs/adr/0003-orders-index.md
+
+# Later, prove the cited file still says what it said.
+gungnir verify $CID --revalidate        # or --all for every entry
 
 # What do we believe right now, and how healthy is the memory?
 gungnir recall "checkout" --current
@@ -78,7 +82,9 @@ Key behaviors:
 
 - **Provenance first.** Evidence links (file excerpts with SHA-256, or other
   entries) are validated at write time. Verification is a logged state
-  machine, never a free field.
+  machine, never a free field. `verify --revalidate` re-hashes evidence
+  files and flags drift: a fact whose cited ADR changed underneath it is
+  not silently stale.
 - **Supersession, not overwrite.** Revisions chain via `revises`; briefings
   flag superseded facts instead of silently showing stale ones.
 - **Non-destructive rollback.** Rolling back walks the revision chain to the
