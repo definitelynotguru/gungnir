@@ -405,3 +405,35 @@ fn mcp_contradict_marks_state() {
         gungnir::VerificationState::Contradicted { .. }
     ));
 }
+
+#[test]
+fn mcp_brief_require_verified_hides_unverified_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = gungnir::Gungnir::open(dir.path()).unwrap();
+    let e = gungnir::Entry::new(
+        "a",
+        gungnir::EntryKind::Decision,
+        "postgres pooling unverified",
+    );
+    g.codex().unwrap().create(&e).unwrap();
+    drop(g);
+
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+
+    let r = p.rpc(&msg(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "brief",
+            "arguments": {"agent": "a", "task": "postgres pooling", "require_verified": true}
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("No verified knowledge covers this task"),
+        "{text}"
+    );
+    assert!(!text.contains(&e.id.to_string()), "{text}");
+}

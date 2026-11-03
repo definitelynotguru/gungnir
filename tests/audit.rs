@@ -558,10 +558,12 @@ fn entity_names_enforce_the_cap_on_both_paths() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 65 characters is over the cap from either path.
+    // 65 characters over the cap is rejected in frontmatter — a declared
+    // entity claim must meet the rule.
     let long = "x".repeat(65);
-    for args in [
-        vec![
+    let out = run(
+        &store,
+        &[
             "add",
             "--agent",
             "a",
@@ -572,22 +574,28 @@ fn entity_names_enforce_the_cap_on_both_paths() {
             "--entities",
             &long,
         ],
-        vec![
-            "add",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("entity names"));
+
+    // The same span in body text is prose, not an entity claim: the write
+    // succeeds and the over-cap name is simply absent from the index.
+    let body_id = add(
+        &store,
+        &[
             "--agent",
             "a",
             "--kind",
             "observation",
             "--summary",
-            "s2",
+            "s2 with a long bracket span",
             "--body",
             &format!("see [[{long}]]"),
         ],
-    ] {
-        let out = run(&store, &args);
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("entity names"));
-    }
+    );
+    let out = ok(&store, &["entities", &long]);
+    assert!(out.contains("no entries mention"), "{out}");
+    let _ = body_id;
 
     // An unterminated [[ is literal text, not a name that swallows lines.
     let unterminated = add(
@@ -869,4 +877,44 @@ fn blame_reports_still_current_when_middle_revision_rolled_back() {
     let out = ok(&store, &["blame", &a]);
     assert!(out.contains("still current"), "{out}");
     assert!(!out.contains(&format!("replaced by: {c}")), "{out}");
+}
+
+#[test]
+fn log_id_since_filters_verification_records() {
+    // --since narrows the entry's own verification log in the id form, not
+    // just the whole-store scan.
+    let (_d, store) = root();
+    let (e1, _, _) = seed(&store);
+
+    let out = ok(&store, &["log", &e1, "--since", "2999-01-01T00:00:00Z"]);
+    assert!(out.contains("verification log"), "{out}");
+    assert!(!out.contains("verified by team"), "{out}");
+
+    let out = ok(&store, &["log", &e1, "--since", "2000-01-01T00:00:00Z"]);
+    assert!(out.contains("verified by team"), "{out}");
+}
+
+#[test]
+fn add_rejects_control_characters_in_single_line_fields() {
+    // Audit rows render summary/agent verbatim; a multi-line summary would
+    // forge extra rows, so writes reject control characters at the door.
+    let (_d, store) = root();
+    let out = run(
+        &store,
+        &[
+            "add",
+            "--agent",
+            "builder",
+            "--kind",
+            "decision",
+            "--summary",
+            "first line\nsecond line",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("control characters"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

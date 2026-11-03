@@ -33,6 +33,27 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>, enforce_refs: bool) -> 
         )));
     }
 
+    // Fields the audit printers render as one line may not carry their own
+    // markup: no newlines or control characters in the values an operator
+    // reads back.
+    if has_control(&entry.summary) {
+        return Err(crate::Error::Invalid(
+            "summary is a single printable line; no control characters".into(),
+        ));
+    }
+    if has_control(&entry.agent) {
+        return Err(crate::Error::Invalid(
+            "agent is a single printable name; no control characters".into(),
+        ));
+    }
+    for rec in &entry.verification_log {
+        if has_control(&rec.verifier) {
+            return Err(crate::Error::Invalid(
+                "verifier is a single printable name; no control characters".into(),
+            ));
+        }
+    }
+
     if entry.kind == EntryKind::Review && entry.review_of.is_none() {
         return Err(crate::Error::Invalid(
             "review entries require review_of".into(),
@@ -157,30 +178,29 @@ fn reference_ids(entry: &Entry) -> std::collections::HashSet<EntryId> {
     out
 }
 
-/// Every entity name an entry claims: frontmatter plus non-id `[[name]]`
-/// body mentions, so both paths meet the same rule.
+/// Every entity name an entry claims. Frontmatter is a declaration and is
+/// validated strictly; body `[[name]]` targets pass through
+/// `entity_mentions`, which keeps only names that meet `valid_entity_name`
+/// — a `[[` span in free text is prose, not an entity claim.
 fn entity_names(entry: &Entry) -> Vec<String> {
-    entry
-        .entities
-        .iter()
-        .cloned()
-        .chain(
-            entry
-                .wikilink_targets()
-                .into_iter()
-                .filter(|t| t.parse::<crate::EntryId>().is_err()),
-        )
-        .collect()
+    entry.entity_mentions()
 }
 
 /// Names are single-line printable text, 1..MAX_ENTITY_LEN *characters*.
 /// No control characters or link delimiters — a name that can escape into
 /// the entity index or the audit output can't carry its own markup.
-fn valid_entity_name(name: &str) -> bool {
+/// Whether `name` is a legal entity name; also used by `entry.rs` to
+/// filter body-derived `[[name]]` mentions — a `[[` span in free text is
+/// prose, not an entity claim, so it drops out rather than failing writes.
+pub fn valid_entity_name(name: &str) -> bool {
     let name = name.trim();
     !name.is_empty()
         && name.chars().count() <= MAX_ENTITY_LEN
         && name
             .chars()
             .all(|c| !c.is_control() && c != '[' && c != ']')
+}
+
+fn has_control(text: &str) -> bool {
+    text.chars().any(char::is_control)
 }

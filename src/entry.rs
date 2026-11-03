@@ -242,7 +242,9 @@ impl Entry {
     }
 
     /// Every entity name this entry claims, frontmatter `entities:` merged
-    /// with non-id `[[name]]` body mentions, deduped case-insensitively.
+    /// with `[[name]]` body mentions, deduped case-insensitively. A body
+    /// target only counts when it meets the entity-name rule — a `[[` span
+    /// in free text ("see [[1,2],[3,4]]") is prose, not a claim.
     pub fn entity_mentions(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut push = |name: String| {
@@ -255,7 +257,7 @@ impl Entry {
             push(e.clone());
         }
         for t in self.wikilink_targets() {
-            if t.parse::<EntryId>().is_err() {
+            if t.parse::<EntryId>().is_err() && crate::validate::valid_entity_name(&t) {
                 push(t);
             }
         }
