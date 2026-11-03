@@ -794,3 +794,72 @@ fn promotions_sharing_a_summary_land_when_kinds_differ() {
     assert_ne!(report.promoted[0], report.promoted[1]);
     assert_eq!(g.codex().unwrap().entries().unwrap().len(), 2);
 }
+
+// -- review round 3 ----------------------------------------------------------
+
+#[test]
+fn briefing_verdict_counts_hidden_matches() {
+    let (_dir, g) = gng();
+    let codex = g.codex().unwrap();
+
+    // Only match is rolled back: hits are empty but hidden_rolled_back
+    // reports the match — the verdict must not claim nothing matched.
+    let mut e = Entry::new("a", EntryKind::Decision, "zorblax pipeline");
+    e.mark_rolled_back("ops");
+    codex.create(&e).unwrap();
+
+    let b = g.brief("a", "zorblax", 8).unwrap();
+    assert!(
+        b.markdown
+            .contains("Entries matched this task but none are verified"),
+        "{}",
+        b.markdown
+    );
+    assert!(
+        !b.markdown.contains("No knowledge matched this task"),
+        "{}",
+        b.markdown
+    );
+}
+
+#[test]
+fn corrupt_journal_blocks_ended_session_guards() {
+    let (_dir, g) = gng();
+    let s = g.start_session("builder", "task").unwrap();
+    g.add_observation(&s, "note").unwrap();
+    g.end_session(&s, "done", vec![]).unwrap();
+
+    // Corrupt an unrelated journal file: the archive lookup can no longer
+    // prove the session ended, so it must fail closed, not report
+    // "no archive" and accept writes or re-end as fresh.
+    write_conflicted_entry(&g.journal("builder").unwrap());
+    let rebuilt = Session {
+        id: s.id.clone(),
+        agent: "builder".into(),
+        task: "task".into(),
+        started_at: s.started_at,
+    };
+    assert!(matches!(
+        g.add_observation(&rebuilt, "post-session note"),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        g.end_session(&rebuilt, "done", vec![]),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
+fn live_session_write_skips_the_journal_scan() {
+    let (_dir, g) = gng();
+    let s = g.start_session("builder", "task").unwrap();
+
+    // An unreadable journal file must not block writes to a live session:
+    // scratch existing already answers "is this session ended".
+    write_conflicted_entry(&g.journal("builder").unwrap());
+    let id = g.add_observation(&s, "still working").unwrap();
+    assert_eq!(
+        g.scratch(&s.id).unwrap().require(id).unwrap().summary,
+        "still working"
+    );
+}
