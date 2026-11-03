@@ -283,3 +283,12 @@ pub fn valid_entity_name(name: &str) -> bool {
 fn has_control(text: &str) -> bool {
     text.chars().any(char::is_control)
 }
+
+/// Collapse control characters to spaces — the sanitize form of the
+/// single-line rule, used where a value must render on one line and the
+/// caller may be working with text stored before the rule existed.
+pub fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
