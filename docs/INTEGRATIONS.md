@@ -8,8 +8,8 @@ is safe; every write goes through the same validation and locking.
 
 The server speaks newline-delimited JSON-RPC over stdio per the Model Context
 Protocol. Tools: `start_session`, `add_observation`, `add_attempt`,
-`end_session`, `recall`, `brief`, `verify`, `promote`, `supersede`,
-`rollback`, `list`, `get`.
+`end_session`, `recall`, `brief`, `verify`, `contradict`, `promote`,
+`supersede`, `rollback`, `list`, `get`.
 
 Build first:
 
@@ -94,7 +94,7 @@ use gungnir::{EntryKind, Gungnir, Promotion};
 
 let g = Gungnir::open("~/gungnir")?;
 
-let s = g.start_session("builder", "fix slow checkout query");
+let s = g.start_session("builder", "fix slow checkout query")?;
 g.add_observation(&s, "EXPLAIN shows seq scan")?;
 g.add_attempt(&s, "index hint", false)?;
 let report = g.end_session(&s, "rewrote checkout query", vec![

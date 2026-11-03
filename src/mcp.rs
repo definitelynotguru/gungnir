@@ -121,8 +121,18 @@ impl Server {
                 }), &["id"])
             },
             {
+                "name": "contradict",
+                "description": "Mark an entry contradicted by another entry.",
+                "inputSchema": schema(json!({
+                    "id": {"type": "string"},
+                    "by": {"type": "string"},
+                    "verifier": {"type": "string"},
+                    "note": {"type": "string"}
+                }), &["id", "by"])
+            },
+            {
                 "name": "promote",
-                "description": "Copy a finding into the shared Codex with provenance linked to its source entry.",
+                "description": "Copy a finding into the shared Codex with provenance linked to its source entry. kind=review makes the promotion a review of the source.",
                 "inputSchema": schema(json!({
                     "from": {"type": "string"},
                     "agent": {"type": "string"},
@@ -174,7 +184,7 @@ impl Server {
             "start_session" => {
                 let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let task = arg("task").ok_or_else(|| Error::Invalid("task required".into()))?;
-                let s = self.g.start_session(agent, task);
+                let s = self.g.start_session(agent, task)?;
                 let briefing = self.g.brief(agent, task, 8)?;
                 self.sessions.insert(s.id.clone(), s.clone());
                 Ok(format!("session_id: {}\n\n{}", s.id, briefing.markdown))
@@ -200,34 +210,44 @@ impl Server {
                 let summary =
                     arg("summary").ok_or_else(|| Error::Invalid("summary required".into()))?;
                 let report = self.g.end_session(&s, summary, vec![])?;
-                self.sessions.remove(&s.id);
-                Ok(format!("archived {}", report.journal_id))
+                if report.already_ended {
+                    Ok(format!("already ended (archive {})", report.journal_id))
+                } else {
+                    self.sessions.remove(&s.id);
+                    Ok(format!("archived {}", report.journal_id))
+                }
             }
             "recall" => {
                 let query = arg("query").ok_or_else(|| Error::Invalid("query required".into()))?;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-                let hits = match parse_layer(arg("layer"))? {
+                let q = Query::new(query, limit);
+                let out = match parse_layer(arg("layer"))? {
                     LayerSel::Journal => {
                         let agent = arg("agent").ok_or_else(|| {
                             Error::Invalid("agent required for journal recall".into())
                         })?;
-                        self.g.recall_layer(
-                            crate::gungnir::Layer::Journal { agent },
-                            &Query::new(query, limit),
-                        )?
+                        self.g
+                            .search_layer(crate::gungnir::Layer::Journal { agent }, &q)?
                     }
-                    LayerSel::Codex => self
-                        .g
-                        .recall_layer(crate::gungnir::Layer::Codex, &Query::new(query, limit))?,
+                    LayerSel::Codex => self.g.search_layer(crate::gungnir::Layer::Codex, &q)?,
                 };
-                if hits.is_empty() {
-                    return Ok("no matches".into());
+                let mut text = if out.hits.is_empty() {
+                    "no matches".to_string()
+                } else {
+                    out.hits
+                        .iter()
+                        .map(|h| format!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                for s in &out.skipped {
+                    text.push_str(&format!(
+                        "\n(skipped unreadable entry {}: {})",
+                        s.path.display(),
+                        s.error
+                    ));
                 }
-                Ok(hits
-                    .iter()
-                    .map(|h| format!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary))
-                    .collect::<Vec<_>>()
-                    .join("\n"))
+                Ok(text)
             }
             "brief" => {
                 let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
@@ -244,6 +264,20 @@ impl Server {
                 self.g
                     .verify(id, verifier, arg("note").map(str::to_owned))?;
                 Ok(format!("verified {id}"))
+            }
+            "contradict" => {
+                let id: EntryId = arg("id")
+                    .ok_or_else(|| Error::Invalid("id required".into()))?
+                    .parse()
+                    .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
+                let by: EntryId = arg("by")
+                    .ok_or_else(|| Error::Invalid("by required".into()))?
+                    .parse()
+                    .map_err(|e| Error::Invalid(format!("bad by id: {e}")))?;
+                let verifier = arg("verifier").unwrap_or("agent");
+                self.g
+                    .contradict(id, by, verifier, arg("note").map(str::to_owned))?;
+                Ok(format!("contradicted {id} by {by}"))
             }
             "promote" => {
                 let from: EntryId = arg("from")
@@ -286,26 +320,34 @@ impl Server {
             }
             "list" => {
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-                let render = |entries: Vec<crate::entry::Entry>| -> String {
-                    if entries.is_empty() {
-                        "(empty)".into()
+                let render = |scan: crate::store::Scan| -> String {
+                    let mut text = if scan.entries.is_empty() {
+                        "(empty)".to_string()
                     } else {
-                        entries
+                        scan.entries
                             .into_iter()
                             .take(limit)
                             .map(|e| format!("{}  {}\t{}", e.id, e.kind, e.summary))
                             .collect::<Vec<_>>()
                             .join("\n")
+                    };
+                    for s in &scan.skipped {
+                        text.push_str(&format!(
+                            "\n(skipped unreadable entry {}: {})",
+                            s.path.display(),
+                            s.error
+                        ));
                     }
+                    text
                 };
                 match parse_layer(arg("layer"))? {
                     LayerSel::Journal => {
                         let agent = arg("agent").ok_or_else(|| {
                             Error::Invalid("agent required for journal list".into())
                         })?;
-                        Ok(render(self.g.journal(agent)?.entries()?))
+                        Ok(render(self.g.journal(agent)?.scan()?))
                     }
-                    LayerSel::Codex => Ok(render(self.g.codex()?.entries()?)),
+                    LayerSel::Codex => Ok(render(self.g.codex()?.scan()?)),
                 }
             }
             "get" => {
@@ -322,12 +364,19 @@ impl Server {
     }
 
     /// Reconstruct the session handle; works across server restarts because
-    /// scratch lives on disk keyed by session id.
+    /// scratch lives on disk keyed by session id and `start_session` persists
+    /// the identity to `.session.yaml`.
     fn session(&self, args: &Value) -> Result<Session> {
         let arg = |k: &str| args.get(k).and_then(Value::as_str);
         let id = arg("session_id").ok_or_else(|| Error::Invalid("session_id required".into()))?;
         if let Some(s) = self.sessions.get(id) {
             return Ok(s.clone());
+        }
+        if let Some(mut s) = self.g.load_session(id)? {
+            // The persisted identity wins; a passed agent only matters when
+            // no meta exists.
+            s.id = id.to_string();
+            return Ok(s);
         }
         let agent = arg("agent")
             .ok_or_else(|| Error::Invalid("agent required (unknown session_id)".into()))?;

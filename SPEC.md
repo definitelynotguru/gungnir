@@ -56,9 +56,10 @@ YAML frontmatter + markdown body. Fields:
 | `review_of`       | id?                 | required when `kind = review`; must exist |
 | `verification`    | unverified \| verified \| contradicted \| rolled_back | |
 | `contradicted_by` | id?                 | required when verification = contradicted |
-| `verification_log`| list of records     | `{verifier, timestamp, status, note}`   |
+| `verification_log`| list of records     | `{verifier, timestamp, status, note}`; `status` is one of the four states, other values fail to parse |
 | `evidence`        | list                | `{kind: file, path, excerpt ≤ 500, sha256}` or `{kind: ref, id}` (refs must exist) |
 | `source_tool`     | string?             |                                         |
+| `outcome`         | bool?               | whether an `attempt` entry succeeded    |
 
 Body: free-form markdown after the closing `---`.
 
@@ -82,16 +83,37 @@ rolled-back entries are always hidden.
 
 Temporal modes:
 
-- `as_of <instant>`: candidate pool limited to entries created at or before
-  the instant, and each entry's verification state evaluated from its
-  append-only verification log as it stood then.
+- `as_of <instant>`: candidate pool limited to entries whose `timestamp`
+  is at or before the instant, and each entry's verification state
+  evaluated from its append-only verification log as it stood then.
+  `timestamp` is **learned time** — when the fact was written, matching the
+  ULID's embedded time — not when the event happened in the world. Asking
+  "as of T" answers "what did the store believe at T", not "what was true
+  at T".
 - `current_only`: every revises chain resolves to its head; superseded tails
   and contradicted facts are excluded from hits and counted in coverage.
 
 Every search reports topic-scoped coverage counts (verified / unverified /
-contradicted, plus hidden superseded and rolled-back totals). Callers use
-coverage to abstain: when zero verified facts match a topic, briefings say
-"No verified knowledge covers this task" instead of staying silent.
+contradicted, plus hidden superseded and rolled-back totals, plus the total
+entries in scope). Callers use coverage to abstain: when zero verified
+facts match, briefings say so plainly — and distinguish "entries matched
+but none are verified" from "nothing matched".
+
+Reads are resilient: a ULID-named file that fails to parse is skipped and
+reported (stderr on the CLI, a note in MCP responses, `skipped` in library
+results) rather than aborting the whole layer scan. Write-time validation
+of the entry being written still fails hard.
+
+Promotion accepts journal sources only — a codex source would cite its own
+layer and a scratch source would dangle once the session ends.
+
+## Sessions
+
+`session start` persists the session identity (agent, task, start time) to
+`scratch/<id>/.session.yaml`, so the archived journal entry carries the
+real task text even when the ending process only knows the session id.
+`end_session` is idempotent: re-ending an already-archived session reports
+`already_ended` instead of writing a second journal entry.
 
 Hybrid mode (pluggable embedder): fuse keyword ranks with embedding cosine
 ranks via reciprocal rank fusion (k = 60). Vector cache keyed by
@@ -121,10 +143,12 @@ disk; recall hides them by default.
 ## Surfaces
 
 - **Library** (`gungnir` crate): everything above.
-- **CLI** (`mnem` bin): `init`, `add`, `get`, `ls`, `recall`, `verify`,
-  `supersede`, `rollback`, `brief`.
-- **MCP server** (milestone 3): tools `start_session`, `end_session`,
-  `add_observation`, `add_attempt`, `recall`, `verify`.
+- **CLI** (`gungnir` bin): `init`, `add`, `get`, `ls`, `recall`, `verify`,
+  `contradict`, `supersede`, `rollback`, `promote`, `brief`, `session`,
+  `stats`, `mcp`.
+- **MCP server**: tools `start_session`, `end_session`, `add_observation`,
+  `add_attempt`, `recall`, `brief`, `verify`, `contradict`, `promote`,
+  `supersede`, `rollback`, `list`, `get`.
 
 ## Deliberate departures from the reference design
 

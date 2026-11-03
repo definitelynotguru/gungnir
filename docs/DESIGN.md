@@ -46,6 +46,14 @@ encoded as 26 characters of Crockford base32. Consequences:
 - The id embeds its creation time, which decides its date shard
   (`YYYY/MM/DD`) deterministically regardless of write order.
 
+There are deliberately two clocks. The ULID's embedded time places the file
+(the shard), and `entry.timestamp` — initialized to the same instant —
+drives `as_of` candidate filtering. Both are **learned time**: `as_of`
+reconstructs what the store believed at an instant, evaluated from
+`timestamp` plus the append-only `verification_log`, not what was true in
+the world at that instant. An event-time field would be a second axis;
+nothing models it today.
+
 ## Entries
 
 One entry is one markdown file: YAML frontmatter plus a free-form body. The

@@ -56,7 +56,7 @@ fn current_only_drops_contradicted_facts() {
     let target = Entry::new("a", EntryKind::Observation, "counter evidence lives here");
     codex.create(&target).unwrap();
     let mut claim = Entry::new("a", EntryKind::Observation, "load balancer flapping");
-    claim.contradict(target.id, "ops");
+    claim.contradict(target.id, "ops", None);
     codex.create(&claim).unwrap();
 
     let out = g
@@ -183,7 +183,7 @@ fn brief_reports_coverage_and_abstains_without_verified_knowledge() {
     let b = g.brief("builder", "cache tuning", 8).unwrap();
     assert!(
         b.markdown
-            .contains("No verified knowledge covers this task"),
+            .contains("Entries matched this task but none are verified"),
         "{}",
         b.markdown
     );
@@ -203,7 +203,7 @@ fn log_records_roundtrip_with_custom_timestamps() {
     let rec = VerificationRecord {
         verifier: "ci".into(),
         timestamp: h(2),
-        status: "verified".into(),
+        status: gungnir::RecordStatus::Verified,
         note: None,
     };
     let yaml = serde_yaml::to_string(&rec).unwrap();
@@ -272,6 +272,105 @@ fn as_of_plus_current_keeps_tail_when_later_revisions_are_in_the_future() {
         .unwrap();
     assert_eq!(mid.hits.len(), 1);
     assert_eq!(mid.hits[0].entry.summary, "sessions use mysql");
+}
+
+#[test]
+fn as_of_evaluates_learned_time_not_event_time() {
+    // Semantics documented in SPEC.md: `as_of` asks "what did the store
+    // believe at instant T" — the entry's `timestamp` is when the fact was
+    // *learned/recorded*, not when the event happened. An as_of between a
+    // fact-change in the world and the moment the new fact was learned
+    // still returns the old head.
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+
+    // The world changed at h(20); the store learned about it at h(50).
+    let mut v1 = Entry::new("a", EntryKind::Decision, "sessions use mysql");
+    v1.timestamp = h(10);
+    codex.create(&v1).unwrap();
+
+    let mut v2 = Entry::new("a", EntryKind::Decision, "sessions use postgres");
+    v2.timestamp = h(50);
+    v2.revises = Some(v1.id);
+    codex.create(&v2).unwrap();
+
+    // As-of between the event and its recording: the old head still stands.
+    let mid = g
+        .search_layer(
+            gungnir::Layer::Codex,
+            &Query::new("sessions use", 10).as_of(h(30)).current(),
+        )
+        .unwrap();
+    assert_eq!(mid.hits.len(), 1);
+    assert_eq!(mid.hits[0].entry.summary, "sessions use mysql");
+
+    // After the learning instant: the new head.
+    let late = g
+        .search_layer(
+            gungnir::Layer::Codex,
+            &Query::new("sessions use", 10).as_of(h(60)).current(),
+        )
+        .unwrap();
+    assert_eq!(late.hits[0].entry.summary, "sessions use postgres");
+}
+
+#[test]
+fn as_of_replays_a_supersede_and_rollback_sequence() {
+    // Replay the same chain at three instants: before the revision,
+    // between revision and rollback, after rollback. The ancestor set
+    // visible at each instant must be exactly right.
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+
+    let mut v1 = Entry::new("a", EntryKind::Decision, "sessions use mysql");
+    v1.timestamp = h(10);
+    v1.verify("human", None);
+    v1.verification_log[0].timestamp = h(12);
+    codex.create(&v1).unwrap();
+
+    let v2_id = g
+        .supersede(v1.id, "a", "sessions use postgres", "migration")
+        .unwrap();
+    let mut v2 = codex.require(v2_id).unwrap();
+    v2.timestamp = h(50);
+    codex.update_with(&v2, &|id| codex.exists(id)).unwrap();
+
+    let rb_id = g.rollback(v2_id, "a").unwrap();
+    let mut rb = codex.require(rb_id).unwrap();
+    rb.timestamp = h(62);
+    codex.update_with(&rb, &|id| codex.exists(id)).unwrap();
+    let mut v2 = codex.require(v2_id).unwrap();
+    v2.verification_log[0].timestamp = h(60); // the rolled_back record
+    codex.update_with(&v2, &|id| codex.exists(id)).unwrap();
+
+    let q = |at: DateTime<Utc>| {
+        g.search_layer(
+            gungnir::Layer::Codex,
+            &Query::new("sessions use", 10).as_of(at).current(),
+        )
+        .unwrap()
+    };
+
+    // Before the revision: v1 is the only head.
+    let early = q(h(30));
+    assert_eq!(early.hits.len(), 1);
+    assert_eq!(early.hits[0].entry.summary, "sessions use mysql");
+    assert_eq!(early.coverage.hidden_superseded, 0);
+
+    // Between revision and rollback: v2 is the head, v1 hidden.
+    let mid = q(h(55));
+    assert_eq!(mid.hits.len(), 1);
+    assert_eq!(mid.hits[0].entry.summary, "sessions use postgres");
+    assert_eq!(mid.coverage.hidden_superseded, 1);
+
+    // After the rollback: v2 is rolled back and hidden, v1 is restored.
+    let late = q(h(65));
+    assert_eq!(late.hits.len(), 1);
+    assert_eq!(late.hits[0].entry.summary, "sessions use mysql");
+    assert_eq!(late.coverage.hidden_rolled_back, 1);
+    assert_eq!(late.coverage.hidden_superseded, 0);
 }
 
 #[test]

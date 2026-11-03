@@ -99,7 +99,7 @@ Key behaviors:
 use gungnir::{EntryKind, Gungnir, Promotion};
 
 let g = Gungnir::open("~/gungnir")?;
-let s = g.start_session("builder", "fix slow checkout query");
+let s = g.start_session("builder", "fix slow checkout query")?;
 g.add_observation(&s, "seq scan on orders_archive")?;
 g.add_attempt(&s, "index hint", false)?;
 let report = g.end_session(&s, "rewrote checkout query", vec![
@@ -137,8 +137,9 @@ Protocol:
 ```
 
 Tools: `start_session`, `add_observation`, `add_attempt`, `end_session`,
-`recall`, `brief`, `verify`, `promote`, `supersede`, `rollback`, `list`,
-`get`. Agents drive the full correction lifecycle over the wire.
+`recall`, `brief`, `verify`, `contradict`, `promote`, `supersede`,
+`rollback`, `list`, `get`. Agents drive the full correction lifecycle over
+the wire.
 
 ## Design notes
 
