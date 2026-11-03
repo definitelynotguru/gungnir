@@ -130,7 +130,8 @@ fn mcp_subprocess_handshake_and_workflow() {
         "{recall_text}"
     );
 
-    // Scratch cleared after end: observing again still works (fresh scratch).
+    // An archived session is done: observing again is rejected, because a
+    // write accepted now would be deleted unarchived on the next end.
     let again = p.rpc(&msg(
         8,
         "tools/call",
@@ -139,7 +140,7 @@ fn mcp_subprocess_handshake_and_workflow() {
             "arguments": {"session_id": sid, "agent": "builder", "text": "post-session note"}
         }),
     ));
-    assert_eq!(again["result"]["isError"], false, "{again}");
+    assert_eq!(again["result"]["isError"], true, "{again}");
 
     // Promotion over the wire: journal finding becomes shared Codex fact.
     let archived = recall_text

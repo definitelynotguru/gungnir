@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::id::EntryId;
 
 /// What kind of knowledge this entry captures.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     Decision,
