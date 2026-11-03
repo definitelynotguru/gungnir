@@ -625,6 +625,31 @@ fn paraphrase() -> Score {
             false_abstentions += 1;
         }
 
+        // Ordering, not just inclusion: the fused rank has to put the
+        // target first in its verification-state bucket. `hits.contains`
+        // would stay green if fusion stopped ordering at all — inclusion
+        // comes from channel scores, not the fused rank.
+        if hy_found {
+            let target_state = all
+                .iter()
+                .find(|e| e.summary.contains(case.target))
+                .unwrap()
+                .verification
+                .clone();
+            let first_in_bucket = hy
+                .hits
+                .iter()
+                .find(|h| h.entry.verification == target_state)
+                .unwrap();
+            s.check(
+                &format!(
+                    "hybrid ranks target first in its bucket for '{}'",
+                    case.query
+                ),
+                first_in_bucket.entry.summary.contains(case.target),
+            );
+        }
+
         println!(
             "  {:<32} legacy={} bm25={} hybrid={} cov={}",
             case.query,

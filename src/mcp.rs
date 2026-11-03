@@ -39,8 +39,9 @@ pub struct Server {
     sessions: HashMap<String, Session>,
     /// One embedder for the server's life: the inner model loads lazily on
     /// the first semantic call and stays resident for every later one.
+    /// Boxed so tests can inject a fake (see `crate::embedding::Uniform`).
     #[cfg(feature = "embed")]
-    embedder: Option<crate::embedding::CachedEmbedder<crate::embedding::local::Fastembed>>,
+    embedder: Option<Box<dyn crate::embedding::Embedder>>,
 }
 
 impl Server {
@@ -250,7 +251,7 @@ impl Server {
                     {
                         self.ensure_embedder()?;
                         self.g
-                            .search_layer_semantic(layer, &q, self.embedder.as_ref().unwrap())?
+                            .search_layer_semantic(layer, &q, self.embedder.as_deref().unwrap())?
                     }
                     #[cfg(not(feature = "embed"))]
                     unreachable!("semantic_enabled errors without the embed feature")
@@ -284,7 +285,7 @@ impl Server {
                     {
                         self.ensure_embedder()?;
                         self.g
-                            .brief_semantic(agent, task, limit, self.embedder.as_ref().unwrap())?
+                            .brief_semantic(agent, task, limit, self.embedder.as_deref().unwrap())?
                     }
                     #[cfg(not(feature = "embed"))]
                     unreachable!("semantic_enabled errors without the embed feature")
@@ -435,10 +436,10 @@ impl Server {
     #[cfg(feature = "embed")]
     fn ensure_embedder(&mut self) -> Result<()> {
         if self.embedder.is_none() {
-            self.embedder = Some(crate::embedding::CachedEmbedder::new(
+            self.embedder = Some(Box::new(crate::embedding::CachedEmbedder::new(
                 crate::embedding::local::Fastembed::new(self.g.root())?,
                 self.g.root(),
-            ));
+            )));
         }
         Ok(())
     }
@@ -550,6 +551,10 @@ mod tests {
 
     fn exchange(input: &str, g: Gungnir) -> Vec<Value> {
         let mut server = Server::new(g);
+        exchange_on(input, &mut server)
+    }
+
+    fn exchange_on(input: &str, server: &mut Server) -> Vec<Value> {
         let mut out: Vec<u8> = Vec::new();
         server
             .serve(BufReader::new(input.as_bytes()), &mut out)
@@ -777,5 +782,46 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("embed"));
+    }
+
+    /// A present-but-non-boolean `semantic` errors rather than reading as
+    /// false — `as_bool().unwrap_or(false)` would silently degrade to
+    /// keyword and answer `no matches`.
+    #[test]
+    fn non_boolean_semantic_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":"postgres","semantic":"yes"}}}"#,
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("boolean"));
+    }
+
+    /// semantic:true must actually reach hybrid search. The uniform
+    /// embedder scores every pair cosine 1.0, so the target is reachable
+    /// through the vector channel alone — no shared keyword token — and a
+    /// keyword answer can only mean the flag degraded silently.
+    #[cfg(feature = "embed")]
+    #[test]
+    fn semantic_true_dispatches_to_hybrid_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gungnir::open(dir.path()).unwrap();
+        let codex = g.codex().unwrap();
+        let mut e = crate::entry::Entry::new("ops", EntryKind::Decision, "postgres pooling limits");
+        e.verify("ops", None);
+        codex.create(&e).unwrap();
+
+        let mut server = Server::new(g);
+        server.embedder = Some(Box::new(crate::embedding::Uniform));
+        let msgs = exchange_on(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":"query cache eviction","semantic":true}}}"#,
+            &mut server,
+        );
+        let text = msgs[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("postgres pooling limits"), "{text}");
     }
 }

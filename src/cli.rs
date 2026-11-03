@@ -254,13 +254,19 @@ fn layer_of(name: &str) -> Result<&'static str> {
 }
 
 /// The shipped local embedder (fastembed bge-small-en-v1.5), wrapped in the
-/// content-addressed vector cache under `<root>/.cache`.
+/// content-addressed vector cache under `<root>/.cache`. Boxed so tests can
+/// swap in a fake: `GUNGNIR_TEST_EMBEDDER=1` serves the uniform-vector
+/// `Uniform` embedder instead, which needs no model download.
 #[cfg(feature = "embed")]
-fn embedder_for(
-    g: &Gungnir,
-) -> Result<crate::embedding::CachedEmbedder<crate::embedding::local::Fastembed>> {
+fn embedder_for(g: &Gungnir) -> Result<Box<dyn crate::embedding::Embedder>> {
+    if std::env::var_os("GUNGNIR_TEST_EMBEDDER").is_some() {
+        return Ok(Box::new(crate::embedding::Uniform));
+    }
     let inner = crate::embedding::local::Fastembed::new(g.root())?;
-    Ok(crate::embedding::CachedEmbedder::new(inner, g.root()))
+    Ok(Box::new(crate::embedding::CachedEmbedder::new(
+        inner,
+        g.root(),
+    )))
 }
 
 #[cfg(not(feature = "embed"))]
@@ -356,7 +362,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 #[cfg(feature = "embed")]
                 {
                     let e = embedder_for(&g)?;
-                    g.search_layer_semantic(layer_sel, &q, &e)?
+                    g.search_layer_semantic(layer_sel, &q, e.as_ref())?
                 }
                 #[cfg(not(feature = "embed"))]
                 {
@@ -443,7 +449,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 #[cfg(feature = "embed")]
                 {
                     let e = embedder_for(&g)?;
-                    g.brief_semantic(&agent, &task, limit, &e)?
+                    g.brief_semantic(&agent, &task, limit, e.as_ref())?
                 }
                 #[cfg(not(feature = "embed"))]
                 {
