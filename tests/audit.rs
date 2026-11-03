@@ -690,6 +690,11 @@ fn log_lists_the_full_revision_chain() {
     let out = ok(&store, &["log", &a]);
     assert!(out.contains(&b), "log omits middle revision: {out}");
     assert!(out.contains(&c), "log omits chain head: {out}");
+
+    // `blame A` names the live head C, not the intermediate B.
+    let out = ok(&store, &["blame", &a]);
+    assert!(out.contains(&format!("replaced by: {c}")), "{out}");
+    assert!(!out.contains(&format!("replaced by: {b}")), "{out}");
 }
 
 #[test]
