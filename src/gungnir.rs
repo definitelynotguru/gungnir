@@ -1205,12 +1205,20 @@ impl Gungnir {
             }
         }
         next.evidence = evidence;
-        // Declarations carry over as stored — copying the normalized index
-        // form (entity_mentions) would rewrite casing and can grow a name
-        // past the cap (İ lowers to two chars). Body-derived mentions are
-        // materialized with their original spelling: the new body need not
-        // repeat the old link, and a revision stays about the same topics.
-        next.entities = prev.entities.clone();
+        // Declarations carry over in their stored spelling — copying the
+        // normalized index form (entity_mentions) would rewrite casing and
+        // can grow a name past the cap (İ lowers to two chars). Declared
+        // names that never should have stored (blank or overlong, predating
+        // the rule) drop out rather than bricking the revision. Body-derived
+        // mentions are materialized with their original spelling: the new
+        // body need not repeat the old link, and a revision stays about the
+        // same topics.
+        next.entities = prev
+            .entities
+            .iter()
+            .filter(|n| crate::validate::valid_entity_name(n))
+            .cloned()
+            .collect();
         for t in prev.wikilink_targets() {
             let t = t.trim();
             if t.parse::<EntryId>().is_ok() || !crate::validate::valid_entity_name(t) {

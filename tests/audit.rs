@@ -1178,3 +1178,45 @@ fn rollback_with_legacy_project_ancestor_completes() {
     let rb_entry = g.codex().unwrap().require(rb.parse().unwrap()).unwrap();
     assert_eq!(rb_entry.project_id.as_deref(), Some("alpha beta"));
 }
+
+#[test]
+fn supersede_drops_legacy_invalid_declarations() {
+    // A declaration stored before the entity rule (blank, overlong) must
+    // not brick supersession: the revision keeps the valid names and
+    // drops the invalid ones.
+    let (_d, store) = root();
+    let a = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "s",
+            "--entities",
+            "real_entity",
+        ],
+    );
+    let g = Gungnir::open(&store).unwrap();
+    let codex = g.codex().unwrap();
+    let pid: gungnir::EntryId = a.parse().unwrap();
+    let path = codex.path_for(pid);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("real_entity"), "{text}");
+    std::fs::write(
+        &path,
+        text.replacen("- real_entity", "- real_entity\n- '   '", 1),
+    )
+    .unwrap();
+    assert_eq!(codex.require(pid).unwrap().entities.len(), 2);
+
+    let b = ok(
+        &store,
+        &["supersede", &a, "--agent", "a", "--summary", "s2"],
+    )
+    .trim()
+    .to_string();
+    let rev = codex.require(b.parse().unwrap()).unwrap();
+    assert_eq!(rev.entities, vec!["real_entity".to_string()]);
+}
