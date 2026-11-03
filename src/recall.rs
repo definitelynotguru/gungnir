@@ -189,7 +189,9 @@ fn stem(word: &str) -> String {
         w.pop();
     }
     // Terminal consonant-y: "retry" → "retri" to meet "retries" → "retri".
-    if w.len() > 3 && w.ends_with('y') && ends_consonant(&w[..w.len() - 1]) {
+    // The floor matches the ies rule's own length requirement, so short
+    // bases keep up too: "try" and "tries" both land on "tri".
+    if w.len() > 2 && w.ends_with('y') && ends_consonant(&w[..w.len() - 1]) {
         w.pop();
         w.push('i');
     }
@@ -568,6 +570,9 @@ mod tests {
         assert_eq!(stem("status"), stem("statuses"));
         assert_eq!(stem("focus"), stem("focuses"));
         assert_eq!(stem("alias"), stem("aliases"));
+        // Short consonant-y bases keep up with their ies plurals.
+        assert_eq!(stem("try"), stem("tries"));
+        assert_eq!(stem("cry"), stem("cries"));
         // Short words stay untouched.
         assert_eq!(stem("db"), "db");
         assert_eq!(stem("go"), "go");
