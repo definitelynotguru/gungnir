@@ -751,20 +751,42 @@ impl Gungnir {
         // hit-only matching would hide conflicts between facts that ranked
         // just below the briefing cutoff.
         let task_tokens: HashSet<String> = recall::tokenize(task).into_iter().collect();
-        let open_conflicts = self
-            .open_conflicts_lenient()?
-            .iter()
-            .filter(|c| {
-                hit_ids.contains(&c.new_entry)
-                    || hit_ids.contains(&c.conflicting_entry)
-                    || recall::tokenize(&c.new_summary)
-                        .iter()
-                        .any(|t| task_tokens.contains(t))
-                    || recall::tokenize(&c.conflicting_summary)
-                        .iter()
-                        .any(|t| task_tokens.contains(t))
-            })
-            .count();
+        let on_topic = |c: &ConflictRecord| {
+            hit_ids.contains(&c.new_entry)
+                || hit_ids.contains(&c.conflicting_entry)
+                || recall::tokenize(&c.new_summary)
+                    .iter()
+                    .any(|t| task_tokens.contains(t))
+                || recall::tokenize(&c.conflicting_summary)
+                    .iter()
+                    .any(|t| task_tokens.contains(t))
+        };
+        // ...and only warn on candidates the agent may see. Briefings are
+        // agent-scoped (codex + own journal), and a record's layer label is
+        // where the scan ran, not who the claim belongs to: a journal
+        // write's codex-scope candidate is labeled "codex" but its new
+        // claim is private. Counting it would leak another agent's journal
+        // activity into this briefing.
+        let codex_root = codex.root().to_path_buf();
+        let journal_root = journal.root().to_path_buf();
+        let mut open_conflicts = 0;
+        for c in self.open_conflicts_lenient()? {
+            if !on_topic(&c) {
+                continue;
+            }
+            let visible =
+                [c.new_entry, c.conflicting_entry]
+                    .iter()
+                    .all(|id| match self.locate(*id) {
+                        Ok(Some(store)) => {
+                            store.root() == codex_root || store.root() == journal_root
+                        }
+                        _ => false,
+                    });
+            if visible {
+                open_conflicts += 1;
+            }
+        }
         Ok(briefing::compile(BriefingInput {
             task: task.to_string(),
             codex_hits: codex_out.hits,

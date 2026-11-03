@@ -280,7 +280,11 @@ impl Conflicts {
         self.persist_locked(rec)
     }
 
-    /// Overwrite an existing record (resolution bookkeeping).
+    /// Overwrite an existing record (resolution bookkeeping). Test-only:
+    /// production closes records through `resolve_locked`, which serializes
+    /// the status recheck — a public blind update could overwrite a
+    /// resolution it never saw.
+    #[cfg(test)]
     pub fn update(&self, rec: &ConflictRecord) -> Result<()> {
         if self.get(rec.id)?.is_none() {
             return Err(Error::Invalid(format!(
