@@ -546,6 +546,7 @@ fn end_session_retry_finishes_pending_promotions() {
                 kind: EntryKind::Decision,
                 summary: "use the index".into(),
                 body: "it fixed the scan".into(),
+                review_of: None,
             }],
         )
         .unwrap();
@@ -568,11 +569,13 @@ fn end_session_retry_finishes_pending_promotions() {
                     kind: EntryKind::Decision,
                     summary: "use the index".into(),
                     body: "it fixed the scan".into(),
+                    review_of: None,
                 },
                 gungnir::Promotion {
                     kind: EntryKind::Observation,
                     summary: "pg_stat confirmed it".into(),
                     body: String::new(),
+                    review_of: None,
                 },
             ],
         )
@@ -781,11 +784,13 @@ fn promotions_sharing_a_summary_land_when_kinds_differ() {
                     kind: EntryKind::Decision,
                     summary: "use the index".into(),
                     body: String::new(),
+                    review_of: None,
                 },
                 gungnir::Promotion {
                     kind: EntryKind::Observation,
                     summary: "use the index".into(),
                     body: String::new(),
+                    review_of: None,
                 },
             ],
         )
@@ -862,4 +867,140 @@ fn live_session_write_skips_the_journal_scan() {
         g.scratch(&s.id).unwrap().require(id).unwrap().summary,
         "still working"
     );
+}
+
+// -- devin round -------------------------------------------------------------
+
+#[test]
+fn concurrent_end_sessions_write_one_archive() {
+    use std::sync::Barrier;
+    let (_dir, g) = gng();
+    let s = g.start_session("builder", "task").unwrap();
+    g.add_observation(&s, "note").unwrap();
+
+    // Two overlapping ends racing on the same session: the lock must
+    // serialize them so one archives and the other reports already_ended.
+    let barrier = Barrier::new(2);
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            let g = Gungnir::open(_dir.path()).unwrap();
+            barrier.wait();
+            g.end_session(&s, "done", vec![])
+        });
+        let b = scope.spawn(|| {
+            let g = Gungnir::open(_dir.path()).unwrap();
+            barrier.wait();
+            g.end_session(&s, "done", vec![])
+        });
+        vec![a.join().unwrap(), b.join().unwrap()]
+    });
+
+    let archives: usize = g
+        .journal("builder")
+        .unwrap()
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EntryKind::Session)
+        .count();
+    assert_eq!(archives, 1);
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 2);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| r.as_ref().unwrap().already_ended)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn distinct_findings_keep_their_bodies() {
+    let (_dir, g) = gng();
+    let s = g.start_session("builder", "task").unwrap();
+    g.add_observation(&s, "note").unwrap();
+
+    // Same kind and summary, different bodies: these are two findings,
+    // not a retry of one — both must land with their own text.
+    let report = g
+        .end_session(
+            &s,
+            "done",
+            vec![
+                gungnir::Promotion {
+                    kind: EntryKind::Decision,
+                    summary: "index the orders table".into(),
+                    body: "covering index on created_at".into(),
+                    review_of: None,
+                },
+                gungnir::Promotion {
+                    kind: EntryKind::Decision,
+                    summary: "index the orders table".into(),
+                    body: "partial index on status = pending".into(),
+                    review_of: None,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(report.promoted.len(), 2);
+    assert_ne!(report.promoted[0], report.promoted[1]);
+    let bodies: Vec<String> = report
+        .promoted
+        .iter()
+        .map(|id| g.codex().unwrap().require(*id).unwrap().body)
+        .collect();
+    assert!(bodies.contains(&"covering index on created_at".to_string()));
+    assert!(bodies.contains(&"partial index on status = pending".to_string()));
+}
+
+#[test]
+fn review_promotion_and_revision_keep_review_of() {
+    let (_dir, g) = gng();
+    let s = g.start_session("builder", "task").unwrap();
+    g.add_observation(&s, "note").unwrap();
+
+    // A review promoted at end-of-session must carry review_of or it
+    // fails validation and strands the session.
+    let target = Entry::new("builder", EntryKind::Observation, "the thing reviewed");
+    let journal = g.journal("builder").unwrap();
+    journal.create(&target).unwrap();
+
+    let report = g
+        .end_session(
+            &s,
+            "done",
+            vec![gungnir::Promotion {
+                kind: EntryKind::Review,
+                summary: "reviewed the thing".into(),
+                body: "looks right".into(),
+                review_of: Some(target.id),
+            }],
+        )
+        .unwrap();
+    let review = g.codex().unwrap().require(report.promoted[0]).unwrap();
+    assert_eq!(review.review_of, Some(target.id));
+
+    // Revising the review must keep the link or validation rejects it.
+    let next = g
+        .supersede(
+            report.promoted[0],
+            "builder",
+            "re-reviewed the thing",
+            "updated",
+        )
+        .unwrap();
+    assert_eq!(
+        g.codex().unwrap().require(next).unwrap().review_of,
+        Some(target.id)
+    );
+}
+
+#[test]
+fn stats_counts_a_started_session_without_notes() {
+    let (_dir, g) = gng();
+    let _s = g.start_session("builder", "task").unwrap();
+
+    // Zero notes yet, but .session.yaml exists: the session is live.
+    let st = g.stats(Some("builder")).unwrap();
+    assert_eq!(st.scratch_sessions, 1);
 }
