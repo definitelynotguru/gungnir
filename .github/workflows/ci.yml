@@ -40,10 +40,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets --features embed -- -D warnings
-      # Tests never load the model: Fastembed inits lazily, so the embed
-      # leg compiles and runs offline.
+      # Tests never load the model: Fastembed inits lazily, and the
+      # test-only `test-embedder` feature lets GUNGNIR_TEST_EMBEDDER=1 swap
+      # in the offline uniform embedder for the --semantic CLI tests.
       - name: Tests
-        run: cargo test --all-targets --features embed
+        run: cargo test --all-targets --features embed,test-embedder
 
   audit:
     name: dependency audit

@@ -250,8 +250,11 @@ impl Server {
                     #[cfg(feature = "embed")]
                     {
                         self.ensure_embedder()?;
-                        self.g
-                            .search_layer_semantic(layer, &q, self.embedder.as_deref().unwrap())?
+                        self.g.search_layer_semantic(
+                            layer,
+                            &q,
+                            self.embedder.as_deref().unwrap(),
+                        )?
                     }
                     #[cfg(not(feature = "embed"))]
                     unreachable!("semantic_enabled errors without the embed feature")
@@ -284,8 +287,12 @@ impl Server {
                     #[cfg(feature = "embed")]
                     {
                         self.ensure_embedder()?;
-                        self.g
-                            .brief_semantic(agent, task, limit, self.embedder.as_deref().unwrap())?
+                        self.g.brief_semantic(
+                            agent,
+                            task,
+                            limit,
+                            self.embedder.as_deref().unwrap(),
+                        )?
                     }
                     #[cfg(not(feature = "embed"))]
                     unreachable!("semantic_enabled errors without the embed feature")
@@ -819,6 +826,61 @@ mod tests {
         server.embedder = Some(Box::new(crate::embedding::Uniform));
         let msgs = exchange_on(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":"query cache eviction","semantic":true}}}"#,
+            &mut server,
+        );
+        let text = msgs[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("postgres pooling limits"), "{text}");
+    }
+
+    /// The brief arm shares `semantic_enabled`, so a mistyped value must
+    /// error there too — not fall through to a keyword briefing.
+    #[test]
+    fn brief_non_boolean_semantic_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brief","arguments":{"agent":"ops","task":"cache eviction","semantic":"yes"}}}"#,
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("boolean"));
+    }
+
+    /// brief with semantic:true errors on a default build, same as recall.
+    #[cfg(not(feature = "embed"))]
+    #[test]
+    fn brief_semantic_errors_without_the_embed_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brief","arguments":{"agent":"ops","task":"cache eviction","semantic":true}}}"#,
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("embed"));
+    }
+
+    /// brief with semantic:true must reach hybrid search — a keyword
+    /// briefing in its place is the silent degrade the flag exists to
+    /// prevent.
+    #[cfg(feature = "embed")]
+    #[test]
+    fn brief_semantic_dispatches_to_hybrid_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gungnir::open(dir.path()).unwrap();
+        let codex = g.codex().unwrap();
+        let mut e = crate::entry::Entry::new("ops", EntryKind::Decision, "postgres pooling limits");
+        e.verify("ops", None);
+        codex.create(&e).unwrap();
+
+        let mut server = Server::new(g);
+        server.embedder = Some(Box::new(crate::embedding::Uniform));
+        let msgs = exchange_on(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brief","arguments":{"agent":"ops","task":"query cache eviction","semantic":true}}}"#,
             &mut server,
         );
         let text = msgs[0]["result"]["content"][0]["text"].as_str().unwrap();

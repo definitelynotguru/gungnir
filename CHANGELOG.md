@@ -46,8 +46,9 @@ All notable changes to Gungnir are documented here. The format follows
   unverified 0.75 / contradicted 0.35 and recency decays at a 90-day
   half-life floored at 0.25. Formula documented in docs/DESIGN.md; applies
   identically in keyword and hybrid mode.
-- **Paraphrase bench.** The bench adds a 18-check paraphrase suite measuring
-  legacy boolean scoring vs BM25-lite vs hybrid recall and asserting hybrid
+- **Paraphrase bench.** The bench adds a paraphrase suite measuring
+  legacy boolean scoring vs BM25-lite vs hybrid recall, asserting the
+  target ranks first in its verification-state bucket and that hybrid
   coverage never falsely abstains when knowledge exists under different
   words.
 

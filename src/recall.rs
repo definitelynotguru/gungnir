@@ -466,11 +466,27 @@ pub(crate) fn stats_pool<'a>(
     revised: &HashSet<EntryId>,
     query: &Query,
 ) -> Vec<&'a Entry> {
+    visible_indices(pool, revised, query)
+        .into_iter()
+        .map(|i| &pool[i].entry)
+        .collect()
+}
+
+/// Indices of candidates visible for scoring and ranking: rolled back
+/// always out; superseded tails and contradicted facts out under
+/// `current_only`. Shared by `stats_pool` (IDF) and `hybrid_search` (rank
+/// channels) so hidden entries shift neither IDF nor RRF ranks.
+pub(crate) fn visible_indices(
+    pool: &[Candidate],
+    revised: &HashSet<EntryId>,
+    query: &Query,
+) -> Vec<usize> {
     pool.iter()
-        .filter(|c| c.state != StateAt::RolledBack)
-        .filter(|c| !query.current_only || !revised.contains(&c.entry.id))
-        .filter(|c| !query.current_only || c.state != StateAt::Contradicted)
-        .map(|c| &c.entry)
+        .enumerate()
+        .filter(|(_, c)| c.state != StateAt::RolledBack)
+        .filter(|(_, c)| !query.current_only || !revised.contains(&c.entry.id))
+        .filter(|(_, c)| !query.current_only || c.state != StateAt::Contradicted)
+        .map(|(i, _)| i)
         .collect()
 }
 
@@ -825,5 +841,116 @@ mod tests {
         assert_eq!(out.hits.len(), 2);
         assert_eq!(out.hits[0].entry.id, fresh.id);
         assert!(out.hits[0].score > out.hits[1].score);
+    }
+
+    /// Hidden entries feed coverage only — never IDF. Two stores with
+    /// identical visible entries must score identically no matter how
+    /// many rolled-back duplicates share the query's tokens.
+    #[test]
+    fn hidden_entries_do_not_shift_visible_scores() {
+        let old = Utc::now() - chrono::Duration::days(3650);
+        let mut a = Entry::new("a", EntryKind::Decision, "postgres pooling limits");
+        a.timestamp = old;
+        a.verify("ops", None);
+        let mut b = Entry::new("a", EntryKind::Decision, "postgres timeout notes");
+        b.timestamp = old;
+        let mut hidden = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "postgres postgres postgres retracted",
+        );
+        hidden.timestamp = old;
+        hidden.mark_rolled_back("ops");
+
+        let (_d1, s1) = store_with(vec![a.clone(), b.clone()]);
+        let (_d2, s2) = store_with(vec![a, b, hidden]);
+        let q = Query::new("postgres", 10);
+        let out1 = search_with_coverage(&s1, &q).unwrap();
+        let out2 = search_with_coverage(&s2, &q).unwrap();
+
+        let ids1: Vec<_> = out1.hits.iter().map(|h| h.entry.id).collect();
+        let ids2: Vec<_> = out2.hits.iter().map(|h| h.entry.id).collect();
+        assert_eq!(ids1, ids2, "hidden entry changed the hit order");
+        for (h1, h2) in out1.hits.iter().zip(&out2.hits) {
+            assert_eq!(
+                h1.score, h2.score,
+                "hidden entry shifted the score of {}",
+                h1.entry.id
+            );
+        }
+        assert_eq!(out2.coverage.hidden_rolled_back, 1);
+    }
+
+    /// SPEC/DESIGN publish trust 1.0/0.75/0.35 and recency at a 90-day
+    /// half-life floored at 0.25 — pin both. Score = relevance × trust ×
+    /// recency, so equal-text entries reduce each ratio to the constant.
+    #[test]
+    fn trust_and_recency_constants_hold() {
+        // Trust: three same-text entries, one per visible state.
+        let old = Utc::now() - chrono::Duration::days(3650);
+        let mut verified = Entry::new("a", EntryKind::Decision, "postgres queue note");
+        verified.timestamp = old;
+        verified.verify("ops", None);
+        let mut unverified = Entry::new("a", EntryKind::Decision, "postgres queue note");
+        unverified.timestamp = old;
+        let mut contradicted = Entry::new("a", EntryKind::Decision, "postgres queue note");
+        contradicted.timestamp = old;
+        contradicted.contradict(verified.id, "ops", None);
+        let (_d, store) = store_with(vec![verified, unverified, contradicted]);
+
+        let out = search_with_coverage(&store, &Query::new("postgres queue", 10)).unwrap();
+        assert_eq!(out.hits.len(), 3);
+        let (v, u, c) = (&out.hits[0], &out.hits[1], &out.hits[2]);
+        assert_eq!(
+            v.entry.verification,
+            crate::entry::VerificationState::Verified
+        );
+        assert_eq!(
+            u.entry.verification,
+            crate::entry::VerificationState::Unverified
+        );
+        assert!(
+            (v.score / u.score - 1.0 / 0.75).abs() < 1e-9,
+            "verified/unverified ratio {} != 1.333",
+            v.score / u.score
+        );
+        assert!(
+            (u.score / c.score - 0.75 / 0.35).abs() < 1e-9,
+            "unverified/contradicted ratio {} != 2.143",
+            u.score / c.score
+        );
+
+        // Recency: identical text, timestamps exactly at the cutoff and
+        // 90 days before it → ratio is exactly one half-life, 0.5.
+        let cutoff = Utc::now() - chrono::Duration::days(4000);
+        let mut fresh = Entry::new("a", EntryKind::Decision, "postgres queue note");
+        fresh.timestamp = cutoff;
+        let mut stale = fresh.clone();
+        stale.id = crate::id::EntryId::generate();
+        stale.timestamp = cutoff - chrono::Duration::days(90);
+        let (_d2, s2) = store_with(vec![fresh, stale]);
+        let out =
+            search_with_coverage(&s2, &Query::new("postgres queue", 10).as_of(cutoff)).unwrap();
+        assert_eq!(out.hits.len(), 2);
+        assert!(
+            (out.hits[1].score / out.hits[0].score - 0.5).abs() < 1e-9,
+            "90-day-old entry scored {} of fresh, expected 0.5",
+            out.hits[1].score / out.hits[0].score
+        );
+
+        // Floor: at 10y and 20y both decay below 0.25, so scores are equal.
+        let mut ten = Entry::new("a", EntryKind::Decision, "postgres queue note");
+        ten.timestamp = cutoff - chrono::Duration::days(365 * 10);
+        let mut twenty = ten.clone();
+        twenty.id = crate::id::EntryId::generate();
+        twenty.timestamp = cutoff - chrono::Duration::days(365 * 20);
+        let (_d3, s3) = store_with(vec![ten, twenty]);
+        let out =
+            search_with_coverage(&s3, &Query::new("postgres queue", 10).as_of(cutoff)).unwrap();
+        assert_eq!(out.hits.len(), 2);
+        assert_eq!(
+            out.hits[0].score, out.hits[1].score,
+            "the 0.25 floor should equalize ancient entries"
+        );
     }
 }

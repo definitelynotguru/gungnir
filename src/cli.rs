@@ -255,11 +255,14 @@ fn layer_of(name: &str) -> Result<&'static str> {
 
 /// The shipped local embedder (fastembed bge-small-en-v1.5), wrapped in the
 /// content-addressed vector cache under `<root>/.cache`. Boxed so tests can
-/// swap in a fake: `GUNGNIR_TEST_EMBEDDER=1` serves the uniform-vector
-/// `Uniform` embedder instead, which needs no model download.
+/// swap in a fake: under the test-only `test-embedder` feature,
+/// `GUNGNIR_TEST_EMBEDDER=1` serves the uniform-vector `Uniform` embedder
+/// instead of the real model. A plain `--features embed` build compiles the
+/// hook out, so the env var can never change a release binary's behavior.
 #[cfg(feature = "embed")]
 fn embedder_for(g: &Gungnir) -> Result<Box<dyn crate::embedding::Embedder>> {
-    if std::env::var_os("GUNGNIR_TEST_EMBEDDER").is_some() {
+    #[cfg(feature = "test-embedder")]
+    if std::env::var("GUNGNIR_TEST_EMBEDDER").is_ok_and(|v| v == "1") {
         return Ok(Box::new(crate::embedding::Uniform));
     }
     let inner = crate::embedding::local::Fastembed::new(g.root())?;

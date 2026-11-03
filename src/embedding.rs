@@ -21,6 +21,10 @@ use crate::recall::{self, CorpusStats, Query, SearchOutcome};
 use crate::{Error, Result, Store};
 
 /// Turns text into vectors. Implement this against your embedding provider.
+///
+/// `embed` must return exactly one vector per input text, in the same
+/// order. A short or misaligned reply is a hard error — callers validate
+/// the length and refuse to score on partial data.
 pub trait Embedder: Send + Sync {
     fn model(&self) -> &str;
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
@@ -103,6 +107,17 @@ impl<E: Embedder> Embedder for CachedEmbedder<E> {
         if !misses.is_empty() {
             let fresh: Vec<String> = misses.iter().map(|(_, t)| (*t).clone()).collect();
             let vectors = self.inner.embed(&fresh)?;
+            // A short inner reply must not write vectors under the wrong
+            // text's key — a misaligned cache entry is a wrong ranking
+            // that survives deletion of the evidence.
+            if vectors.len() != fresh.len() {
+                return Err(Error::Invalid(format!(
+                    "embedder {} returned {} vectors for {} texts",
+                    self.inner.model(),
+                    vectors.len(),
+                    fresh.len()
+                )));
+            }
             for ((i, t), v) in misses.into_iter().zip(vectors) {
                 let path = self.cache_path(t);
                 fs::write(
@@ -182,9 +197,13 @@ pub fn hybrid_search(
     let pool_len = pool.len();
     let stats = CorpusStats::new(recall::stats_pool(&pool, &revised, query).into_iter());
 
-    // Keyword channel. The ranking holds only candidates with signal:
-    // zero-score entries have no keyword relevance, and letting them into
-    // RRF would make store order influence a vector-only query's results.
+    // Keyword channel. The ranking holds only visible candidates with
+    // signal: hidden entries (rolled back, superseded, contradicted under
+    // current_only) may feed coverage but must not take a rank — the same
+    // visibility set stats_pool excludes from IDF. Zero-score entries have
+    // no keyword relevance, and letting them into RRF would make store
+    // order influence a vector-only query's results.
+    let visible = recall::visible_indices(&pool, &revised, query);
     let qtokens = {
         let mut t = recall::tokenize(&query.text);
         t.sort();
@@ -195,7 +214,11 @@ pub fn hybrid_search(
         .iter()
         .map(|c| recall::score(&c.entry, &qtokens, &stats))
         .collect();
-    let mut kw_rank: Vec<usize> = (0..pool.len()).filter(|&i| kw_scores[i] > 0.0).collect();
+    let mut kw_rank: Vec<usize> = visible
+        .iter()
+        .copied()
+        .filter(|&i| kw_scores[i] > 0.0)
+        .collect();
     kw_rank.sort_by(|a, b| kw_scores[*b].total_cmp(&kw_scores[*a]));
 
     // Vector channel. Entries rolled back *now* stay out of the embedder:
@@ -204,24 +227,40 @@ pub fn hybrid_search(
     // query that evaluates them back to their pre-retraction state. Their
     // keyword scores still compute locally, so coverage can report them
     // as hidden.
-    let embedded: Vec<usize> = pool
+    let embedded: Vec<usize> = visible
         .iter()
-        .enumerate()
-        .filter(|(_, c)| c.entry.verification != crate::entry::VerificationState::RolledBack)
-        .map(|(i, _)| i)
+        .copied()
+        .filter(|&i| pool[i].entry.verification != crate::entry::VerificationState::RolledBack)
         .collect();
     let texts: Vec<String> = embedded
         .iter()
         .map(|&i| format!("{}\n{}", pool[i].entry.summary, pool[i].entry.body))
         .collect();
     let vectors = embedder.embed(&texts)?;
+    if vectors.len() != texts.len() {
+        return Err(Error::Invalid(format!(
+            "embedder {} returned {} vectors for {} texts",
+            embedder.model(),
+            vectors.len(),
+            texts.len()
+        )));
+    }
     let query_vecs = embedder.embed(std::slice::from_ref(&query.text))?;
+    if query_vecs.len() != 1 {
+        return Err(Error::Invalid(format!(
+            "embedder {} returned {} vectors for the query",
+            embedder.model(),
+            query_vecs.len()
+        )));
+    }
     let qv = &query_vecs[0];
     let mut vec_scores = vec![0.0f32; pool.len()];
     for (i, v) in embedded.iter().zip(vectors.iter()) {
         vec_scores[*i] = cosine(qv, v);
     }
-    let mut vec_rank: Vec<usize> = (0..pool.len())
+    let mut vec_rank: Vec<usize> = embedded
+        .iter()
+        .copied()
         .filter(|&i| vec_scores[i] > VECTOR_MATCH_FLOOR)
         .collect();
     vec_rank.sort_by(|a, b| vec_scores[*b].total_cmp(&vec_scores[*a]));
@@ -668,5 +707,47 @@ mod tests {
             seen.iter().all(|t| !t.contains("retracted fact")),
             "retracted text went to the embedder via as_of: {seen:?}"
         );
+    }
+
+    /// Hidden entries feed coverage only — they must not consume RRF
+    /// ranks. With a rolled-back keyword champion in the pool, the two
+    /// visible hits must fuse identically to a store without it.
+    #[test]
+    fn hidden_entries_take_no_rank_in_the_fused_order() {
+        let old = chrono::Utc::now() - chrono::Duration::days(3650);
+        let mut a = Entry::new("a", EntryKind::Decision, "postgres alpha note");
+        a.timestamp = old;
+        a.verify("ops", None);
+        let mut b = Entry::new("a", EntryKind::Decision, "postgres beta note");
+        b.timestamp = old;
+        b.verify("ops", None);
+        let mut hidden = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "postgres postgres postgres retracted",
+        );
+        hidden.timestamp = old;
+        hidden.mark_rolled_back("ops");
+
+        let dir1 = tempfile::tempdir().unwrap();
+        let s1 = Store::open(dir1.path()).unwrap();
+        s1.create(&a).unwrap();
+        s1.create(&b).unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let s2 = Store::open(dir2.path()).unwrap();
+        s2.create(&a).unwrap();
+        s2.create(&b).unwrap();
+        s2.create(&hidden).unwrap();
+
+        let q = Query::new("postgres", 10);
+        let out1 = hybrid_search(&s1, &q, &Uniform).unwrap();
+        let out2 = hybrid_search(&s2, &q, &Uniform).unwrap();
+        let ids1: Vec<_> = out1.hits.iter().map(|h| h.entry.id).collect();
+        let ids2: Vec<_> = out2.hits.iter().map(|h| h.entry.id).collect();
+        assert_eq!(ids1, ids2, "hidden entry changed the fused order");
+        for (h1, h2) in out1.hits.iter().zip(&out2.hits) {
+            assert_eq!(h1.score, h2.score, "hidden entry shifted a fused score");
+        }
+        assert_eq!(out2.coverage.hidden_rolled_back, 1);
     }
 }
