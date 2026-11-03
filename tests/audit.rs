@@ -1220,3 +1220,48 @@ fn supersede_drops_legacy_invalid_declarations() {
     let rev = codex.require(b.parse().unwrap()).unwrap();
     assert_eq!(rev.entities, vec!["real_entity".to_string()]);
 }
+
+#[test]
+fn diff_layer_restricts_both_snapshots() {
+    // --layer must keep other partitions out of the diff, not just label
+    // them: codex-only shows no journal rows, journal-only shows no codex.
+    let (_d, store) = root();
+    let _ = seed(&store);
+    let t1 = (Utc::now() - Duration::hours(1)).to_rfc3339();
+    let t2 = (Utc::now() + Duration::hours(1)).to_rfc3339();
+
+    let out = ok(&store, &["diff", &t1, &t2, "--layer", "codex"]);
+    assert!(!out.contains("journal/"), "{out}");
+    let out = ok(&store, &["diff", &t1, &t2, "--layer", "journal"]);
+    assert!(out.contains("journal/builder"), "{out}");
+    assert!(!out.contains("codex/"), "{out}");
+}
+
+#[test]
+fn blame_marks_contradicted_entries_not_current() {
+    // A contradicted belief with no successor is not "still current":
+    // recall hides it from the current view, so blame must say so.
+    let (_d, store) = root();
+    let a = add(
+        &store,
+        &["--agent", "a", "--kind", "decision", "--summary", "s"],
+    );
+    let c = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "counter",
+        ],
+    );
+    ok(
+        &store,
+        &["contradict", &a, "--by", &c, "--verifier", "team"],
+    );
+    let out = ok(&store, &["blame", &a]);
+    assert!(out.contains("contradicted"), "{out}");
+    assert!(!out.contains("still current"), "{out}");
+}

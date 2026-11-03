@@ -480,7 +480,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
             println!("{}", e.summary);
             let mentions = e.entity_mentions();
             if !mentions.is_empty() {
-                println!("entities: {}", mentions.join(", "));
+                println!(
+                    "entities: {}",
+                    mentions
+                        .iter()
+                        .map(|m| crate::validate::one_line(m))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
             if !e.body.is_empty() {
                 println!("\n{}", e.body);
