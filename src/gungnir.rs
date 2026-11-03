@@ -225,6 +225,47 @@ impl Gungnir {
         self.conflicts_queue().open_lenient()
     }
 
+    /// One recorded candidate by id, strict — corruption and missing ids
+    /// both surface as errors.
+    pub fn conflict_record(&self, id: ConflictId) -> Result<ConflictRecord> {
+        self.conflicts_queue().require(id)
+    }
+
+    /// Candidates `agent` may see. A record's layer label says where the
+    /// scan ran, not who the claim belongs to — a journal write's
+    /// codex-scope candidate is labeled "codex" but describes a private
+    /// claim — so visibility is derived from where both endpoints live:
+    /// the shared codex or the agent's own journal. `all` includes
+    /// resolved and dismissed records.
+    pub fn conflicts_for(&self, agent: &str, all: bool) -> Result<Vec<ConflictRecord>> {
+        let records = if all {
+            self.all_conflicts()?
+        } else {
+            self.open_conflicts()?
+        };
+        let codex = self.codex()?;
+        let journal = self.journal(agent)?;
+        Ok(records
+            .into_iter()
+            .filter(|c| self.record_visible(&codex, &journal, c))
+            .collect())
+    }
+
+    /// Whether `agent` may see and resolve `record`: every endpoint sits in
+    /// the shared codex or the agent's own journal.
+    pub fn conflict_visible_to(&self, agent: &str, record: &ConflictRecord) -> Result<bool> {
+        Ok(self.record_visible(&self.codex()?, &self.journal(agent)?, record))
+    }
+
+    /// Endpoint visibility shared by `conflicts_for`, `conflict_visible_to`,
+    /// and briefings: both ends exist in the shared or the agent's own
+    /// store. `exists` is a path stat on already-open stores.
+    fn record_visible(&self, codex: &Store, journal: &Store, c: &ConflictRecord) -> bool {
+        [c.new_entry, c.conflicting_entry]
+            .iter()
+            .all(|id| codex.exists(*id).unwrap_or(false) || journal.exists(*id).unwrap_or(false))
+    }
+
     /// Stores scanned for conflicts after a claim write lands in `home`:
     /// always the write's own layer, plus the shared Codex when the write
     /// lands in a Journal — journal facts are private, but disagreeing with
@@ -246,26 +287,30 @@ impl Gungnir {
         Ok(vec![])
     }
 
-    /// Detect + record conflict candidates for `entry` across its scopes.
-    /// Detection runs after the write lands and can only add records, so a
-    /// failure is a warning the caller surfaces — never an error: returning
-    /// Err would report a completed write as failed and tempt a duplicate
-    /// retry (SPEC.md: the write still succeeds).
+    /// Detect + record conflict candidates for `entries` across the home
+    /// layer's scopes in one pass per scope. Detection runs after the
+    /// writes land and can only add records, so a failure is a warning the
+    /// caller surfaces — never an error: returning Err would report a
+    /// completed write as failed and tempt a duplicate retry (SPEC.md: the
+    /// write still succeeds).
     fn scan_and_record(
         &self,
         home: &Store,
-        entry: &Entry,
+        entries: &[Entry],
         embedder: Option<&dyn crate::embedding::Embedder>,
     ) -> (Vec<ConflictRecord>, Vec<String>) {
         let queue = self.conflicts_queue();
         let mut records = Vec::new();
         let mut warnings = Vec::new();
+        if entries.is_empty() {
+            return (records, warnings);
+        }
         let scopes = match self.conflict_scopes(home) {
             Ok(s) => s,
             Err(e) => return (records, vec![format!("conflict detection skipped: {e}")]),
         };
         for (store, layer) in scopes {
-            let candidates = match conflicts::detect(&store, &layer, entry, embedder) {
+            let candidates = match conflicts::detect_many(&store, &layer, entries, embedder) {
                 Ok(c) => c,
                 Err(e) => {
                     warnings.push(format!("conflict detection on {layer} failed: {e}"));
@@ -321,7 +366,8 @@ impl Gungnir {
             }
         };
         store.create_with(&entry, &|id| self.exists_anywhere(id))?;
-        let (conflicts, warnings) = self.scan_and_record(&store, &entry, embedder);
+        let (conflicts, warnings) =
+            self.scan_and_record(&store, std::slice::from_ref(&entry), embedder);
         Ok(WriteOutcome {
             id: entry.id,
             conflicts,
@@ -634,13 +680,7 @@ impl Gungnir {
         // Scan the freshly landed promotions: entries deduped on retry
         // were already scanned by the end that created them.
         let codex = self.codex()?;
-        let mut conflicts = Vec::new();
-        let mut warnings = Vec::new();
-        for c in &fresh {
-            let (records, w) = self.scan_and_record(&codex, c, embedder);
-            conflicts.extend(records);
-            warnings.extend(w);
-        }
+        let (conflicts, warnings) = self.scan_and_record(&codex, &fresh, embedder);
 
         Ok(EndReport {
             journal_id: journal_entry.id,
@@ -772,10 +812,7 @@ impl Gungnir {
             if !on_topic(&c) {
                 continue;
             }
-            let visible = [c.new_entry, c.conflicting_entry].iter().all(|id| {
-                codex.exists(*id).unwrap_or(false) || journal.exists(*id).unwrap_or(false)
-            });
-            if visible {
+            if self.record_visible(&codex, &journal, &c) {
                 open_conflicts += 1;
             }
         }
@@ -970,6 +1007,11 @@ impl Gungnir {
         store.update_with(&entry, &|id| self.exists_anywhere(id))
     }
 
+    /// Mark `id` contradicted by `by` — the same transition the conflict
+    /// resolution's Contradict verb runs, with the same refutation policy:
+    /// refuses rolled-back targets and refuses to replace a
+    /// `contradicted_by` naming a different entry, so callers can't swap an
+    /// earlier refutation by going through the direct verb.
     pub fn contradict(
         &self,
         id: EntryId,
@@ -982,8 +1024,10 @@ impl Gungnir {
             return Err(Error::NotFound(by));
         }
         let mut entry = store.require(id)?;
-        entry.contradict(by, verifier, note);
-        store.update_with(&entry, &|id| self.exists_anywhere(id))
+        if apply_contradiction(&mut entry, by, verifier, note)? {
+            store.update_with(&entry, &|id| self.exists_anywhere(id))?;
+        }
+        Ok(())
     }
 
     /// Close a conflict candidate with one of the three resolution verbs.
@@ -1055,24 +1099,8 @@ impl Gungnir {
                         .locate(rec.conflicting_entry)?
                         .ok_or(Error::NotFound(rec.conflicting_entry))?;
                     let mut entry = store.require(rec.conflicting_entry)?;
-                    if entry.verification == VerificationState::RolledBack {
-                        return Err(Error::Invalid(format!(
-                            "{} is rolled back; contradict applies to live facts",
-                            rec.conflicting_entry
-                        )));
-                    }
-                    match &entry.verification {
-                        VerificationState::Contradicted { by } if *by == rec.new_entry => {}
-                        VerificationState::Contradicted { by } => {
-                            return Err(Error::Invalid(format!(
-                                "{} is already contradicted by {by}; refusing to replace that refutation",
-                                rec.conflicting_entry
-                            )));
-                        }
-                        _ => {
-                            entry.contradict(rec.new_entry, actor, None);
-                            store.update_with(&entry, &|id| self.exists_anywhere(id))?;
-                        }
+                    if apply_contradiction(&mut entry, rec.new_entry, actor, None)? {
+                        store.update_with(&entry, &|id| self.exists_anywhere(id))?;
                     }
                 }
                 ConflictVerb::Dismiss => {}
@@ -1146,7 +1174,8 @@ impl Gungnir {
         next.evidence = evidence;
         next.body = body.into();
         store.create_with(&next, &|id| self.exists_anywhere(id))?;
-        let (conflicts, warnings) = self.scan_and_record(&store, &next, embedder);
+        let (conflicts, warnings) =
+            self.scan_and_record(&store, std::slice::from_ref(&next), embedder);
         Ok(WriteOutcome {
             id: next.id,
             conflicts,
@@ -1292,7 +1321,8 @@ impl Gungnir {
             c.review_of = Some(from);
         }
         codex.create_with(&c, &|id| self.exists_anywhere(id))?;
-        let (conflicts, warnings) = self.scan_and_record(&codex, &c, embedder);
+        let (conflicts, warnings) =
+            self.scan_and_record(&codex, std::slice::from_ref(&c), embedder);
         Ok(WriteOutcome {
             id: c.id,
             conflicts,
@@ -1473,6 +1503,37 @@ fn summarize(text: &str) -> String {
         s = "(untitled)".into();
     }
     s
+}
+
+/// The refutation policy shared by `Gungnir::contradict` and the resolve
+/// path's Contradict verb: refuse rolled-back targets, and refuse to
+/// replace a `contradicted_by` naming a different entry so a direct verb
+/// call can't swap an earlier refutation. Returns true when the
+/// transition was applied; already-contradicted-by-`by` is an idempotent
+/// no-op.
+fn apply_contradiction(
+    entry: &mut Entry,
+    by: EntryId,
+    verifier: &str,
+    note: Option<String>,
+) -> Result<bool> {
+    if entry.verification == VerificationState::RolledBack {
+        return Err(Error::Invalid(format!(
+            "{} is rolled back; contradict applies to live facts",
+            entry.id
+        )));
+    }
+    match &entry.verification {
+        VerificationState::Contradicted { by: existing } if *existing == by => Ok(false),
+        VerificationState::Contradicted { by: existing } => Err(Error::Invalid(format!(
+            "{} is already contradicted by {existing}; refusing to replace that refutation",
+            entry.id
+        ))),
+        _ => {
+            entry.contradict(by, verifier, note);
+            Ok(true)
+        }
+    }
 }
 
 #[cfg(test)]

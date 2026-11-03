@@ -202,19 +202,20 @@ impl Server {
             },
             {
                 "name": "conflicts",
-                "description": "List open conflict candidates. all: include resolved and dismissed.",
+                "description": "List open conflict candidates visible to agent: codex endpoints plus the agent's own journal. all: include resolved and dismissed.",
                 "inputSchema": schema(json!({
+                    "agent": {"type": "string"},
                     "all": {"type": "boolean"}
-                }), &[])
+                }), &["agent"])
             },
             {
                 "name": "resolve_conflict",
-                "description": "Close a conflict candidate. verb: supersede (newer truth, links the revision chain), contradict (verified entry is wrong), or dismiss (not a conflict).",
+                "description": "Close a conflict candidate visible to agent. verb: supersede (newer truth, links the revision chain), contradict (verified entry is wrong), or dismiss (not a conflict).",
                 "inputSchema": schema(json!({
                     "id": {"type": "string"},
                     "verb": {"type": "string", "enum": ["supersede", "contradict", "dismiss"]},
                     "agent": {"type": "string"}
-                }), &["id", "verb"])
+                }), &["id", "verb", "agent"])
             },
             {
                 "name": "list",
@@ -424,12 +425,12 @@ impl Server {
                 ))
             }
             "conflicts" => {
+                let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-                let records = if all {
-                    self.g.all_conflicts()?
-                } else {
-                    self.g.open_conflicts()?
-                };
+                // Same scoping briefings apply: a candidate naming a
+                // private journal endpoint stays invisible to other
+                // agents, record summaries included.
+                let records = self.g.conflicts_for(agent, all)?;
                 if records.is_empty() {
                     return Ok(if all {
                         "(no conflict candidates)".into()
@@ -469,7 +470,11 @@ impl Server {
                         )))
                     }
                 };
-                let actor = arg("agent").unwrap_or("agent");
+                let actor = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let rec = self.g.conflict_record(id)?;
+                if !self.g.conflict_visible_to(actor, &rec)? {
+                    return Err(Error::Invalid(format!("conflict not found: {id}")));
+                }
                 let rec = self.g.resolve_conflict(id, verb, actor)?;
                 Ok(format!("{} resolved: {}", rec.id, rec.status))
             }
