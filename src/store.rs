@@ -169,7 +169,20 @@ impl Store {
         paths.sort_by_key(|(id, _)| *id);
         for (file_id, path) in paths {
             match parse_entry_file(&path) {
-                Ok(entry) if entry.id == file_id => scan.entries.push(entry),
+                // Canonical placement is path_for(id): a file sitting in
+                // another day shard is skipped, not adopted. get() and
+                // locate() read only the canonical path, so entries and
+                // mutations would otherwise disagree on what exists.
+                Ok(entry) if entry.id == file_id && path == self.path_for(entry.id) => {
+                    scan.entries.push(entry);
+                }
+                Ok(entry) if entry.id == file_id => scan.skipped.push(Skipped {
+                    path: path.clone(),
+                    error: format!(
+                        "placed in wrong shard; canonical path is {}",
+                        self.path_for(entry.id).display()
+                    ),
+                }),
                 Ok(entry) => scan.skipped.push(Skipped {
                     path,
                     error: format!("entry id {} does not match filename id {file_id}", entry.id),

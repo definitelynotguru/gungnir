@@ -333,6 +333,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 let hidden = out.coverage.hidden_superseded + out.coverage.hidden_rolled_back;
                 if out.coverage.total == 0 {
                     println!("(no knowledge on file)");
+                } else if out.coverage.contradicted > 0 {
+                    println!("(only contradicted knowledge matched this topic)");
                 } else if out.coverage.total_visible() == 0 && hidden > 0 {
                     println!("(no live knowledge covers this topic; {hidden} superseded or rolled back hidden)");
                 } else {

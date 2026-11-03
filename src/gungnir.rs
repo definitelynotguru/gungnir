@@ -5,7 +5,7 @@
 //! - Journal: `<root>/journal/<agent>` — private per-agent history
 //! - Scratch: `<root>/scratch/<session>` — ephemeral per-task memory
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -152,7 +152,8 @@ impl Gungnir {
 
     /// Write the session's identity file. Skipped silently when it already
     /// exists, so a session reconstructed with an empty task never clobbers
-    /// the real one.
+    /// the real one. Temp-then-rename like every other write: a torn meta
+    /// would fail `load_session` for the session's whole life.
     fn persist_session(&self, session: &Session) -> Result<()> {
         let path = self.session_meta_path(&session.id);
         if path.exists() {
@@ -161,7 +162,9 @@ impl Gungnir {
         std::fs::create_dir_all(path.parent().unwrap())?;
         let yaml = serde_yaml::to_string(session)
             .map_err(|e| Error::Invalid(format!("cannot serialize session {}: {e}", session.id)))?;
-        std::fs::write(&path, yaml)?;
+        let tmp = path.with_file_name(format!(".tmp-{}-session.yaml", std::process::id()));
+        std::fs::write(&tmp, yaml)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -244,13 +247,17 @@ impl Gungnir {
                     session.id
                 )));
             };
-            // A crashed end can leave scratch behind; converge by clearing it.
+            // A crashed end can leave pending promotions and scratch behind;
+            // finish the promotions (skipping the ones that landed) and
+            // converge by clearing scratch.
+            let promoted =
+                self.finish_promotions(archive, &session.id, &session.agent, promotions)?;
             if scratch_exists {
                 std::fs::remove_dir_all(&dir)?;
             }
             return Ok(EndReport {
                 journal_id: archive,
-                promoted: vec![],
+                promoted,
                 already_ended: true,
             });
         }
@@ -297,26 +304,51 @@ impl Gungnir {
         let journal_store = self.journal(&session.agent)?;
         journal_store.create(&journal_entry)?;
 
-        let codex = self.codex()?;
-        let mut promoted_ids = Vec::new();
-        for p in promotions {
-            let mut c = Entry::new(&session.agent, p.kind, p.summary);
-            c.session_id = Some(session.id.clone());
-            c.body = p.body;
-            c.evidence.push(Evidence::Ref {
-                id: journal_entry.id,
-            });
-            codex.create_with(&c, &|id| self.exists_anywhere(id))?;
-            promoted_ids.push(c.id);
-        }
+        let promoted =
+            self.finish_promotions(journal_entry.id, &session.id, &session.agent, promotions)?;
 
         std::fs::remove_dir_all(&dir)?;
 
         Ok(EndReport {
             journal_id: journal_entry.id,
-            promoted: promoted_ids,
+            promoted,
             already_ended: false,
         })
+    }
+
+    /// Write session promotions into the Codex, each citing the archive as
+    /// evidence. Retries dedupe on `session_id` + `summary`, so a crash or
+    /// validation failure mid-loop leaves the next end_session able to
+    /// finish the set without duplicating what landed.
+    fn finish_promotions(
+        &self,
+        archive: EntryId,
+        session_id: &str,
+        agent: &str,
+        promotions: Vec<Promotion>,
+    ) -> Result<Vec<EntryId>> {
+        let codex = self.codex()?;
+        let mut by_summary: HashMap<String, EntryId> = codex
+            .entries()?
+            .into_iter()
+            .filter(|e| e.session_id.as_deref() == Some(session_id))
+            .map(|e| (e.summary, e.id))
+            .collect();
+        let mut promoted_ids = Vec::new();
+        for p in promotions {
+            if let Some(&existing) = by_summary.get(&p.summary) {
+                promoted_ids.push(existing);
+                continue;
+            }
+            let mut c = Entry::new(agent, p.kind, p.summary);
+            c.session_id = Some(session_id.to_string());
+            c.body = p.body;
+            c.evidence.push(Evidence::Ref { id: archive });
+            codex.create_with(&c, &|id| self.exists_anywhere(id))?;
+            by_summary.insert(c.summary.clone(), c.id);
+            promoted_ids.push(c.id);
+        }
+        Ok(promoted_ids)
     }
 
     // -- reading -------------------------------------------------------------
@@ -408,7 +440,21 @@ impl Gungnir {
         next.revises = Some(old);
         next.project_id = prev.project_id.clone();
         next.session_id = prev.session_id.clone();
-        next.evidence = prev.evidence.clone();
+        // Carry evidence forward — but only refs that still resolve. Stores
+        // written before promote was journal-only can hold refs to deleted
+        // scratch entries; refusing to revise those entries would brick the
+        // correction workflow on them.
+        let mut evidence = Vec::new();
+        for ev in prev.evidence {
+            let keep = match &ev {
+                Evidence::Ref { id } => self.exists_anywhere(*id)?,
+                Evidence::File { .. } => true,
+            };
+            if keep {
+                evidence.push(ev);
+            }
+        }
+        next.evidence = evidence;
         next.body = body.into();
         store.create_with(&next, &|id| self.exists_anywhere(id))?;
         Ok(next.id)

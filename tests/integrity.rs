@@ -528,3 +528,210 @@ fn promote_via_mcp_review_kind_links_source() {
     let review = g.codex().unwrap().require(rid).unwrap();
     assert_eq!(review.review_of, Some(report.journal_id));
 }
+
+// -- review round 1 ----------------------------------------------------------
+
+#[test]
+fn end_session_retry_finishes_pending_promotions() {
+    let (_dir, g) = gng();
+    let s = g.start_session("builder", "task").unwrap();
+    g.add_observation(&s, "note").unwrap();
+
+    let first = g
+        .end_session(
+            &s,
+            "done",
+            vec![gungnir::Promotion {
+                kind: EntryKind::Decision,
+                summary: "use the index".into(),
+                body: "it fixed the scan".into(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(first.promoted.len(), 1);
+
+    // A crash between archive write and scratch removal leaves scratch
+    // behind; the caller retries with the full promotion list plus one
+    // that never landed.
+    let rebuilt = Session {
+        id: s.id.clone(),
+        agent: "builder".into(),
+        task: "task".into(),
+        started_at: s.started_at,
+    };
+    g.add_observation(&rebuilt, "leftover note").unwrap();
+
+    let retry = g
+        .end_session(
+            &s,
+            "done",
+            vec![
+                gungnir::Promotion {
+                    kind: EntryKind::Decision,
+                    summary: "use the index".into(),
+                    body: "it fixed the scan".into(),
+                },
+                gungnir::Promotion {
+                    kind: EntryKind::Observation,
+                    summary: "pg_stat confirmed it".into(),
+                    body: String::new(),
+                },
+            ],
+        )
+        .unwrap();
+    assert!(retry.already_ended);
+    assert_eq!(retry.journal_id, first.journal_id);
+
+    // The landed promotion is deduped by reference, not duplicated; the
+    // pending one is written now.
+    assert_eq!(retry.promoted.len(), 2);
+    assert_eq!(retry.promoted[0], first.promoted[0]);
+    let codex = g.codex().unwrap();
+    let session_entries: Vec<_> = codex
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.session_id.as_deref() == Some(s.id.as_str()))
+        .collect();
+    assert_eq!(session_entries.len(), 2);
+    assert!(!g
+        .root()
+        .join("scratch")
+        .join(gungnir::layout::sanitize_component(&s.id))
+        .exists());
+}
+
+#[test]
+fn briefing_verdict_counts_contradicted_matches() {
+    let (_dir, g) = gng();
+    let codex = g.codex().unwrap();
+    let counter = Entry::new("a", EntryKind::Observation, "dashboard shows flapping");
+    codex.create(&counter).unwrap();
+    let claim = Entry::new("a", EntryKind::Observation, "load balancer healthy");
+    codex.create(&claim).unwrap();
+    g.contradict(claim.id, counter.id, "ops", None).unwrap();
+
+    let b = g.brief("a", "load balancer", 8).unwrap();
+    assert!(
+        b.markdown
+            .contains("Entries matched this task but none are verified"),
+        "{}",
+        b.markdown
+    );
+    assert!(
+        !b.markdown.contains("No knowledge matched this task"),
+        "{}",
+        b.markdown
+    );
+}
+
+#[test]
+fn cli_recall_names_contradicted_only_matches() {
+    let (dir, g) = gng();
+    let codex = g.codex().unwrap();
+    let counter = Entry::new("a", EntryKind::Observation, "counter evidence");
+    codex.create(&counter).unwrap();
+    let claim = Entry::new("a", EntryKind::Observation, "claim about zorblax");
+    codex.create(&claim).unwrap();
+    g.contradict(claim.id, counter.id, "ops", None).unwrap();
+
+    // `zorblax` matches only the contradicted entry (the counter's summary
+    // shares no tokens), so it is dropped from hits under --current.
+    let out = cli(dir.path(), &["recall", "zorblax", "--current"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("only contradicted knowledge matched"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("no knowledge matched this topic"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn supersede_drops_dangling_evidence_refs() {
+    let (_dir, g) = gng();
+    let codex = g.codex().unwrap();
+    let solid = Entry::new("a", EntryKind::Observation, "solid source");
+    codex.create(&solid).unwrap();
+
+    // Simulate a store written before promote was journal-only: a codex
+    // entry citing a scratch entry that end_session has since deleted.
+    let mut stale = Entry::new("a", EntryKind::Decision, "old claim needs correcting");
+    stale.evidence.push(Evidence::Ref { id: solid.id });
+    stale.evidence.push(Evidence::Ref {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
+    });
+    codex.create_with(&stale, &|_id| Ok(true)).unwrap();
+
+    let new_id = g
+        .supersede(stale.id, "a", "old claim corrected", "fixed")
+        .unwrap();
+    let next = codex.require(new_id).unwrap();
+    // The resolvable ref carries forward; the dangling one does not block
+    // the correction.
+    assert_eq!(next.evidence, vec![Evidence::Ref { id: solid.id }]);
+}
+
+#[test]
+fn mcp_tools_report_skipped_entries() {
+    let (dir, g) = gng();
+    let codex = g.codex().unwrap();
+    let good = Entry::new("a", EntryKind::Decision, "sessions use postgres");
+    codex.create(&good).unwrap();
+    write_conflicted_entry(&codex);
+
+    let mut server = gungnir::mcp::Server::new(Gungnir::open(dir.path()).unwrap());
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list","arguments":{"layer":"codex"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"query":"postgres","layer":"codex"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"brief","arguments":{"agent":"a","task":"postgres"}}}"#,
+        "\n",
+    );
+    let mut out: Vec<u8> = Vec::new();
+    server
+        .serve(std::io::BufReader::new(input.as_bytes()), &mut out)
+        .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let msgs: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(msgs.len(), 3);
+    for msg in &msgs {
+        let body = msg["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(body.contains("(skipped unreadable entry"), "{msg}");
+    }
+}
+
+#[test]
+fn scan_reports_a_wrongly_sharded_file() {
+    let (_dir, g) = gng();
+    let codex = g.codex().unwrap();
+    let e = Entry::new("a", EntryKind::Decision, "placed by hand");
+    codex.create(&e).unwrap();
+
+    // A hand move or git merge can leave a ULID-named file outside its
+    // canonical YYYY/MM/DD shard. Reads and mutations agree: the file is
+    // reported, never adopted.
+    let canonical = codex.path_for(e.id);
+    let wrong_dir = codex.root().join("1999/01/01");
+    std::fs::create_dir_all(&wrong_dir).unwrap();
+    let wrong_path = wrong_dir.join(canonical.file_name().unwrap());
+    std::fs::rename(&canonical, &wrong_path).unwrap();
+
+    let scan = codex.scan().unwrap();
+    assert!(scan.entries.is_empty());
+    assert_eq!(scan.skipped.len(), 1);
+    assert!(
+        scan.skipped[0].error.contains("wrong shard"),
+        "{}",
+        scan.skipped[0].error
+    );
+    assert!(codex.get(e.id).unwrap().is_none());
+}

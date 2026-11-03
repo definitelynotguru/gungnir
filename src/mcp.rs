@@ -187,7 +187,15 @@ impl Server {
                 let s = self.g.start_session(agent, task)?;
                 let briefing = self.g.brief(agent, task, 8)?;
                 self.sessions.insert(s.id.clone(), s.clone());
-                Ok(format!("session_id: {}\n\n{}", s.id, briefing.markdown))
+                let mut text = format!("session_id: {}\n\n{}", s.id, briefing.markdown);
+                for s in &briefing.skipped {
+                    text.push_str(&format!(
+                        "\n(skipped unreadable entry {}: {})",
+                        s.path.display(),
+                        s.error
+                    ));
+                }
+                Ok(text)
             }
             "add_observation" => {
                 let s = self.session(args)?;
@@ -253,7 +261,16 @@ impl Server {
                 let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let task = arg("task").ok_or_else(|| Error::Invalid("task required".into()))?;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
-                Ok(self.g.brief(agent, task, limit)?.markdown)
+                let b = self.g.brief(agent, task, limit)?;
+                let mut text = b.markdown;
+                for s in &b.skipped {
+                    text.push_str(&format!(
+                        "\n(skipped unreadable entry {}: {})",
+                        s.path.display(),
+                        s.error
+                    ));
+                }
+                Ok(text)
             }
             "verify" => {
                 let id: EntryId = arg("id")
