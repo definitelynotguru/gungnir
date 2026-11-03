@@ -669,6 +669,9 @@ pub fn format_blame(r: &EntryReport) -> String {
             one_line(&l.entry.summary),
             fmt_state(&l.entry)
         )),
+        None if matches!(e.verification, VerificationState::RolledBack) => {
+            out.push_str("replaced by: nothing — retracted\n")
+        }
         None => out.push_str("replaced by: nothing — still current\n"),
     }
 

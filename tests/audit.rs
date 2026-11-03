@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use chrono::{TimeZone, Utc};
+use chrono::{Duration, Utc};
 use gungnir::{Entry, EntryKind, Gungnir, VerificationState};
 
 fn root() -> (tempfile::TempDir, PathBuf) {
@@ -160,9 +160,11 @@ fn diff_reports_added_verified_superseded_contradicted_rolled_back() {
     let (_d, store) = root();
     let g = Gungnir::open(&store).unwrap();
     let codex = g.codex().unwrap();
-    let t1 = "2026-01-01T00:00:00Z";
-    let t2 = "2027-06-01T00:00:00Z";
-    let old = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    // Window instants derive from the clock the transitions stamp, so the
+    // assertions cannot drift out of range with the calendar.
+    let t1 = (Utc::now() - Duration::hours(1)).to_rfc3339();
+    let t2 = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    let old = Utc::now() - Duration::days(30);
 
     // Present before t1, verified between t1 and t2.
     let mut v = Entry::new("a", EntryKind::Decision, "postgres pooling verified later");
@@ -199,7 +201,7 @@ fn diff_reports_added_verified_superseded_contradicted_rolled_back() {
         codex.update(&r2).unwrap();
     }
 
-    let out = ok(&store, &["diff", t1, t2]);
+    let out = ok(&store, &["diff", &t1, &t2]);
     assert!(out.contains("added ("), "{out}");
     assert!(out.contains("verified (1)"), "{out}");
     assert!(out.contains(&format!("{}", v.id)), "{out}");
@@ -213,12 +215,12 @@ fn diff_reports_added_verified_superseded_contradicted_rolled_back() {
 
     // A topic filter restricts both snapshots: "sessions" matches the
     // superseded pair but not the verified pooling fact.
-    let out = ok(&store, &["diff", t1, t2, "--topic", "sessions"]);
+    let out = ok(&store, &["diff", &t1, &t2, "--topic", "sessions"]);
     assert!(out.contains(&format!("{}", s.id)), "{out}");
     assert!(!out.contains(&format!("{}", v.id)), "{out}");
 
     // t2 < t1 is rejected.
-    let out = run(&store, &["diff", t2, t1]);
+    let out = run(&store, &["diff", &t2, &t1]);
     assert_eq!(out.status.code(), Some(1));
 }
 
@@ -750,7 +752,7 @@ fn blame_reports_current_state_after_rollback() {
     assert!(!out.contains(&format!("replaced by: {rb}")), "{out}");
 
     let out = ok(&store, &["blame", &b]);
-    assert!(out.contains("still current"), "{out}");
+    assert!(out.contains("retracted"), "{out}");
 
     // And the log shows the restore as part of the lineage, not hidden.
     let out = ok(&store, &["log", &a]);
