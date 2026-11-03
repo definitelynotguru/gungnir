@@ -63,19 +63,7 @@ pub fn plan(store: &Store, target: EntryId) -> Result<RollbackPlan> {
 /// Execute a plan: mark intermediates rolled back, write the rollback entry.
 /// Returns the rollback entry id. Crash between steps leaves a consistent
 /// store (rolled-back markers and the rollback entry are independent).
-/// `exists` resolves evidence refs, which may cite entries in other layers.
-pub fn apply(
-    store: &Store,
-    plan: &RollbackPlan,
-    agent: &str,
-    exists: crate::validate::Exists<'_>,
-) -> Result<EntryId> {
-    for id in &plan.intermediates {
-        let mut entry = store.require(*id)?;
-        entry.mark_rolled_back(agent);
-        store.update_with(&entry, exists)?;
-    }
-
+pub fn apply(store: &Store, plan: &RollbackPlan, agent: &str) -> Result<EntryId> {
     let ancestor = store.require(plan.ancestor)?;
     let n = plan.intermediates.len();
     let mut summary = format!(
@@ -89,7 +77,13 @@ pub fn apply(
 
     let mut rb = Entry::new(agent, EntryKind::Rollback, summary);
     rb.revises = Some(plan.ancestor);
-    rb.project_id = ancestor.project_id.clone();
+    // An ancestor stored before the single-line rule can carry a control
+    // character in its project; the record normalizes the inherited value
+    // so the create cannot fail and leave the plan half applied.
+    rb.project_id = ancestor
+        .project_id
+        .clone()
+        .map(|p| crate::validate::one_line(&p));
     rb.body = format!(
         "# Rollback of {}\n\nRolled back:\n{}",
         plan.target,
@@ -98,18 +92,21 @@ pub fn apply(
             .map(|id| format!("- {id}\n"))
             .collect::<String>()
     );
-    store.create_with(&rb, exists)?;
+    // Validate before mutating any revision: a record that cannot be
+    // written must fail the call while nothing has changed.
+    crate::validate::validate_entry(&rb, &|id| store.exists(id), true)?;
+    for id in &plan.intermediates {
+        let mut entry = store.require(*id)?;
+        entry.mark_rolled_back(agent);
+        store.update(&entry)?;
+    }
+    store.create(&rb)?;
     Ok(rb.id)
 }
 
 /// Plan + apply in one call.
-pub fn rollback(
-    store: &Store,
-    target: EntryId,
-    agent: &str,
-    exists: crate::validate::Exists<'_>,
-) -> Result<EntryId> {
-    apply(store, &plan(store, target)?, agent, exists)
+pub fn rollback(store: &Store, target: EntryId, agent: &str) -> Result<EntryId> {
+    apply(store, &plan(store, target)?, agent)
 }
 
 #[cfg(test)]
@@ -143,7 +140,7 @@ mod tests {
             store.update(&v1).unwrap();
         }
 
-        let rb_id = rollback(&store, ids[2], "agent", &|id| store.exists(id)).unwrap();
+        let rb_id = rollback(&store, ids[2], "agent").unwrap();
         assert_eq!(
             store.require(ids[1]).unwrap().verification,
             VerificationState::RolledBack
@@ -167,7 +164,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let ids = chain(&store, "a", &["v1", "v2"]);
         assert!(matches!(
-            rollback(&store, ids[1], "agent", &|id| store.exists(id)),
+            rollback(&store, ids[1], "agent"),
             Err(Error::Invalid(_))
         ));
         // Store untouched.
@@ -186,7 +183,7 @@ mod tests {
         e.verify("human", None);
         store.update(&e).unwrap();
         assert!(matches!(
-            rollback(&store, ids[0], "agent", &|id| store.exists(id)),
+            rollback(&store, ids[0], "agent"),
             Err(Error::Invalid(_))
         ));
     }

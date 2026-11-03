@@ -440,7 +440,7 @@ fn require_verified_as_of_reports_the_state_it_filtered_on() {
     e.verification_log.push(VerificationRecord {
         verifier: "ops".into(),
         timestamp: h(2),
-        status: "contradicted".into(),
+        status: gungnir::RecordStatus::Contradicted,
         note: None,
     });
     e.verification = gungnir::VerificationState::Contradicted { by: counter.id };

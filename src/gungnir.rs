@@ -647,7 +647,6 @@ impl Gungnir {
             ));
         }
 
-<<<<<<< HEAD
         // The persisted task wins over whatever a rebuilt handle claims;
         // fall back to the handle for pre-meta sessions.
         let task = self
@@ -1206,10 +1205,22 @@ impl Gungnir {
             }
         }
         next.evidence = evidence;
-        // Body-derived mentions are materialized into frontmatter: the new
-        // body need not repeat the old link, and a revision stays about the
-        // same topics unless the body says otherwise.
-        next.entities = prev.entity_mentions();
+        // Declarations carry over as stored — copying the normalized index
+        // form (entity_mentions) would rewrite casing and can grow a name
+        // past the cap (İ lowers to two chars). Body-derived mentions are
+        // materialized with their original spelling: the new body need not
+        // repeat the old link, and a revision stays about the same topics.
+        next.entities = prev.entities.clone();
+        for t in prev.wikilink_targets() {
+            let t = t.trim();
+            if t.parse::<EntryId>().is_ok() || !crate::validate::valid_entity_name(t) {
+                continue;
+            }
+            let key = t.to_lowercase();
+            if !next.entities.iter().any(|e| e.to_lowercase() == key) {
+                next.entities.push(t.to_string());
+            }
+        }
         next.body = body.into();
         store.create_with(&next, &|id| self.exists_anywhere(id))?;
         let (conflicts, warnings) =
@@ -1223,7 +1234,7 @@ impl Gungnir {
 
     pub fn rollback(&self, target: EntryId, agent: &str) -> Result<EntryId> {
         let store = self.locate(target)?.ok_or(Error::NotFound(target))?;
-        rollback::rollback(&store, target, agent, &|id| self.exists_anywhere(id))
+        rollback::rollback(&store, target, agent)
     }
 
     /// Every entry in the store across all partitions — the read the audit
@@ -1707,7 +1718,7 @@ mod tests {
         let codex_entry = Entry::new("builder", EntryKind::Decision, "canonical decision");
         g.codex().unwrap().create(&codex_entry).unwrap();
 
-        let s = g.start_session("builder", "trace checkout");
+        let s = g.start_session("builder", "trace checkout").unwrap();
         let a = g.add_observation(&s, "first observation").unwrap();
         g.add_observation(&s, format!("builds on [[{a}]]")).unwrap();
         g.add_observation(&s, format!("grounds in [[{}]]", codex_entry.id))
@@ -1731,7 +1742,7 @@ mod tests {
         // `[[ {id} ]]` is a real link to the wikilink parser (targets are
         // trimmed), so demotion must match the padded form too.
         let (_d, g) = gng();
-        let s = g.start_session("builder", "trace checkout");
+        let s = g.start_session("builder", "trace checkout").unwrap();
         let a = g.add_observation(&s, "first observation").unwrap();
         g.add_observation(&s, format!("builds on [[ {a} ]]"))
             .unwrap();
@@ -1748,7 +1759,7 @@ mod tests {
         // Free text holds `[[` spans that are prose, not entity claims —
         // archiving must not reject the write.
         let (_d, g) = gng();
-        let s = g.start_session("builder", "explain the matrix [[1,2],[3,4]] syntax");
+        let s = g.start_session("builder", "explain the matrix [[1,2],[3,4]] syntax").unwrap();
         g.add_observation(&s, "note [[foo,bar] inline").unwrap();
         g.end_session(&s, "done", vec![]).unwrap();
 

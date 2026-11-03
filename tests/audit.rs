@@ -628,7 +628,7 @@ fn deleted_scratch_link_does_not_brick_updates() {
     let g = Gungnir::open(&store).unwrap();
 
     // A scratch entry exists only for the session's life.
-    let s = g.start_session("builder", "temp task");
+    let s = g.start_session("builder", "temp task").unwrap();
     let scratch_id = g.add_observation(&s, "temporary observation").unwrap();
 
     // promote writes into codex with the union resolver; a body wikilink
@@ -1073,4 +1073,108 @@ fn log_agent_filter_matches_stored_actor() {
     assert!(!out.contains(&id), "{out}");
     let out = ok(&store, &["log", "--agent", "team\nevil"]);
     assert!(out.contains(&id), "{out}");
+}
+
+#[test]
+fn supersede_inherits_declared_entities_as_stored() {
+    // Declarations carry over raw, not through the index's normalized
+    // form: `İ`*64 is a legal declaration but lowercases to 128 chars,
+    // which the create path would reject if it were materialized as a
+    // fresh claim.
+    let (_d, store) = root();
+    let idot = "\u{130}".repeat(64);
+    let a = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "s",
+            "--entities",
+            &idot,
+        ],
+    );
+    let b = ok(
+        &store,
+        &["supersede", &a, "--agent", "a", "--summary", "s2"],
+    )
+    .trim()
+    .to_string();
+    let out = ok(&store, &["get", &b]);
+    assert!(out.contains("i̇"), "{out}");
+}
+
+#[test]
+fn rollback_with_legacy_project_ancestor_completes() {
+    // An ancestor stored before the single-line rule can carry a
+    // control-character project. The rollback record must still be
+    // creatable — else the plan marks revisions and then fails.
+    let (_d, store) = root();
+    let a = add(
+        &store,
+        &[
+            "--agent",
+            "builder",
+            "--kind",
+            "decision",
+            "--summary",
+            "mysql pool",
+            "--project",
+            "alpha",
+        ],
+    );
+    ok(&store, &["verify", &a, "--verifier", "team"]);
+    let b = ok(
+        &store,
+        &[
+            "supersede",
+            &a,
+            "--agent",
+            "builder",
+            "--summary",
+            "postgres pool",
+        ],
+    )
+    .trim()
+    .to_string();
+
+    // Tamper the ancestor's stored project, as a legacy entry would.
+    let g = Gungnir::open(&store).unwrap();
+    let codex = g.codex().unwrap();
+    let pid: gungnir::EntryId = a.parse().unwrap();
+    let path = codex.path_for(pid);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("project_id: alpha"), "{text}");
+    std::fs::write(
+        &path,
+        text.replacen("project_id: alpha", "project_id: \"alpha\\nbeta\"", 1),
+    )
+    .unwrap();
+    assert!(codex
+        .require(pid)
+        .unwrap()
+        .project_id
+        .unwrap()
+        .contains('\n'));
+
+    let out = run(&store, &["rollback", &b, "--agent", "builder"]);
+    assert!(
+        out.status.success(),
+        "rollback failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rb = String::from_utf8_lossy(&out.stdout)
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+    let out = ok(&store, &["blame", &b]);
+    assert!(out.contains("rolled-back"), "{out}");
+    // The record inherits the ancestor's project, normalized to one line.
+    let g = Gungnir::open(&store).unwrap();
+    let rb_entry = g.codex().unwrap().require(rb.parse().unwrap()).unwrap();
+    assert_eq!(rb_entry.project_id.as_deref(), Some("alpha beta"));
 }

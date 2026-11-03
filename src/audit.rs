@@ -13,6 +13,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use crate::entry::{Entry, EntryKind, Evidence, VerificationState};
 use crate::id::EntryId;
 use crate::recall::{self, CorpusStats, StateAt};
+use crate::validate::one_line;
 use crate::{Error, Result};
 
 /// One entry plus the partition it was found in: `codex`,
@@ -35,12 +36,6 @@ fn fmt_time(t: DateTime<Utc>) -> String {
 /// Collapse a stored text field to one display line: control characters
 /// (newlines included) become spaces so a crafted value can't forge extra
 /// rows in audit output.
-fn one_line(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
-}
-
 fn fmt_state(e: &Entry) -> String {
     match &e.verification {
         VerificationState::Unverified => "unverified".into(),
