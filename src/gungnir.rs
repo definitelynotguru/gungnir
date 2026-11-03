@@ -966,10 +966,10 @@ impl Gungnir {
 
     // -- mutations ------------------------------------------------------------
 
-    /// Reference resolution across every layer. Evidence may point anywhere
-    /// (Codex fact citing its Journal archive, etc.), so all mutation paths
-    /// validate against the union.
-    fn exists_anywhere(&self, id: EntryId) -> Result<bool> {
+    /// Reference resolution across every layer. Evidence and wikilinks may
+    /// point anywhere (Codex fact citing its Journal archive, etc.), so all
+    /// mutation paths validate against the union.
+    pub(crate) fn exists_anywhere(&self, id: EntryId) -> Result<bool> {
         Ok(self.locate(id)?.is_some())
     }
 

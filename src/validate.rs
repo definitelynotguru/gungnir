@@ -18,13 +18,18 @@ pub type Exists<'a> = &'a dyn Fn(EntryId) -> Result<bool>;
 /// Validate an entry against every write-time rule except uniqueness,
 /// which only the store can judge (it knows its own ids).
 ///
-/// Used for both creates and updates; the store distinguishes them by
-/// checking id presence before calling here.
-pub fn validate_entry(entry: &Entry, exists: Exists<'_>) -> Result<()> {
-    if entry.summary.chars().count() > MAX_SUMMARY_LEN {
+/// `enforce_refs` gates the existence checks (`revises`, `review_of`,
+/// `contradicted_by`, evidence refs, body `[[id]]` links). Creates must
+/// pass them; updates skip them because references rot underneath a
+/// persisted entry — a journal layer or a scratch session cited at write
+/// time can be deleted later, and an entry must not become unwritable
+/// (unverifiable, unfixable) for a link it made when the target existed.
+/// Shape rules (review_of presence, caps, entity syntax) always apply.
+pub fn validate_entry(entry: &Entry, exists: Exists<'_>, enforce_refs: bool) -> Result<()> {
+    if entry.summary.len() > MAX_SUMMARY_LEN {
         return Err(crate::Error::Invalid(format!(
             "summary is {} chars; cap is {MAX_SUMMARY_LEN}",
-            entry.summary.chars().count()
+            entry.summary.len()
         )));
     }
 
@@ -32,6 +37,29 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>) -> Result<()> {
         return Err(crate::Error::Invalid(
             "review entries require review_of".into(),
         ));
+    }
+
+    for name in entity_names(entry) {
+        if !valid_entity_name(&name) {
+            return Err(crate::Error::Invalid(format!(
+                "entity names are 1..{MAX_ENTITY_LEN} printable chars; got '{name}'"
+            )));
+        }
+    }
+
+    for ev in &entry.evidence {
+        if let Evidence::File { excerpt, .. } = ev {
+            if excerpt.len() > MAX_EXCERPT_LEN {
+                return Err(crate::Error::Invalid(format!(
+                    "evidence excerpt is {} chars; cap is {MAX_EXCERPT_LEN}",
+                    excerpt.len()
+                )));
+            }
+        }
+    }
+
+    if !enforce_refs {
+        return Ok(());
     }
 
     if let VerificationState::Contradicted { by } = entry.verification {
@@ -59,36 +87,18 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>) -> Result<()> {
     }
 
     for ev in &entry.evidence {
-        match ev {
-            Evidence::File { excerpt, .. } => {
-                if excerpt.chars().count() > MAX_EXCERPT_LEN {
-                    return Err(crate::Error::Invalid(format!(
-                        "evidence excerpt is {} chars; cap is {MAX_EXCERPT_LEN}",
-                        excerpt.chars().count()
-                    )));
-                }
+        if let Evidence::Ref { id } = ev {
+            if !exists(*id)? {
+                return Err(crate::Error::Invalid(format!(
+                    "evidence ref points at missing entry {id}"
+                )));
             }
-            Evidence::Ref { id } => {
-                if !exists(*id)? {
-                    return Err(crate::Error::Invalid(format!(
-                        "evidence ref points at missing entry {id}"
-                    )));
-                }
-            }
-        }
-    }
-
-    for name in &entry.entities {
-        let name = name.trim();
-        if name.is_empty() || name.len() > MAX_ENTITY_LEN {
-            return Err(crate::Error::Invalid(format!(
-                "entity names are 1..{MAX_ENTITY_LEN} chars; got '{name}'"
-            )));
         }
     }
 
     // `[[<entry-id>]]` wikilinks must resolve like evidence refs.
-    // `[[name]]` targets that are not ids are entity mentions — free form.
+    // `[[name]]` targets that are not ids are entity mentions — checked
+    // by the shape rule above, not here.
     for id in entry.wikilink_ids() {
         if !exists(id)? {
             return Err(crate::Error::Invalid(format!(
@@ -98,4 +108,32 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Every entity name an entry claims: frontmatter plus non-id `[[name]]`
+/// body mentions, so both paths meet the same rule.
+fn entity_names(entry: &Entry) -> Vec<String> {
+    entry
+        .entities
+        .iter()
+        .cloned()
+        .chain(
+            entry
+                .wikilink_targets()
+                .into_iter()
+                .filter(|t| t.parse::<crate::EntryId>().is_err()),
+        )
+        .collect()
+}
+
+/// Names are single-line printable text, 1..MAX_ENTITY_LEN *characters*.
+/// No control characters or link delimiters — a name that can escape into
+/// the entity index or the audit output can't carry its own markup.
+fn valid_entity_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.chars().count() <= MAX_ENTITY_LEN
+        && name
+            .chars()
+            .all(|c| !c.is_control() && c != '[' && c != ']')
 }

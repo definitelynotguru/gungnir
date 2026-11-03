@@ -467,3 +467,179 @@ fn contradict_verb_is_wired() {
         VerificationState::Contradicted { .. }
     ));
 }
+
+#[test]
+fn blame_lists_body_wikilink_citations_without_evidence() {
+    let (_d, store) = root();
+    let (e1, _, _) = seed(&store);
+
+    // An entry whose ONLY link to e1 is a body [[id]] — no evidence items.
+    let citer = add(
+        &store,
+        &[
+            "--agent",
+            "builder",
+            "--kind",
+            "observation",
+            "--summary",
+            "follow-up that cites the decision",
+            "--body",
+            &format!("builds on [[{e1}]]"),
+        ],
+    );
+
+    let out = ok(&store, &["blame", &e1]);
+    assert!(out.contains(&citer), "{out}");
+    assert!(out.contains("cited by"), "{out}");
+}
+
+#[test]
+fn add_accepts_body_wikilink_across_layers() {
+    let (_d, store) = root();
+    let codex_id = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "codex fact to cite",
+        ],
+    );
+
+    // Journal entry citing a codex id: the union resolver must see it.
+    let out = run(
+        &store,
+        &[
+            "add",
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "journal note citing codex",
+            "--body",
+            &format!("per [[{codex_id}]]"),
+            "--into",
+            "journal",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn entity_names_enforce_the_cap_on_both_paths() {
+    let (_d, store) = root();
+
+    // 40 non-ASCII chars = 80 UTF-8 bytes: the cap is on characters.
+    let cjk = "\u{4e2d}".repeat(40);
+    let out = run(
+        &store,
+        &[
+            "add",
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "non-ascii entity",
+            "--entities",
+            &cjk,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 65 characters is over the cap from either path.
+    let long = "x".repeat(65);
+    for args in [
+        vec![
+            "add",
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "s1",
+            "--entities",
+            &long,
+        ],
+        vec![
+            "add",
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "s2",
+            "--body",
+            &format!("see [[{long}]]"),
+        ],
+    ] {
+        let out = run(&store, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("entity names"));
+    }
+
+    // An unterminated [[ is literal text, not a name that swallows lines.
+    let unterminated = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "literal bracket note",
+            "--body",
+            "a [[ half link\nmore text and [[real_entity]] here",
+        ],
+    );
+    let g = Gungnir::open(&store).unwrap();
+    let e = g
+        .codex()
+        .unwrap()
+        .require(unterminated.parse().unwrap())
+        .unwrap();
+    assert_eq!(e.entity_mentions(), vec!["real_entity".to_string()]);
+}
+
+#[test]
+fn deleted_scratch_link_does_not_brick_updates() {
+    let (_d, store) = root();
+    let g = Gungnir::open(&store).unwrap();
+
+    // A scratch entry exists only for the session's life.
+    let s = g.start_session("builder", "temp task");
+    let scratch_id = g.add_observation(&s, "temporary observation").unwrap();
+
+    // promote writes into codex with the union resolver; a body wikilink
+    // to the scratch id is valid while the session lives.
+    let cid = g
+        .promote(
+            scratch_id,
+            "builder",
+            EntryKind::Decision,
+            "fact citing scratch work",
+            format!("derived from [[{scratch_id}]]"),
+        )
+        .unwrap();
+
+    // Session ends, scratch is deleted — the link now dangles.
+    let _ = g.end_session(&s, "done", vec![]).unwrap();
+    assert!(g.locate(scratch_id).unwrap().is_none());
+
+    // Verify must still land: an entry can't be bricked by a link that
+    // was valid when written.
+    g.verify(cid, "human", None).unwrap();
+    let stored = g.codex().unwrap().require(cid).unwrap();
+    assert_eq!(stored.verification, VerificationState::Verified);
+}
