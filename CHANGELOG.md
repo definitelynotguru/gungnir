@@ -51,6 +51,12 @@ All notable changes to Gungnir are documented here. The format follows
   target ranks first in its verification-state bucket and that hybrid
   coverage never falsely abstains when knowledge exists under different
   words.
+- **Cross-agent coverage counts.** `stats --topic <topic>` and the briefing
+  coverage section report aggregate counts over other agents' journals
+  (agents who attempted the topic, agents with a recorded failure, matched
+  entries) so a second agent stops repeating a documented failure. Counts
+  only; peer summaries, bodies, and ids never leave their journal. Topic
+  existence per agent is the documented leak.
 
 ### Changed (breaking)
 

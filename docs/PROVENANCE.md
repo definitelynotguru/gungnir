@@ -82,6 +82,20 @@ What lands in the Codex is a deliberate act (`promote`), linked back to its
 Journal source by an evidence ref. The shared truth carries its lineage with
 it.
 
+## Peer coverage
+
+Briefings and `stats --topic` expose aggregate counts over other agents'
+journals: how many journals hold a topic-matched entry, how many recorded
+a failed attempt, and how many entries matched. Only counts cross the
+partition boundary. Summaries, bodies, and ids of peer entries never reach
+the caller.
+
+The boundary that remains: a positive count reveals *that* at least one
+other agent wrote about the topic. Topic existence per agent is not
+hidden; everything below the count level is. If even existence is
+sensitive for a topic, the answer is not to query for it, or to drop that
+agent's journal from the shared root entirely.
+
 ## What provenance does not claim
 
 - File evidence hashes content at citation time; it does not detect later

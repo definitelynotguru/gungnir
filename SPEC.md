@@ -118,6 +118,12 @@ real task text even when the ending process only knows the session id.
 `end_session` is idempotent: re-ending an already-archived session reports
 `already_ended` instead of writing a second journal entry.
 
+Briefings and `stats --topic` additionally report cross-journal coverage:
+aggregate counts over journal partitions other than the caller's (agents
+who attempted the topic, agents with a recorded failure, matched entries).
+Only counts cross the privacy boundary: peer summaries, bodies, and ids
+never surface; topic existence per agent is not hidden.
+
 Hybrid mode (`--semantic` on CLI, `semantic: true` on MCP) fuses keyword
 ranks with embedding cosine ranks via reciprocal rank fusion (k = 60) over
 the same temporal pool, coverage, and ordering rule. A candidate is
@@ -154,7 +160,7 @@ disk; recall hides them by default.
 - **Library** (`gungnir` crate): everything above.
 - **CLI** (`gungnir` bin): `init`, `add`, `get`, `ls`, `recall`, `verify`,
   `contradict`, `supersede`, `rollback`, `promote`, `brief`, `session`,
-  `stats`, `mcp`.
+  `stats` (`--topic` reports cross-journal coverage counts), `mcp`.
 - **MCP server**: tools `start_session`, `end_session`, `add_observation`,
   `add_attempt`, `recall`, `brief`, `verify`, `contradict`, `promote`,
   `supersede`, `rollback`, `list`, `get`.

@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 
 use crate::entry::{EntryKind, VerificationState};
+use crate::gungnir::PeerCoverage;
 use crate::id::EntryId;
 use crate::recall::{Coverage, Hit};
 use crate::store::Skipped;
@@ -30,6 +31,9 @@ pub struct BriefingInput {
     pub journal_coverage: Coverage,
     pub codex_skipped: Vec<Skipped>,
     pub journal_skipped: Vec<Skipped>,
+    /// Cross-journal topic counts, excluding the requesting agent. Counts
+    /// only: peer summaries and bodies never reach the briefing.
+    pub peers: PeerCoverage,
 }
 
 fn label(hit: &Hit, superseded: &HashSet<EntryId>, task_tokens: &[String]) -> String {
@@ -131,6 +135,18 @@ pub fn compile(input: BriefingInput) -> Briefing {
     md.push('\n');
     md.push_str(&coverage_line("Journal", &input.journal_coverage));
     md.push('\n');
+    if input.peers.agents_attempted > 0 {
+        let p = &input.peers;
+        let agents = if p.agents_attempted == 1 {
+            "agent".to_string()
+        } else {
+            "agents".to_string()
+        };
+        md.push_str(&format!(
+            "- Peers: {} other {agents} attempted this topic; {} failed\n",
+            p.agents_attempted, p.agents_failed
+        ));
+    }
     if input.codex_coverage.verified == 0 && input.journal_coverage.verified == 0 {
         // Contradicted and hidden (superseded, rolled back) matches count:
         // the briefing lists them above, so "nothing matched" must not
@@ -190,6 +206,7 @@ mod tests {
             journal_coverage: Coverage::default(),
             codex_skipped: vec![],
             journal_skipped: vec![],
+            peers: PeerCoverage::default(),
         }
     }
 
