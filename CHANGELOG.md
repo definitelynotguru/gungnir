@@ -51,6 +51,11 @@ All notable changes to Gungnir are documented here. The format follows
   target ranks first in its verification-state bucket and that hybrid
   coverage never falsely abstains when knowledge exists under different
   words.
+- **gungnir-bench as a public artifact.** `bench/` holds the accuracy
+  harness as data any store can run: `corpus.yaml` (the world under test),
+  `checks.yaml` (19 exact-match assertions across five abilities), and a
+  spec documenting the adapter contract. `tests/bench.rs` is the reference
+  runner; a dedicated CI job keeps the artifact honest.
 - **Evidence revalidation.** `verify --evidence <path>` records a file's
   SHA-256 and excerpt at verify time; `verify --revalidate <id>` (or
   `--all`) re-hashes evidence files and flags drifted or missing ones.
