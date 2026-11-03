@@ -468,16 +468,19 @@ fn dispatch(cli: Cli) -> Result<()> {
                 };
                 let mut intact = 0usize;
                 for c in &report.checks {
-                    match &c.actual_sha256 {
-                        Some(_) if c.intact() => intact += 1,
-                        Some(actual) => println!(
+                    match (&c.actual_sha256, &c.read_error) {
+                        (Some(_), _) if c.intact() => intact += 1,
+                        (_, Some(e)) => {
+                            println!("UNREADABLE {} {} ({e})", c.entry, c.path)
+                        }
+                        (Some(actual), _) => println!(
                             "DRIFT   {} {} expected {} got {}",
                             c.entry,
                             c.path,
                             short(&c.expected_sha256),
                             short(actual)
                         ),
-                        None => println!("MISSING {} {}", c.entry, c.path),
+                        (None, None) => println!("MISSING {} {}", c.entry, c.path),
                     }
                 }
                 for path in &report.unreadable {

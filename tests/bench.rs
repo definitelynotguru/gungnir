@@ -26,6 +26,7 @@ use gungnir::{Entry, EntryKind, Evidence, Gungnir, Layer, Promotion, Query, Stor
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CorpusFile {
     epoch_base: i64,
     sessions: Vec<CorpusSession>,
@@ -33,6 +34,7 @@ struct CorpusFile {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CorpusSession {
     agent: String,
     task: String,
@@ -43,6 +45,7 @@ struct CorpusSession {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CorpusLine {
     kind: String,
     text: String,
@@ -51,6 +54,7 @@ struct CorpusLine {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CorpusPromotion {
     label: String,
     kind: EntryKind,
@@ -60,6 +64,7 @@ struct CorpusPromotion {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CorpusFact {
     label: String,
     agent: String,
@@ -76,17 +81,22 @@ struct CorpusFact {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChecksFile {
+    #[allow(dead_code)]
+    version: u32,
     abilities: Vec<Ability>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Ability {
     name: String,
     checks: Vec<Check>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Check {
     name: String,
     run: Run,
@@ -94,6 +104,7 @@ struct Check {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Run {
     search: Option<String>,
     brief: Option<String>,
@@ -111,6 +122,7 @@ struct Run {
 /// several fields; the runner evaluates them as one unit against the same
 /// run output.
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct Expect {
     hits_exactly: Option<usize>,
     hits_at_least: Option<usize>,
@@ -380,6 +392,24 @@ fn field<T>(expect: Option<T>, f: impl FnOnce(T) -> bool) -> bool {
         Some(want) => f(want),
         None => true,
     }
+}
+
+/// The check format is strict: a misspelled assertion field fails to
+/// parse instead of silently passing without testing anything.
+#[test]
+fn checks_yaml_rejects_unknown_fields() {
+    let yaml = r#"
+abilities:
+  - name: typo test
+    checks:
+      - name: misspelled assertion
+        run: {search: "budget", layer: codex}
+        expect: {hits_exactlly: 1}
+"#;
+    assert!(
+        serde_yaml::from_str::<ChecksFile>(yaml).is_err(),
+        "unknown expect field must be rejected"
+    );
 }
 
 #[test]
@@ -740,4 +770,31 @@ fn paraphrase() -> Score {
     );
 
     s
+}
+
+/// Peer coverage through the vector channel: a session archived under
+/// synonyms, not the query's tokens, still counts for a semantic briefing.
+#[test]
+fn peer_coverage_semantic_counts_paraphrased_peer_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+
+    let scout = g.start_session("scout", "investigate db issues");
+    g.add_observation(&scout, "postgres pool exhausted during deploy")
+        .unwrap();
+    g.end_session(&scout, "pool exhaustion diagnosed", vec![])
+        .unwrap();
+
+    // Zero keyword overlap between the topic and the session text.
+    let kw = g
+        .peer_coverage(None, "database connection saturation")
+        .unwrap();
+    assert_eq!(kw.agents_attempted, 0);
+
+    let embedder = gungnir::embedding::CachedEmbedder::new(SynonymEmbedder, dir.path());
+    let sem = g
+        .peer_coverage_semantic(None, "database connection saturation", &embedder)
+        .unwrap();
+    assert_eq!(sem.agents_attempted, 1);
+    assert_eq!(sem.entries, 1);
 }
