@@ -555,3 +555,32 @@ fn briefing_warns_on_candidates_whose_entries_left_the_hits() {
     let text = format!("{briefing:?}");
     assert!(text.contains("conflict"), "briefing must warn: {text}");
 }
+
+#[test]
+fn briefing_hides_other_agents_journal_conflicts() {
+    use gungnir::gungnir::Layer;
+
+    let (_d, g) = gng();
+    write_verified(&g, "sessions use mysql");
+
+    // Agent B writes a disputing claim in *its own* journal: the candidate
+    // records codex as the layer (the scan ran against codex) but the new
+    // claim is private to B.
+    let b = g
+        .add(
+            Entry::new("b", EntryKind::Decision, "sessions use postgres"),
+            Layer::Journal { agent: "b" },
+        )
+        .unwrap();
+    assert_eq!(b.conflicts.len(), 1);
+    assert_eq!(b.conflicts[0].layer, "codex");
+
+    // B's briefing warns — it can see its own journal claim.
+    let mine = format!("{:?}", g.brief("b", "sessions", 5).unwrap());
+    assert!(mine.contains("conflict"), "b should warn: {mine}");
+
+    // A's briefing on the same topic must not count B's private
+    // candidate — that would leak B's journal activity.
+    let theirs = format!("{:?}", g.brief("a", "sessions", 5).unwrap());
+    assert!(!theirs.contains("conflict"), "a must not warn: {theirs}");
+}
