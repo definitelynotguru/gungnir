@@ -1828,7 +1828,7 @@ mod tests {
         // the link demotes to its bare id instead of bricking every retry.
         let (_d, g) = gng();
         let foreign = EntryId::generate().to_string();
-        let s = g.start_session("builder", &format!("port fix from [[ {foreign} ]]"));
+        let s = g.start_session("builder", format!("port fix from [[ {foreign} ]]"));
         g.add_observation(&s, "first observation").unwrap();
         g.end_session(&s, "done", vec![]).unwrap();
 
