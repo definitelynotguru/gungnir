@@ -26,6 +26,9 @@ pub enum Error {
 
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("{0} evidence file(s) failed revalidation")]
+    Drift(usize),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

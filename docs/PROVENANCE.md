@@ -82,6 +82,16 @@ What lands in the Codex is a deliberate act (`promote`), linked back to its
 Journal source by an evidence ref. The shared truth carries its lineage with
 it.
 
+## Revalidation
+
+File evidence records `sha256` at citation time. `verify --revalidate`
+re-hashes every file evidence path on an entry (or `--all` for the whole
+store) and reports three outcomes per link: intact, drifted (the file
+exists but hashes differently), or missing. It is read-only: drift is a
+finding to act on, not a state the store rewrites. Ref evidence is skipped:
+entry links resolve live, and the verification log already tracks their
+state.
+
 ## Peer coverage
 
 Briefings and `stats --topic` expose aggregate counts over other agents'
@@ -98,8 +108,10 @@ agent's journal from the shared root entirely.
 
 ## What provenance does not claim
 
-- File evidence hashes content at citation time; it does not detect later
-  edits to the cited file. Diff your repo if you need that guarantee.
+- Revalidation detects drift; it does not prove the *recorded* hash was
+  honest when written. A verifier citing a file records the hash it saw;
+  revalidation proves the file still matches that record, not that the
+  record was true.
 - Verification records name a verifier string; Gungnir does not authenticate
   humans. "verified" means someone took responsibility, recorded under their
   name.

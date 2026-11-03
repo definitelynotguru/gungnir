@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 
 use chrono::Utc;
+use sha2::Digest as _;
 
 use crate::briefing::{self, Briefing, BriefingInput};
 use crate::entry::{Entry, EntryKind, Evidence, VerificationState};
@@ -19,7 +20,7 @@ use crate::layout::{self, CODEX, JOURNAL, SCRATCH};
 use crate::recall::{self, Hit, Query, SearchOutcome};
 use crate::rollback;
 use crate::store::Skipped;
-use crate::validate::MAX_SUMMARY_LEN;
+use crate::validate::{self, MAX_SUMMARY_LEN};
 use crate::{Error, Result, Store};
 
 /// One open working session. Identity (`agent`, `task`, `started_at`) is
@@ -69,6 +70,24 @@ pub struct PeerCoverage {
     pub entries: usize,
     /// Of `agents_attempted`, how many recorded a failed attempt.
     pub agents_failed: usize,
+}
+
+/// One evidence-file revalidation result. `expected_sha256` is the hash
+/// recorded at citation time; `actual_sha256` is `None` when the file is
+/// gone. Read-only: revalidation reports drift, it never rewrites history.
+#[derive(Clone, Debug)]
+pub struct EvidenceCheck {
+    pub entry: EntryId,
+    pub path: String,
+    pub expected_sha256: String,
+    pub actual_sha256: Option<String>,
+}
+
+impl EvidenceCheck {
+    /// Intact means present and hashing to the recorded value.
+    pub fn intact(&self) -> bool {
+        self.actual_sha256.as_deref() == Some(self.expected_sha256.as_str())
+    }
 }
 
 /// Memory health snapshot: counts by layer and verification state,
@@ -544,6 +563,33 @@ impl Gungnir {
         Ok(pc)
     }
 
+    /// Re-hash every file-evidence link on `id` and compare against the
+    /// SHA-256 recorded at citation time. A missing file reports
+    /// `actual_sha256: None`. Entry refs are skipped: they resolve to live
+    /// entries whose history the verification log already tracks.
+    pub fn revalidate(&self, id: EntryId) -> Result<Vec<EvidenceCheck>> {
+        let store = self.locate(id)?.ok_or(Error::NotFound(id))?;
+        let entry = store.require(id)?;
+        Ok(check_evidence(&entry))
+    }
+
+    /// [`Self::revalidate`] over every entry in every layer.
+    pub fn revalidate_all(&self) -> Result<Vec<EvidenceCheck>> {
+        let mut checks = Vec::new();
+        for e in self.codex()?.entries()? {
+            checks.extend(check_evidence(&e));
+        }
+        for base_name in [JOURNAL, SCRATCH] {
+            let base = self.root.join(base_name);
+            for name in layer_child_names(&base)? {
+                for e in Store::open(base.join(&name))?.entries()? {
+                    checks.extend(check_evidence(&e));
+                }
+            }
+        }
+        Ok(checks)
+    }
+
     /// Search one layer with coverage accounting.
     pub fn search_layer(&self, layer: Layer, query: &Query) -> Result<SearchOutcome> {
         match layer {
@@ -592,6 +638,38 @@ impl Gungnir {
     pub fn verify(&self, id: EntryId, verifier: &str, note: Option<String>) -> Result<()> {
         let store = self.locate(id)?.ok_or(Error::NotFound(id))?;
         let mut entry = store.require(id)?;
+        entry.verify(verifier, note);
+        store.update_with(&entry, &|id| self.exists_anywhere(id))
+    }
+
+    /// Verify and record file evidence on the entry in one update: the
+    /// SHA-256 of each path's current content, plus an excerpt from its
+    /// start. Later `revalidate` calls can then prove the cited file still
+    /// says what it said.
+    pub fn verify_with_evidence(
+        &self,
+        id: EntryId,
+        verifier: &str,
+        note: Option<String>,
+        evidence_paths: &[PathBuf],
+    ) -> Result<()> {
+        let store = self.locate(id)?.ok_or(Error::NotFound(id))?;
+        let mut entry = store.require(id)?;
+        for path in evidence_paths {
+            let raw = std::fs::read(path)?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&raw));
+            let text = String::from_utf8_lossy(&raw);
+            let text = text.trim_start();
+            let mut end = validate::MAX_EXCERPT_LEN.min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            entry.evidence.push(Evidence::File {
+                path: path.display().to_string(),
+                excerpt: text[..end].to_string(),
+                sha256: digest,
+            });
+        }
         entry.verify(verifier, note);
         store.update_with(&entry, &|id| self.exists_anywhere(id))
     }
@@ -839,6 +917,30 @@ fn failed_attempt(h: &crate::recall::Hit) -> bool {
     let e = &h.entry;
     e.body.starts_with("outcome: failed")
         || (e.kind == EntryKind::Session && e.body.contains("[failed]"))
+}
+
+/// Revalidate one entry's file-evidence links; entry refs skip straight
+/// through. A missing file reports `None` rather than erroring; drift is
+/// data, not a failure of the revalidation itself.
+fn check_evidence(entry: &Entry) -> Vec<EvidenceCheck> {
+    entry
+        .evidence
+        .iter()
+        .filter_map(|ev| match ev {
+            Evidence::File { path, sha256, .. } => {
+                let actual = std::fs::read(path)
+                    .ok()
+                    .map(|raw| format!("{:x}", sha2::Sha256::digest(&raw)));
+                Some(EvidenceCheck {
+                    entry: entry.id,
+                    path: path.clone(),
+                    expected_sha256: sha256.clone(),
+                    actual_sha256: actual,
+                })
+            }
+            Evidence::Ref { .. } => None,
+        })
+        .collect()
 }
 
 /// Ids that some newer live entry revises, i.e. facts with a newer
@@ -1176,6 +1278,71 @@ mod tests {
             b.markdown
         );
         assert!(!b.markdown.contains("index did not help"), "{}", b.markdown);
+    }
+
+    #[test]
+    fn revalidate_flags_drifted_and_missing_evidence_files() {
+        let (d, g) = gng();
+        let adr = d.path().join("adr.md");
+        std::fs::write(&adr, "decision: use postgres").unwrap();
+
+        let codex = g.codex().unwrap();
+        let e = Entry::new("ops", EntryKind::Decision, "use postgres");
+        codex.create(&e).unwrap();
+        g.verify_with_evidence(e.id, "team", None, std::slice::from_ref(&adr))
+            .unwrap();
+
+        // Intact.
+        let checks = g.revalidate(e.id).unwrap();
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].intact());
+
+        // Drift.
+        std::fs::write(&adr, "decision: use sqlite").unwrap();
+        let checks = g.revalidate(e.id).unwrap();
+        assert!(!checks[0].intact());
+        assert_eq!(
+            checks[0].actual_sha256.as_deref().map(|s| s.len()),
+            Some(64)
+        );
+
+        // Missing.
+        std::fs::remove_file(&adr).unwrap();
+        let checks = g.revalidate(e.id).unwrap();
+        assert!(!checks[0].intact());
+        assert_eq!(checks[0].actual_sha256, None);
+    }
+
+    #[test]
+    fn revalidate_all_spans_layers_and_skips_ref_evidence() {
+        let (d, g) = gng();
+        let adr = d.path().join("spec.md");
+        std::fs::write(&adr, "the spec").unwrap();
+
+        let s = g.start_session("builder", "write spec");
+        g.add_observation(&s, "spec drafted").unwrap();
+        let report = g
+            .end_session(
+                &s,
+                "spec done",
+                vec![Promotion {
+                    kind: EntryKind::Decision,
+                    summary: "spec chosen".into(),
+                    body: "".into(),
+                }],
+            )
+            .unwrap();
+        let promoted = g.codex().unwrap().require(report.promoted[0]).unwrap();
+        // Promoted evidence is a Ref to the journal archive; revalidation
+        // must skip it and check only file evidence.
+        assert!(matches!(promoted.evidence[0], Evidence::Ref { .. }));
+        g.verify_with_evidence(report.promoted[0], "team", None, &[adr])
+            .unwrap();
+
+        let checks = g.revalidate_all().unwrap();
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].intact());
+        assert_eq!(checks[0].entry, report.promoted[0]);
     }
 
     #[cfg(unix)]

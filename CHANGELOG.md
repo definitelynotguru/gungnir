@@ -51,6 +51,10 @@ All notable changes to Gungnir are documented here. The format follows
   target ranks first in its verification-state bucket and that hybrid
   coverage never falsely abstains when knowledge exists under different
   words.
+- **Evidence revalidation.** `verify --evidence <path>` records a file's
+  SHA-256 and excerpt at verify time; `verify --revalidate <id>` (or
+  `--all`) re-hashes evidence files and flags drifted or missing ones.
+  Read-only; exits non-zero on drift.
 - **Cross-agent coverage counts.** `stats --topic <topic>` and the briefing
   coverage section report aggregate counts over other agents' journals
   (agents who attempted the topic, agents with a recorded failure, matched

@@ -82,13 +82,26 @@ enum Cmd {
         limit: usize,
     },
 
-    /// Mark an entry verified.
+    /// Mark an entry verified, or revalidate its evidence files.
     Verify {
-        id: EntryId,
+        /// Entry to verify (or, with --revalidate, to check). Omit with
+        /// --revalidate --all.
+        id: Option<EntryId>,
         #[arg(long, default_value = "human")]
         verifier: String,
         #[arg(long)]
         note: Option<String>,
+        /// Record file evidence at verify time: hash the file's content
+        /// and keep an excerpt. Repeatable.
+        #[arg(long)]
+        evidence: Vec<PathBuf>,
+        /// Re-hash the entry's evidence files instead of verifying; flag
+        /// any whose content drifted since citation. Read-only.
+        #[arg(long)]
+        revalidate: bool,
+        /// With --revalidate: check file evidence on every entry.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Mark an entry contradicted by another entry.
@@ -258,6 +271,11 @@ fn layer_of(name: &str) -> Result<&'static str> {
     layout::parse_layer_name(Some(name)).map_err(Error::Invalid)
 }
 
+/// First 8 hex chars of a digest, enough to identify drift at a glance.
+fn short(sha: &str) -> &str {
+    &sha[..8.min(sha.len())]
+}
+
 /// The shipped local embedder (fastembed bge-small-en-v1.5), wrapped in the
 /// content-addressed vector cache under `<root>/.cache`. Boxed so tests can
 /// swap in a fake: under the test-only `test-embedder` feature,
@@ -406,9 +424,57 @@ fn dispatch(cli: Cli) -> Result<()> {
             warn_skipped(&out.skipped);
         }
 
-        C::Verify { id, verifier, note } => {
-            g.verify(id, &verifier, note)?;
-            println!("verified {id}");
+        C::Verify {
+            id,
+            verifier,
+            note,
+            evidence,
+            revalidate,
+            all,
+        } => {
+            if revalidate {
+                let checks = match (id, all) {
+                    (_, true) => g.revalidate_all()?,
+                    (Some(id), false) => g.revalidate(id)?,
+                    (None, false) => {
+                        return Err(Error::Invalid(
+                            "--revalidate needs an entry id or --all".into(),
+                        ))
+                    }
+                };
+                let mut intact = 0usize;
+                for c in &checks {
+                    match &c.actual_sha256 {
+                        Some(_) if c.intact() => intact += 1,
+                        Some(actual) => println!(
+                            "DRIFT   {} {} expected {} got {}",
+                            c.entry,
+                            c.path,
+                            short(&c.expected_sha256),
+                            short(actual)
+                        ),
+                        None => println!("MISSING {} {}", c.entry, c.path),
+                    }
+                }
+                let drifted = checks.iter().filter(|c| !c.intact()).count();
+                println!("{intact} intact, {drifted} drifted or missing");
+                if drifted > 0 {
+                    return Err(Error::Drift(drifted));
+                }
+            } else {
+                let id = id.ok_or_else(|| Error::Invalid("verify needs an entry id".into()))?;
+                if all {
+                    return Err(Error::Invalid(
+                        "--all only applies with --revalidate".into(),
+                    ));
+                }
+                if evidence.is_empty() {
+                    g.verify(id, &verifier, note)?;
+                } else {
+                    g.verify_with_evidence(id, &verifier, note, &evidence)?;
+                }
+                println!("verified {id}");
+            }
         }
 
         C::Contradict {
