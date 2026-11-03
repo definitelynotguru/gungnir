@@ -131,20 +131,29 @@ fn ends_consonant(w: &str) -> bool {
 /// both sides of the comparison, so an occasional over-stem costs nothing.
 fn stem(word: &str) -> String {
     let mut w = word.to_string();
-    // Pass 1 strips a plural marker ("connections" → "connection"); it runs
-    // before the derivational endings so "postings" loses "s", not "ing",
-    // and it runs only once so "cases" never loses a second "s". A terminal
-    // "ss" is never a plural ("access", "class").
-    for (suffix, repl) in [("sses", "ss"), ("ies", "i"), ("es", ""), ("s", "")] {
-        if suffix == "s" && w.ends_with("ss") {
-            continue;
-        }
+    // Pass 1 strips one plural marker ("connections" → "connection"); it
+    // runs before the derivational endings so "postings" loses "s", not
+    // "ing". The bare "s" strip skips terminal "ss"/"us"/"is"/"as" — those
+    // are singular endings, not plurals — so "status"/"statuses" and
+    // "alias"/"aliases" meet at the singular. An "es" strip counts as the
+    // plural marker, so it never triggers a second strip: the 's' left
+    // behind ("responses" → "respons") belongs to the base.
+    let mut stripped = false;
+    for (suffix, repl) in [("sses", "ss"), ("ies", "i"), ("es", "")] {
         if let Some(base) = w.strip_suffix(suffix) {
             if base.len() >= 2 {
                 w = base.to_string() + repl;
+                stripped = true;
                 break;
             }
         }
+    }
+    if !stripped
+        && w.ends_with('s')
+        && !["ss", "us", "is", "as"].iter().any(|e| w.ends_with(e))
+        && w.len() > 3
+    {
+        w.pop();
     }
     // Pass 2 strips derivational endings ("connection" → "connect").
     for (suffix, repl) in [
@@ -555,6 +564,10 @@ mod tests {
         assert_eq!(stem("issue"), stem("issues"));
         assert_eq!(stem("queue"), stem("queues"));
         assert_eq!(stem("post"), stem("postings"));
+        // Latin -us plurals: "statuses" meets "status" at "statu".
+        assert_eq!(stem("status"), stem("statuses"));
+        assert_eq!(stem("focus"), stem("focuses"));
+        assert_eq!(stem("alias"), stem("aliases"));
         // Short words stay untouched.
         assert_eq!(stem("db"), "db");
         assert_eq!(stem("go"), "go");
