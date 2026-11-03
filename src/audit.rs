@@ -32,6 +32,15 @@ fn fmt_time(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// Collapse a stored text field to one display line: control characters
+/// (newlines included) become spaces so a crafted value can't forge extra
+/// rows in audit output.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 fn fmt_state(e: &Entry) -> String {
     match &e.verification {
         VerificationState::Unverified => "unverified".into(),
@@ -170,10 +179,14 @@ pub fn format_report(r: &EntryReport, since: Option<DateTime<Utc>>) -> String {
         r.entry.id,
         r.partition,
         fmt_time(r.entry.timestamp),
-        r.entry.agent,
+        one_line(&r.entry.agent),
         fmt_state(&r.entry),
     );
-    out.push_str(&format!("\n  {}  {}", r.entry.kind, r.entry.summary));
+    out.push_str(&format!(
+        "\n  {}  {}",
+        r.entry.kind,
+        one_line(&r.entry.summary)
+    ));
     if let Some(prev) = r.entry.revises {
         out.push_str(&format!("\n  revises {prev}"));
     }
@@ -184,21 +197,21 @@ pub fn format_report(r: &EntryReport, since: Option<DateTime<Utc>>) -> String {
             "  {}  {}  {}\n",
             a.entry.id,
             fmt_state(&a.entry),
-            a.entry.summary
+            one_line(&a.entry.summary)
         ));
     }
     out.push_str(&format!(
         "  {}  {}  {}  <- this entry\n",
         r.entry.id,
         fmt_state(&r.entry),
-        r.entry.summary
+        one_line(&r.entry.summary)
     ));
     for s in &r.chain {
         out.push_str(&format!(
             "  {}  {}  {}\n",
             s.entry.id,
             fmt_state(&s.entry),
-            s.entry.summary
+            one_line(&s.entry.summary)
         ));
     }
 
@@ -217,10 +230,10 @@ pub fn format_report(r: &EntryReport, since: Option<DateTime<Utc>>) -> String {
                 "  {}  {} by {}",
                 fmt_time(rec.timestamp),
                 rec.status,
-                rec.verifier
+                one_line(&rec.verifier)
             ));
             if let Some(note) = &rec.note {
-                out.push_str(&format!(" — {note}"));
+                out.push_str(&format!(" — {}", one_line(note)));
             }
             out.push('\n');
         }
@@ -246,7 +259,9 @@ pub fn format_report(r: &EntryReport, since: Option<DateTime<Utc>>) -> String {
         for l in &r.cited_by {
             out.push_str(&format!(
                 "  {}  {}  {}\n",
-                l.entry.id, l.partition, l.entry.summary
+                l.entry.id,
+                l.partition,
+                one_line(&l.entry.summary)
             ));
         }
     }
@@ -255,7 +270,9 @@ pub fn format_report(r: &EntryReport, since: Option<DateTime<Utc>>) -> String {
         for l in &r.contradicts {
             out.push_str(&format!(
                 "  {}  {}  {}\n",
-                l.entry.id, l.partition, l.entry.summary
+                l.entry.id,
+                l.partition,
+                one_line(&l.entry.summary)
             ));
         }
     }
@@ -311,10 +328,10 @@ pub fn scan_events(
         push(AuditEvent {
             when: l.entry.timestamp,
             kind: EventKind::Created,
-            actor: l.entry.agent.clone(),
+            actor: one_line(&l.entry.agent),
             partition: l.partition.clone(),
             id: l.entry.id,
-            summary: l.entry.summary.clone(),
+            summary: one_line(&l.entry.summary),
             note: None,
         });
         for rec in &l.entry.verification_log {
@@ -327,11 +344,11 @@ pub fn scan_events(
             push(AuditEvent {
                 when: rec.timestamp,
                 kind,
-                actor: rec.verifier.clone(),
+                actor: one_line(&rec.verifier),
                 partition: l.partition.clone(),
                 id: l.entry.id,
-                summary: l.entry.summary.clone(),
-                note: rec.note.clone(),
+                summary: one_line(&l.entry.summary),
+                note: rec.note.as_deref().map(one_line),
             });
         }
     }
@@ -519,7 +536,7 @@ fn entry_line(prefix: &str, e: &SnapshotEntry) -> String {
         e.located.entry.id,
         e.located.partition,
         e.located.entry.kind.to_string(),
-        e.located.entry.summary
+        one_line(&e.located.entry.summary)
     )
 }
 
@@ -612,7 +629,7 @@ pub fn format_blame(r: &EntryReport) -> String {
     let mut out = format!(
         "{}  \"{}\"  ({})\nbelief state: {}\n",
         e.id,
-        e.summary,
+        one_line(&e.summary),
         r.partition,
         fmt_state(e)
     );
@@ -626,19 +643,21 @@ pub fn format_blame(r: &EntryReport) -> String {
                 "\n  {}  {} by {}",
                 fmt_time(rec.timestamp),
                 rec.status,
-                rec.verifier
+                one_line(&rec.verifier)
             ));
             if let Some(note) = &rec.note {
-                out.push_str(&format!(" — {note}"));
+                out.push_str(&format!(" — {}", one_line(note)));
             }
         }
     }
     out.push('\n');
 
     match (e.revises, r.ancestors.last()) {
-        (Some(prev), Some(l)) => {
-            out.push_str(&format!("supersedes: {}  \"{}\"\n", prev, l.entry.summary))
-        }
+        (Some(prev), Some(l)) => out.push_str(&format!(
+            "supersedes: {}  \"{}\"\n",
+            prev,
+            one_line(&l.entry.summary)
+        )),
         (Some(prev), None) => out.push_str(&format!("supersedes: {prev}\n")),
         (None, _) => {}
     }
@@ -647,7 +666,7 @@ pub fn format_blame(r: &EntryReport) -> String {
         Some(l) => out.push_str(&format!(
             "replaced by: {}  \"{}\"  [{}]\n",
             l.entry.id,
-            l.entry.summary,
+            one_line(&l.entry.summary),
             fmt_state(&l.entry)
         )),
         None => out.push_str("replaced by: nothing — still current\n"),
@@ -658,7 +677,9 @@ pub fn format_blame(r: &EntryReport) -> String {
         for l in &r.cited_by {
             out.push_str(&format!(
                 "\n  {}  {}  {}",
-                l.entry.id, l.partition, l.entry.summary
+                l.entry.id,
+                l.partition,
+                one_line(&l.entry.summary)
             ));
         }
         out.push('\n');
@@ -666,7 +687,11 @@ pub fn format_blame(r: &EntryReport) -> String {
     if !r.contradicts.is_empty() {
         out.push_str("this belief contradicts:");
         for l in &r.contradicts {
-            out.push_str(&format!("\n  {}  {}", l.entry.id, l.entry.summary));
+            out.push_str(&format!(
+                "\n  {}  {}",
+                l.entry.id,
+                one_line(&l.entry.summary)
+            ));
         }
         out.push('\n');
     }
@@ -748,9 +773,9 @@ pub fn format_review(items: &[ReviewItem]) -> String {
                 out.push_str(&format!(
                     "    {}  {:<12}  {:<11}  {}{}\n",
                     item.entry.id,
-                    item.entry.agent,
+                    one_line(&item.entry.agent),
                     item.entry.kind.to_string(),
-                    item.entry.summary,
+                    one_line(&item.entry.summary),
                     extracted,
                 ));
                 out.push_str(&format!(
@@ -785,7 +810,7 @@ pub fn format_entities(all: &[Located], name: Option<&str>) -> String {
                     l.entry.id,
                     l.partition,
                     fmt_state(&l.entry),
-                    l.entry.summary
+                    one_line(&l.entry.summary)
                 ));
             }
             out

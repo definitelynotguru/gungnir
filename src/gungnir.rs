@@ -1564,10 +1564,33 @@ pub fn superseded_ids(store: &Store) -> Result<HashSet<EntryId>> {
 /// a scratch target stops existing at session end, and a link that can only
 /// dangle reads better as plain text in the durable journal archive.
 fn demote_scratch_links(text: &str, scratch_ids: &std::collections::HashSet<EntryId>) -> String {
-    let mut out = text.to_string();
-    for id in scratch_ids {
-        out = out.replace(&format!("[[{id}]]"), &id.to_string());
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("[[") {
+        let after_open = &rest[open + 2..];
+        let line_end = after_open.find('\n').unwrap_or(after_open.len());
+        match after_open[..line_end].find("]]") {
+            Some(close) => {
+                let target = after_open[..close].trim();
+                if target
+                    .parse::<EntryId>()
+                    .ok()
+                    .is_some_and(|id| scratch_ids.contains(&id))
+                {
+                    out.push_str(&rest[..open]);
+                    out.push_str(target);
+                } else {
+                    out.push_str(&rest[..open + 2 + close + 2]);
+                }
+                rest = &after_open[close + 2..];
+            }
+            None => {
+                out.push_str(&rest[..open + 2 + line_end]);
+                rest = &after_open[line_end..];
+            }
+        }
     }
+    out.push_str(rest);
     out
 }
 
@@ -1701,6 +1724,41 @@ mod tests {
         assert!(!body.contains(&format!("[[{a}]]")), "{body}");
         assert!(body.contains(&a.to_string()), "{body}");
         assert!(body.contains(&format!("[[{}]]", codex_entry.id)), "{body}");
+    }
+
+    #[test]
+    fn end_session_demotes_whitespace_padded_scratch_links() {
+        // `[[ {id} ]]` is a real link to the wikilink parser (targets are
+        // trimmed), so demotion must match the padded form too.
+        let (_d, g) = gng();
+        let s = g.start_session("builder", "trace checkout");
+        let a = g.add_observation(&s, "first observation").unwrap();
+        g.add_observation(&s, format!("builds on [[ {a} ]]"))
+            .unwrap();
+        g.end_session(&s, "done", vec![]).unwrap();
+
+        let archived = g.journal("builder").unwrap().entries().unwrap();
+        let body = &archived[0].body;
+        assert!(!body.contains("]]"), "{body}");
+        assert!(body.contains(&a.to_string()), "{body}");
+    }
+
+    #[test]
+    fn end_session_archives_tasks_with_non_link_bracket_spans() {
+        // Free text holds `[[` spans that are prose, not entity claims —
+        // archiving must not reject the write.
+        let (_d, g) = gng();
+        let s = g.start_session("builder", "explain the matrix [[1,2],[3,4]] syntax");
+        g.add_observation(&s, "note [[foo,bar] inline").unwrap();
+        g.end_session(&s, "done", vec![]).unwrap();
+
+        let archived = g.journal("builder").unwrap().entries().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert!(
+            archived[0].body.contains("[[1,2],[3,4]]"),
+            "{}",
+            archived[0].body
+        );
     }
 
     #[test]
