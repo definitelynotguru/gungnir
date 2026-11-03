@@ -891,6 +891,59 @@ mod tests {
         assert!(!b.markdown.contains("vacuum"), "{}", b.markdown);
     }
 
+    /// A paraphrase the keyword brief misses must still reach the codex
+    /// through the semantic path — this is the regression brief_semantic
+    /// exists for.
+    struct Dict;
+    impl crate::embedding::Embedder for Dict {
+        fn model(&self) -> &str {
+            "dict-1"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let l = t.to_lowercase();
+                    if l.contains("postgres") || l.contains("connection") {
+                        vec![1.0f32, 0.0]
+                    } else {
+                        vec![0.0f32, 1.0]
+                    }
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn brief_semantic_surfaces_paraphrased_codex_knowledge() {
+        let (_d, g) = gng();
+        let codex = g.codex().unwrap();
+        let mut e = Entry::new("ops", EntryKind::Decision, "postgres pooling limits");
+        e.verify("ops", None);
+        codex.create(&e).unwrap();
+
+        let kw = g.brief("builder", "database connection tuning", 8).unwrap();
+        assert!(
+            !kw.markdown.contains("postgres pooling limits"),
+            "premise: keyword brief misses the paraphrase\n{}",
+            kw.markdown
+        );
+        let sem = g
+            .brief_semantic("builder", "database connection tuning", 8, &Dict)
+            .unwrap();
+        assert!(
+            sem.markdown.contains("postgres pooling limits"),
+            "{}",
+            sem.markdown
+        );
+        assert!(
+            !sem.markdown
+                .contains("No verified knowledge covers this task"),
+            "{}",
+            sem.markdown
+        );
+    }
+
     #[test]
     fn supersede_links_and_locate_finds_layers() {
         let (_d, g) = gng();

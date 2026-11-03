@@ -70,6 +70,11 @@ All notable changes to Gungnir are documented here. The format follows
 - **`add_observation`/`add_attempt` reject an already-ended session.**
   Previously the write succeeded and the next `end_session` deleted the
   notes unarchived. (MCP step-level behavior changes accordingly.)
+- **Library API.** `recall::score` now takes a `&CorpusStats`
+  argument (build one with `CorpusStats::new` over the visible pool) and
+  `embedding::hybrid_search` returns `Result<SearchOutcome>` — hits plus
+  coverage — instead of `Result<Vec<Hit>>`. The CLI and MCP surface are
+  unchanged.
 
 ### Fixed
 

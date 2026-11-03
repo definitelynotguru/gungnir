@@ -131,33 +131,35 @@ fn ends_consonant(w: &str) -> bool {
 /// both sides of the comparison, so an occasional over-stem costs nothing.
 fn stem(word: &str) -> String {
     let mut w = word.to_string();
-    // Two passes: plurals first ("connections" → "connection"), then
-    // derivational endings ("connection" → "connect").
-    for _ in 0..2 {
-        for (suffix, repl) in [
-            ("ational", "ate"),
-            ("tional", "tion"),
-            ("ies", "i"),
-            ("sses", "ss"),
-            ("ing", ""),
-            ("ed", ""),
-            ("ation", "ate"),
-            ("tion", "t"),
-            ("ly", ""),
-            ("es", ""),
-            ("s", ""),
-        ] {
-            // A terminal "ss" is never a plural ("access", "class");
-            // stripping it would split the family ("accessing" → "acces"
-            // vs "access" → "acce").
-            if suffix == "s" && w.ends_with("ss") {
-                continue;
+    // Pass 1 strips a plural marker ("connections" → "connection"); it runs
+    // before the derivational endings so "postings" loses "s", not "ing",
+    // and it runs only once so "cases" never loses a second "s". A terminal
+    // "ss" is never a plural ("access", "class").
+    for (suffix, repl) in [("sses", "ss"), ("ies", "i"), ("es", ""), ("s", "")] {
+        if suffix == "s" && w.ends_with("ss") {
+            continue;
+        }
+        if let Some(base) = w.strip_suffix(suffix) {
+            if base.len() >= 2 {
+                w = base.to_string() + repl;
+                break;
             }
-            if let Some(base) = w.strip_suffix(suffix) {
-                if base.len() >= 2 {
-                    w = base.to_string() + repl;
-                    break;
-                }
+        }
+    }
+    // Pass 2 strips derivational endings ("connection" → "connect").
+    for (suffix, repl) in [
+        ("ational", "ate"),
+        ("tional", "tion"),
+        ("ing", ""),
+        ("ed", ""),
+        ("ation", "ate"),
+        ("tion", "t"),
+        ("ly", ""),
+    ] {
+        if let Some(base) = w.strip_suffix(suffix) {
+            if base.len() >= 2 {
+                w = base.to_string() + repl;
+                break;
             }
         }
     }
@@ -171,10 +173,10 @@ fn stem(word: &str) -> String {
         }
     }
     // Silent trailing e: "migrate" → "migrat", matching the "ation"→"ate"
-    // rule above. The length floor only protects 1–2 letter stems; a base
-    // word must land on the same stem as its inflections ("code" meets
-    // "codes"/"coded" at "cod").
-    if w.len() > 2 && w.ends_with('e') && ends_consonant(&w[..w.len() - 1]) {
+    // rule above. No consonant precondition: vowel+e words keep the family
+    // together too ("value" and "values" both land on "valu", "issue" and
+    // "issues" on "issu"). The length floor only protects 1–2 letter stems.
+    if w.len() > 2 && w.ends_with('e') {
         w.pop();
     }
     // Terminal consonant-y: "retry" → "retri" to meet "retries" → "retri".
@@ -545,6 +547,14 @@ mod tests {
         assert_eq!(stem("accessed"), stem("access"));
         assert_eq!(stem("accesses"), stem("access"));
         assert_eq!(stem("class"), stem("classes"));
+        // Plural and trailing-e rules must agree for every e-family:
+        // a base word and its plural land on one stem.
+        assert_eq!(stem("case"), stem("cases"));
+        assert_eq!(stem("response"), stem("responses"));
+        assert_eq!(stem("value"), stem("values"));
+        assert_eq!(stem("issue"), stem("issues"));
+        assert_eq!(stem("queue"), stem("queues"));
+        assert_eq!(stem("post"), stem("postings"));
         // Short words stay untouched.
         assert_eq!(stem("db"), "db");
         assert_eq!(stem("go"), "go");
@@ -580,9 +590,14 @@ mod tests {
 
         let out = search_with_coverage(&store, &Query::new("ulid", 10)).unwrap();
         assert_eq!(out.hits[0].entry.summary, "ulid checkout");
-        let ulid_score = out.hits[0].score;
-        let out2 = search_with_coverage(&store, &Query::new("note", 10)).unwrap();
-        assert!(ulid_score > out2.hits[0].score || out2.hits.len() == 4);
+        // The idf contract itself: df=1 outweighs df=5.
+        let stats = CorpusStats::new(store.entries().unwrap().iter());
+        assert!(
+            stats.idf("ulid") > stats.idf("checkout"),
+            "df=1 must outweigh df=5: {} vs {}",
+            stats.idf("ulid"),
+            stats.idf("checkout")
+        );
     }
 
     #[test]

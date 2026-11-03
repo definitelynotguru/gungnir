@@ -757,4 +757,21 @@ mod tests {
             .unwrap()
             .contains("not found"));
     }
+
+    /// semantic:true must fail loudly on a default build — keyword results
+    /// in its place would be a silent degrade.
+    #[cfg(not(feature = "embed"))]
+    #[test]
+    fn semantic_true_errors_without_the_embed_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":"postgres","semantic":true}}}"#,
+            Gungnir::open(dir.path()).unwrap(),
+        );
+        assert_eq!(msgs[0]["result"]["isError"], true);
+        assert!(msgs[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("embed"));
+    }
 }
