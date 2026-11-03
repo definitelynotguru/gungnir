@@ -647,6 +647,7 @@ impl Gungnir {
             ));
         }
 
+<<<<<<< HEAD
         // The persisted task wins over whatever a rebuilt handle claims;
         // fall back to the handle for pre-meta sessions.
         let task = self
@@ -666,7 +667,11 @@ impl Gungnir {
             b"",
         )?;
 
-        let mut journal_entry = Entry::new(&session.agent, EntryKind::Session, summary);
+        let mut journal_entry = Entry::new(
+            &session.agent,
+            EntryKind::Session,
+            demote_scratch_links(summary, &scratch_ids),
+        );
         journal_entry.session_id = Some(session.id.clone());
         journal_entry.body = format!(
             "# Task\n{}\n\n# Transcript\n{}",

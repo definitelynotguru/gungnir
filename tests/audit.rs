@@ -814,3 +814,54 @@ fn supersede_inherits_body_entity_mentions() {
         "body-derived entity lost on revision: {out}"
     );
 }
+
+#[test]
+fn blame_reports_still_current_when_middle_revision_rolled_back() {
+    // A <- B <- C, then B rolled back: current recall reveals A again
+    // (the rolled-back edge stops hiding it), so `blame A` must not name
+    // the still-live C as A's replacement.
+    let (_d, store) = root();
+    let a = add(
+        &store,
+        &[
+            "--agent",
+            "builder",
+            "--kind",
+            "decision",
+            "--summary",
+            "mysql pool",
+        ],
+    );
+    ok(&store, &["verify", &a, "--verifier", "team"]);
+    let b = ok(
+        &store,
+        &[
+            "supersede",
+            &a,
+            "--agent",
+            "builder",
+            "--summary",
+            "postgres pool",
+        ],
+    )
+    .trim()
+    .to_string();
+    let c = ok(
+        &store,
+        &[
+            "supersede",
+            &b,
+            "--agent",
+            "builder",
+            "--summary",
+            "pgbouncer pool",
+        ],
+    )
+    .trim()
+    .to_string();
+    ok(&store, &["rollback", &b, "--agent", "builder"]);
+
+    let out = ok(&store, &["blame", &a]);
+    assert!(out.contains("still current"), "{out}");
+    assert!(!out.contains(&format!("replaced by: {c}")), "{out}");
+}

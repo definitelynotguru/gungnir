@@ -114,14 +114,13 @@ pub fn entry_report(id: EntryId, all: &[Located]) -> Option<EntryReport> {
     // `replaced by` applies the same live-revision rule as current recall:
     // a rollback record restores, it does not replace, and a rolled-back
     // revision cannot be the current head either.
-    let superseded = superseded_ids(all, None);
-    let replacement = chain
-        .iter()
-        .find(|l| {
-            l.entry.kind != EntryKind::Rollback
-                && l.entry.verification != VerificationState::RolledBack
-                && !superseded.contains_key(&l.entry.id)
-        })
+    // The queried entry's own live replacement, by current-recall rules:
+    // the successor whose edge actually hides this entry. A rolled-back
+    // middle revision reveals its ancestor, so a deeper live descendant
+    // must NOT count as this entry's replacement.
+    let replacement = superseded_ids(all, None)
+        .get(&id)
+        .and_then(|rid| find(all, *rid))
         .cloned();
 
     let cited_by: Vec<Located> = all
