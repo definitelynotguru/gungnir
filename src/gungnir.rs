@@ -182,7 +182,18 @@ impl Gungnir {
 
     /// The journal archive a session was ended into, if it was.
     fn find_archive(&self, agent: &str, session_id: &str) -> Result<Option<EntryId>> {
-        for e in self.journal(agent)?.entries()? {
+        let scan = self.journal(agent)?.scan()?;
+        // An unreadable journal file might be the archive itself: fail
+        // closed rather than read "no archive" and accept writes or a
+        // second archive for an ended session.
+        if let Some(bad) = scan.skipped.first() {
+            return Err(Error::Invalid(format!(
+                "journal for {agent} has unreadable entry {}: {}; cannot confirm whether session {session_id} is archived",
+                bad.path.display(),
+                bad.error
+            )));
+        }
+        for e in scan.entries {
             if e.kind == EntryKind::Session && e.session_id.as_deref() == Some(session_id) {
                 return Ok(Some(e.id));
             }
@@ -210,9 +221,14 @@ impl Gungnir {
         text: String,
         outcome: Option<bool>,
     ) -> Result<EntryId> {
-        // An archived session is done: the retry path clears scratch, so a
-        // write accepted now would be deleted unarchived on the next end.
-        if self.find_archive(&session.agent, &session.id)?.is_some() {
+        let dir_exists = self.session_dir(&session.id).exists();
+        // Scratch existing means the session is live: a successful end
+        // deletes it, so its presence is the cheap signal that skips the
+        // journal parse on every write. Only when scratch is absent does
+        // the journal decide — an archive found there means the session
+        // is done and a write accepted now would be deleted unarchived
+        // on the next end.
+        if !dir_exists && self.find_archive(&session.agent, &session.id)?.is_some() {
             return Err(Error::Invalid(format!(
                 "session {} already ended; its notes are archived and new ones cannot be added",
                 session.id

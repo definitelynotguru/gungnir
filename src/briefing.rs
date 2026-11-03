@@ -129,12 +129,17 @@ pub fn compile(input: BriefingInput) -> Briefing {
         // Contradicted and hidden (superseded, rolled back) matches count:
         // the briefing lists them above, so "nothing matched" must not
         // contradict its own output.
-        let matched_any = input
-            .codex_coverage
+        let c = input.codex_coverage;
+        let j = input.journal_coverage;
+        let matched_any = c
             .total_visible()
-            .saturating_add(input.codex_coverage.contradicted)
-            .saturating_add(input.journal_coverage.total_visible())
-            .saturating_add(input.journal_coverage.contradicted)
+            .saturating_add(c.contradicted)
+            .saturating_add(c.hidden_superseded)
+            .saturating_add(c.hidden_rolled_back)
+            .saturating_add(j.total_visible())
+            .saturating_add(j.contradicted)
+            .saturating_add(j.hidden_superseded)
+            .saturating_add(j.hidden_rolled_back)
             > 0;
         if matched_any {
             md.push_str(
