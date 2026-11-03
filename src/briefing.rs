@@ -63,8 +63,14 @@ fn label(hit: &Hit, superseded: &HashSet<EntryId>, task_tokens: &[String]) -> St
 
 /// First body line relevant to the task, as context under the summary.
 /// Transcript bullets ("- attempt: ...") win over prose echoes of the task.
+/// Relevance compares stemmed tokens on both sides — the same vocabulary
+/// the scorer sees — so "latency" meets "latenci" and "us" no longer
+/// swallows "status" the way a substring match would.
 fn excerpt(body: &str, task_tokens: &[String]) -> Option<String> {
-    let relevant = |l: &&str| task_tokens.iter().any(|t| l.to_lowercase().contains(t));
+    let relevant = |l: &&str| {
+        let line_tokens = crate::recall::tokenize(l);
+        task_tokens.iter().any(|t| line_tokens.contains(t))
+    };
     let lines: Vec<&str> = body
         .lines()
         .map(str::trim)
@@ -302,6 +308,41 @@ mod tests {
         let b = compile(i);
         assert!(
             b.markdown.contains("- attempt: added checkout cache"),
+            "{}",
+            b.markdown
+        );
+    }
+
+    #[test]
+    fn excerpt_matches_stemmed_tokens_not_substrings() {
+        // "used" stems to "us"; a substring matcher would offer the
+        // "status" line as relevant. Under stemmed-token matching the body
+        // shares no token with the task, so no excerpt is picked.
+        let mut e = Entry::new("a", EntryKind::Observation, "connection notes");
+        e.body = "status update: all green".into();
+        let mut i = input();
+        i.task = "used connections".into();
+        i.codex_hits = vec![Hit {
+            entry: e,
+            score: 1.0,
+        }];
+        let b = compile(i);
+        assert!(!b.markdown.contains("> status"), "{}", b.markdown);
+    }
+
+    #[test]
+    fn excerpt_still_fires_when_stems_agree() {
+        let mut e = Entry::new("a", EntryKind::Observation, "orders report");
+        e.body = "query latency on orders doubled".into();
+        let mut i = input();
+        i.task = "query latency".into();
+        i.codex_hits = vec![Hit {
+            entry: e,
+            score: 1.0,
+        }];
+        let b = compile(i);
+        assert!(
+            b.markdown.contains("> query latency on orders doubled"),
             "{}",
             b.markdown
         );

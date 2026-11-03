@@ -165,9 +165,10 @@ fn stem(word: &str) -> String {
         }
     }
     // Silent trailing e: "migrate" → "migrat", matching the "ation"→"ate"
-    // rule above. Keep real terminal -ee/-ye/-le words mostly intact via
-    // the length floor.
-    if w.len() > 4 && w.ends_with('e') && ends_consonant(&w[..w.len() - 1]) {
+    // rule above. The length floor only protects 1–2 letter stems; a base
+    // word must land on the same stem as its inflections ("code" meets
+    // "codes"/"coded" at "cod").
+    if w.len() > 2 && w.ends_with('e') && ends_consonant(&w[..w.len() - 1]) {
         w.pop();
     }
     // Terminal consonant-y: "retry" → "retri" to meet "retries" → "retri".
@@ -497,6 +498,25 @@ mod tests {
         assert_eq!(stem("connections"), stem("connection"));
         assert_eq!(stem("indexes"), stem("index"));
         assert_eq!(stem("slowly"), stem("slow"));
+        // A base word shares a stem with every inflection of it, short
+        // bases included.
+        for family in [
+            vec!["code", "codes", "coded", "coding"],
+            vec!["use", "used", "using"],
+            vec!["file", "files", "filing"],
+            vec!["note", "notes", "noted"],
+            vec!["type", "types", "typed"],
+        ] {
+            let base = stem(family[0]);
+            for inflection in &family[1..] {
+                assert_eq!(
+                    stem(inflection),
+                    base,
+                    "{inflection} must share a stem with {}",
+                    family[0]
+                );
+            }
+        }
         // Short words stay untouched.
         assert_eq!(stem("db"), "db");
         assert_eq!(stem("go"), "go");

@@ -180,15 +180,27 @@ pub fn hybrid_search(
     let mut kw_rank: Vec<usize> = (0..pool.len()).collect();
     kw_rank.sort_by(|a, b| kw_scores[*b].total_cmp(&kw_scores[*a]));
 
-    // Vector channel.
-    let texts: Vec<String> = pool
+    // Vector channel. Rolled-back candidates stay out of the embedder:
+    // retracted text must not leave the process through a user-supplied
+    // HTTP embedder, nor linger in the vector cache. Their keyword scores
+    // still compute locally, so coverage can report them as hidden.
+    let embedded: Vec<usize> = pool
         .iter()
-        .map(|c| format!("{}\n{}", c.entry.summary, c.entry.body))
+        .enumerate()
+        .filter(|(_, c)| c.state != recall::StateAt::RolledBack)
+        .map(|(i, _)| i)
+        .collect();
+    let texts: Vec<String> = embedded
+        .iter()
+        .map(|&i| format!("{}\n{}", pool[i].entry.summary, pool[i].entry.body))
         .collect();
     let vectors = embedder.embed(&texts)?;
     let query_vecs = embedder.embed(std::slice::from_ref(&query.text))?;
     let qv = &query_vecs[0];
-    let vec_scores: Vec<f32> = vectors.iter().map(|v| cosine(qv, v)).collect();
+    let mut vec_scores = vec![0.0f32; pool.len()];
+    for (i, v) in embedded.iter().zip(vectors.iter()) {
+        vec_scores[*i] = cosine(qv, v);
+    }
     let mut vec_rank: Vec<usize> = (0..pool.len()).collect();
     vec_rank.sort_by(|a, b| vec_scores[*b].total_cmp(&vec_scores[*a]));
 
@@ -263,6 +275,24 @@ pub mod local {
                 .unwrap()
                 .embed(texts, None)
                 .map_err(|e| Error::Invalid(format!("embed failed: {e}")))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn construction_is_lazy_and_never_touches_the_network() {
+            let dir = tempfile::tempdir().unwrap();
+            let e = Fastembed::new(dir.path()).unwrap();
+            assert_eq!(e.model(), "bge-small-en-v1.5-q");
+            assert_eq!(
+                e.cache_dir,
+                dir.path().join(crate::layout::CACHE).join("fastembed")
+            );
+            assert!(e.inner.lock().unwrap().is_none(), "model stays unloaded");
+            assert!(!e.cache_dir.exists(), "no files written before first embed");
         }
     }
 }
@@ -494,6 +524,47 @@ mod tests {
         );
         let out = hybrid_search(&store, &Query::new("postgres", 10), &embedder).unwrap();
         assert!(out.hits.is_empty());
+        assert_eq!(out.coverage.hidden_rolled_back, 1);
+    }
+
+    /// Records every text handed to it; rolled-back content must never
+    /// reach an embedder, especially an external HTTP one.
+    struct Recording {
+        seen: Mutex<Vec<String>>,
+    }
+    impl Embedder for Recording {
+        fn model(&self) -> &str {
+            "rec-1"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.seen.lock().unwrap().extend(texts.iter().cloned());
+            Ok(texts.iter().map(|_| vec![1.0f32]).collect())
+        }
+    }
+
+    #[test]
+    fn rolled_back_text_never_reaches_the_embedder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let live = Entry::new("a", EntryKind::Decision, "postgres live fact");
+        let mut rolled = Entry::new("a", EntryKind::Decision, "postgres retracted fact");
+        rolled.mark_rolled_back("ops");
+        store.create(&live).unwrap();
+        store.create(&rolled).unwrap();
+
+        let rec = Recording {
+            seen: Mutex::new(vec![]),
+        };
+        let out = hybrid_search(&store, &Query::new("postgres", 10), &rec).unwrap();
+        let seen = rec.seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|t| !t.contains("retracted")),
+            "retracted text went to the embedder: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|t| t.contains("live fact")),
+            "live entries still get embedded"
+        );
         assert_eq!(out.coverage.hidden_rolled_back, 1);
     }
 }

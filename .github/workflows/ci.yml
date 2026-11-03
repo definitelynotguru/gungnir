@@ -29,6 +29,22 @@ jobs:
       - name: Tests
         run: cargo test --all-targets
 
+  embed:
+    name: clippy + test (ubuntu-latest, features=embed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --features embed -- -D warnings
+      # Tests never load the model: Fastembed inits lazily, so the embed
+      # leg compiles and runs offline.
+      - name: Tests
+        run: cargo test --all-targets --features embed
+
   audit:
     name: dependency audit
     runs-on: ubuntu-latest
