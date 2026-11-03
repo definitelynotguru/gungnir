@@ -742,7 +742,7 @@ impl Gungnir {
     /// attempts relevant to `task`, with coverage driving the abstention
     /// signal.
     pub fn brief(&self, agent: &str, task: &str, limit: usize) -> Result<Briefing> {
-        self.brief_inner(agent, task, limit, None)
+        self.brief_inner(agent, &Query::new(task, limit), None)
     }
 
     /// Briefing through the hybrid vector + keyword path. The abstention
@@ -755,19 +755,33 @@ impl Gungnir {
         limit: usize,
         embedder: &dyn crate::embedding::Embedder,
     ) -> Result<Briefing> {
-        self.brief_inner(agent, task, limit, Some(embedder))
+        self.brief_inner(agent, &Query::new(task, limit), Some(embedder))
+    }
+
+    /// Briefing driven by a full query: `require_verified`, `as_of`, and
+    /// `limit` all apply. [`Self::brief`] is the no-flags shortcut.
+    pub fn brief_with(&self, agent: &str, query: &Query) -> Result<Briefing> {
+        self.brief_inner(agent, query, None)
+    }
+
+    /// [`Self::brief_with`] through the hybrid vector + keyword path.
+    pub fn brief_with_semantic(
+        &self,
+        agent: &str,
+        query: &Query,
+        embedder: &dyn crate::embedding::Embedder,
+    ) -> Result<Briefing> {
+        self.brief_inner(agent, query, Some(embedder))
     }
 
     fn brief_inner(
         &self,
         agent: &str,
-        task: &str,
-        limit: usize,
+        q: &Query,
         embedder: Option<&dyn crate::embedding::Embedder>,
     ) -> Result<Briefing> {
         let codex = self.codex()?;
         let journal = self.journal(agent)?;
-        let q = Query::new(task, limit);
 
         let search = |store: &Store, q: &Query| -> Result<SearchOutcome> {
             match embedder {
@@ -775,8 +789,8 @@ impl Gungnir {
                 None => recall::search_with_coverage(store, q),
             }
         };
-        let codex_out = search(&codex, &q)?;
-        let journal_out = search(&journal, &q)?;
+        let codex_out = search(&codex, q)?;
+        let journal_out = search(&journal, q)?;
         // Open conflict candidates touching this topic's hits warn in the
         // briefing — the same role the CONTRADICTED warning plays, one step
         // earlier in the lifecycle.
@@ -790,7 +804,7 @@ impl Gungnir {
         // snapshot shares a task token — hits truncate to `limit`, so
         // hit-only matching would hide conflicts between facts that ranked
         // just below the briefing cutoff.
-        let task_tokens: HashSet<String> = recall::tokenize(task).into_iter().collect();
+        let task_tokens: HashSet<String> = recall::tokenize(&q.text).into_iter().collect();
         let on_topic = |c: &ConflictRecord| {
             hit_ids.contains(&c.new_entry)
                 || hit_ids.contains(&c.conflicting_entry)
@@ -817,7 +831,7 @@ impl Gungnir {
             }
         }
         Ok(briefing::compile(BriefingInput {
-            task: task.to_string(),
+            task: q.text.clone(),
             codex_hits: codex_out.hits,
             journal_hits: journal_out.hits,
             codex_superseded: superseded_ids(&codex)?,
@@ -826,7 +840,7 @@ impl Gungnir {
             journal_coverage: journal_out.coverage,
             codex_skipped: codex_out.skipped,
             journal_skipped: journal_out.skipped,
-            peers: self.peer_coverage_inner(Some(agent), task, embedder)?,
+            peers: self.peer_coverage_inner(Some(agent), &q.text, embedder)?,
             open_conflicts,
         }))
     }
@@ -1172,6 +1186,7 @@ impl Gungnir {
             }
         }
         next.evidence = evidence;
+        next.entities = prev.entities.clone();
         next.body = body.into();
         store.create_with(&next, &|id| self.exists_anywhere(id))?;
         let (conflicts, warnings) =
@@ -1186,6 +1201,32 @@ impl Gungnir {
     pub fn rollback(&self, target: EntryId, agent: &str) -> Result<EntryId> {
         let store = self.locate(target)?.ok_or(Error::NotFound(target))?;
         rollback::rollback(&store, target, agent, &|id| self.exists_anywhere(id))
+    }
+
+    /// Every entry in the store across all partitions — the read the audit
+    /// commands (`log --since`, `diff`, `review`, `entities`) run over.
+    /// Scratch is included: an audit is only honest if it sees what the
+    /// agent is working with right now.
+    pub fn all_entries(&self) -> Result<Vec<crate::audit::Located>> {
+        let mut out = Vec::new();
+        for e in self.codex()?.entries()? {
+            out.push(crate::audit::Located {
+                partition: CODEX.to_string(),
+                entry: e,
+            });
+        }
+        for base_name in [JOURNAL, SCRATCH] {
+            let base = self.root.join(base_name);
+            for child in layer_child_names(&base)? {
+                for e in Store::open(base.join(&child))?.entries()? {
+                    out.push(crate::audit::Located {
+                        partition: format!("{base_name}/{child}"),
+                        entry: e,
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Memory health across all layers. `agent` scopes the journal count;
@@ -1665,7 +1706,7 @@ mod tests {
         );
         assert!(
             !sem.markdown
-                .contains("No verified knowledge covers this task"),
+                .contains("Entries matched this task but none are verified"),
             "{}",
             sem.markdown
         );

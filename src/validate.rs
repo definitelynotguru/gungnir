@@ -9,6 +9,7 @@ use crate::{Entry, EntryId, Result};
 
 pub const MAX_SUMMARY_LEN: usize = 200;
 pub const MAX_EXCERPT_LEN: usize = 500;
+pub const MAX_ENTITY_LEN: usize = 64;
 
 /// Resolve whether an entry id exists, across whatever scope the caller cares
 /// about.
@@ -74,6 +75,25 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>) -> Result<()> {
                     )));
                 }
             }
+        }
+    }
+
+    for name in &entry.entities {
+        let name = name.trim();
+        if name.is_empty() || name.len() > MAX_ENTITY_LEN {
+            return Err(crate::Error::Invalid(format!(
+                "entity names are 1..{MAX_ENTITY_LEN} chars; got '{name}'"
+            )));
+        }
+    }
+
+    // `[[<entry-id>]]` wikilinks must resolve like evidence refs.
+    // `[[name]]` targets that are not ids are entity mentions — free form.
+    for id in entry.wikilink_ids() {
+        if !exists(id)? {
+            return Err(crate::Error::Invalid(format!(
+                "body wikilink [[{id}]] points at missing entry"
+            )));
         }
     }
 

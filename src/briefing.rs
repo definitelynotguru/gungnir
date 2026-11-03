@@ -14,6 +14,10 @@ pub struct Briefing {
     pub markdown: String,
     pub codex_hits: Vec<Hit>,
     pub journal_hits: Vec<Hit>,
+    /// Topic-matched coverage per layer, kept for machine-readable callers:
+    /// abstention is `codex_coverage.verified + journal_coverage.verified == 0`.
+    pub codex_coverage: Coverage,
+    pub journal_coverage: Coverage,
     /// Files that failed to parse while scanning either layer.
     pub skipped: Vec<Skipped>,
 }
@@ -195,6 +199,8 @@ pub fn compile(input: BriefingInput) -> Briefing {
         markdown: md,
         codex_hits: input.codex_hits,
         journal_hits: input.journal_hits,
+        codex_coverage: input.codex_coverage,
+        journal_coverage: input.journal_coverage,
         skipped,
     }
 }

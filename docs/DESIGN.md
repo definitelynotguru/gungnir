@@ -182,6 +182,33 @@ A `.conflicts/` markdown queue persists them in the substrate the product
 already sells — git-diffable, human-editable — rather than hiding them in a
 derived index.
 
+## Audit and abstention
+
+The trust lifecycle only pays if a human can read it. `src/audit.rs` is the
+read surface: every audit command is a pure function over the same
+`Store::entries()` scan recall already performs — `log <id>` walks the
+verification log and the `revises` lineage, `log --since` scans creations
+and verification transitions chronologically across all partitions, `diff
+<t1> <t2>` replays the as-of machinery at two instants and reports the
+delta, `blame` resolves an id or a topic to its vouching and supersession
+lineage, and `review` lists unverified belief-kind entries for the daily
+triage ritual. Snapshot semantics deliberately mirror `current_only`: a
+rolled-back head reveals its tail, and a rollback record's `revises` pointer
+restores rather than replaces, so `diff` and recall can never disagree about
+what "superseded" means.
+
+Entities stay entity-lite on purpose: frontmatter `entities:` names plus
+`[[name]]` body mentions merge into the index, and `[[id]]` wikilinks are
+validated at write time exactly like evidence refs. That is walkable
+structure without a graph — the roadmap's deliberate refusal.
+
+Abstention is a first-class output, not a prose aside. `require_verified`
+filters hits to verified entries while coverage keeps counting the full
+matched pool, so "nothing verified" and "nothing exists" never collapse. The
+CLI turns it into an exit code (2) plus an explicit verdict line; `recall
+--json` and the MCP `coverage:` line carry `abstained` for callers that
+branch on it programmatically.
+
 ## Concurrency and durability
 
 Writes go to a temporary sibling then `rename` into place, atomic on POSIX and

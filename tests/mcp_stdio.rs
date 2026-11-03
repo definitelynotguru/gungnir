@@ -308,3 +308,100 @@ fn mcp_conflict_tools_close_the_loop() {
     let text = list["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("resolved-contradicted"), "{text}");
 }
+
+#[test]
+fn mcp_recall_reports_coverage_and_abstains() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = gungnir::Gungnir::open(dir.path()).unwrap();
+    let mut e = gungnir::Entry::new("a", gungnir::EntryKind::Decision, "postgres pooling");
+    e.body = "pool size".into();
+    g.codex().unwrap().create(&e).unwrap();
+    drop(g);
+
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+
+    // Machine-readable coverage rides every recall; the abstained flag is
+    // the refusal signal a caller can branch on without parsing prose.
+    let r = p.rpc(&msg(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "recall",
+            "arguments": {"query": "postgres", "require_verified": true}
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    let cov_line = text.lines().last().unwrap();
+    let cov: serde_json::Value =
+        serde_json::from_str(cov_line.trim_start_matches("coverage: ")).unwrap();
+    assert_eq!(cov["abstained"], true, "{text}");
+    assert_eq!(cov["verified"], 0);
+    assert_eq!(cov["unverified"], 1);
+
+    // Verify it, and the same call stops abstaining.
+    let v = p.rpc(&msg(
+        3,
+        "tools/call",
+        serde_json::json!({
+            "name": "verify",
+            "arguments": {"id": e.id.to_string(), "verifier": "team"}
+        }),
+    ));
+    assert_eq!(v["result"]["isError"], false, "{v}");
+
+    let r = p.rpc(&msg(
+        4,
+        "tools/call",
+        serde_json::json!({
+            "name": "recall",
+            "arguments": {"query": "postgres", "require_verified": true}
+        }),
+    ));
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("postgres pooling"), "{text}");
+    let cov: serde_json::Value = serde_json::from_str(
+        text.lines()
+            .last()
+            .unwrap()
+            .trim_start_matches("coverage: "),
+    )
+    .unwrap();
+    assert_eq!(cov["abstained"], false);
+    assert_eq!(cov["verified"], 1);
+}
+
+#[test]
+fn mcp_contradict_marks_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = gungnir::Gungnir::open(dir.path()).unwrap();
+    let target = gungnir::Entry::new("a", gungnir::EntryKind::Observation, "balancer healthy");
+    let counter = gungnir::Entry::new("a", gungnir::EntryKind::Observation, "balancer flapping");
+    g.codex().unwrap().create(&target).unwrap();
+    g.codex().unwrap().create(&counter).unwrap();
+    drop(g);
+
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+    let r = p.rpc(&msg(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "contradict",
+            "arguments": {"id": target.id.to_string(), "by": counter.id.to_string(), "verifier": "ops"}
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+
+    let stored = gungnir::Gungnir::open(dir.path())
+        .unwrap()
+        .codex()
+        .unwrap()
+        .require(target.id)
+        .unwrap();
+    assert!(matches!(
+        stored.verification,
+        gungnir::VerificationState::Contradicted { .. }
+    ));
+}
