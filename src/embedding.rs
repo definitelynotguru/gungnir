@@ -26,6 +26,22 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 }
 
+/// Every text embeds to the same unit vector, so every pair scores cosine
+/// 1.0 — above the vector match floor with zero keyword overlap. Exists so
+/// the semantic dispatch surfaces (CLI `--semantic`, MCP `semantic: true`)
+/// can be exercised without shipping a model; opt in via
+/// `GUNGNIR_TEST_EMBEDDER=1`.
+pub struct Uniform;
+
+impl Embedder for Uniform {
+    fn model(&self) -> &str {
+        "uniform-1"
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![1.0f32]).collect())
+    }
+}
+
 /// Disk cache in front of any embedder.
 ///
 /// Cache key is `sha256(model + "\n" + normalized_text)` — content-addressed,
@@ -182,14 +198,16 @@ pub fn hybrid_search(
     let mut kw_rank: Vec<usize> = (0..pool.len()).filter(|&i| kw_scores[i] > 0.0).collect();
     kw_rank.sort_by(|a, b| kw_scores[*b].total_cmp(&kw_scores[*a]));
 
-    // Vector channel. Rolled-back candidates stay out of the embedder:
+    // Vector channel. Entries rolled back *now* stay out of the embedder:
     // retracted text must not leave the process through a user-supplied
-    // HTTP embedder, nor linger in the vector cache. Their keyword scores
-    // still compute locally, so coverage can report them as hidden.
+    // HTTP embedder, nor linger in the vector cache — even on an as_of
+    // query that evaluates them back to their pre-retraction state. Their
+    // keyword scores still compute locally, so coverage can report them
+    // as hidden.
     let embedded: Vec<usize> = pool
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.state != recall::StateAt::RolledBack)
+        .filter(|(_, c)| c.entry.verification != crate::entry::VerificationState::RolledBack)
         .map(|(i, _)| i)
         .collect();
     let texts: Vec<String> = embedded
@@ -613,5 +631,42 @@ mod tests {
             "live entries still get embedded"
         );
         assert_eq!(out.coverage.hidden_rolled_back, 1);
+    }
+
+    /// An as_of query evaluates a rolled-back entry back to its
+    /// pre-retraction state — and must still never send its text to the
+    /// embedder. Egress is gated on the present state, not the as-of one.
+    #[test]
+    fn as_of_query_still_hides_retracted_text_from_the_embedder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rolled = Entry::new("a", EntryKind::Decision, "postgres retracted fact");
+        // temporal_pool drops entries created after the cutoff entirely, so
+        // the fixture must look old: created 3d ago, verified 2d ago,
+        // rolled back now; the query lands in the verified window.
+        rolled.timestamp = chrono::Utc::now() - chrono::Duration::days(3);
+        rolled.verify("ops", None);
+        rolled.verification_log[0].timestamp = chrono::Utc::now() - chrono::Duration::days(2);
+        rolled.mark_rolled_back("ops");
+        rolled.verification_log[1].timestamp = chrono::Utc::now();
+        store.create(&rolled).unwrap();
+
+        let rec = Recording {
+            seen: Mutex::new(vec![]),
+        };
+        let mut q = Query::new("postgres retracted", 10);
+        q = q.as_of(chrono::Utc::now() - chrono::Duration::days(1));
+        let out = hybrid_search(&store, &q, &rec).unwrap();
+        // Historical view: the entry was verified then, so it is a hit.
+        assert_eq!(
+            out.hits.len(),
+            1,
+            "as_of should surface the pre-rollback state"
+        );
+        let seen = rec.seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|t| !t.contains("retracted fact")),
+            "retracted text went to the embedder via as_of: {seen:?}"
+        );
     }
 }
