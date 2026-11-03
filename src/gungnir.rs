@@ -74,13 +74,19 @@ pub struct PeerCoverage {
 
 /// One evidence-file revalidation result. `expected_sha256` is the hash
 /// recorded at citation time; `actual_sha256` is `None` when the file is
-/// gone. Read-only: revalidation reports drift, it never rewrites history.
+/// gone. `read_error` distinguishes a file that exists but can't be read
+/// from a genuinely missing one — the CLI prints it as UNREADABLE, not
+/// MISSING. Read-only: revalidation reports drift, it never rewrites
+/// history.
 #[derive(Clone, Debug)]
 pub struct EvidenceCheck {
     pub entry: EntryId,
     pub path: String,
     pub expected_sha256: String,
     pub actual_sha256: Option<String>,
+    /// Set when the file exists but reading it failed (permissions, a
+    /// directory in its place, …). `actual_sha256` is `None` then too.
+    pub read_error: Option<String>,
 }
 
 impl EvidenceCheck {
@@ -548,7 +554,7 @@ impl Gungnir {
             journal_coverage: journal_out.coverage,
             codex_skipped: codex_out.skipped,
             journal_skipped: journal_out.skipped,
-            peers: self.peer_coverage(Some(agent), task)?,
+            peers: self.peer_coverage_inner(Some(agent), task, embedder)?,
         }))
     }
 
@@ -559,6 +565,28 @@ impl Gungnir {
     ///
     /// `agent: None` counts every journal partition.
     pub fn peer_coverage(&self, agent: Option<&str>, topic: &str) -> Result<PeerCoverage> {
+        self.peer_coverage_inner(agent, topic, None)
+    }
+
+    /// [`Self::peer_coverage`] through the hybrid vector + keyword path, so
+    /// a semantic briefing sees peers whose journals paraphrase the topic.
+    /// Failure attribution stays keyword-based: a session's failed lines
+    /// must share stemmed tokens with the topic to count.
+    pub fn peer_coverage_semantic(
+        &self,
+        agent: Option<&str>,
+        topic: &str,
+        embedder: &dyn crate::embedding::Embedder,
+    ) -> Result<PeerCoverage> {
+        self.peer_coverage_inner(agent, topic, Some(embedder))
+    }
+
+    fn peer_coverage_inner(
+        &self,
+        agent: Option<&str>,
+        topic: &str,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> Result<PeerCoverage> {
         let base = self.root.join(JOURNAL);
         let exclude = agent.map(layout::sanitize_component);
         let q = Query::new(topic, usize::MAX);
@@ -569,9 +597,10 @@ impl Gungnir {
             }
             // Best-effort: a corrupt file in a peer's journal must not fail
             // this agent's briefing. Skipped partitions simply don't count.
-            let Ok(out) =
-                Store::open(base.join(&name)).and_then(|s| recall::search_with_coverage(&s, &q))
-            else {
+            let Ok(out) = Store::open(base.join(&name)).and_then(|s| match embedder {
+                Some(e) => crate::embedding::hybrid_search(&s, &q, e),
+                None => recall::search_with_coverage(&s, &q),
+            }) else {
                 continue;
             };
             if out.hits.is_empty() {
@@ -579,7 +608,7 @@ impl Gungnir {
             }
             pc.agents_attempted += 1;
             pc.entries += out.hits.len();
-            if out.hits.iter().any(failed_attempt) {
+            if out.hits.iter().any(|h| failed_attempt(h, topic)) {
                 pc.agents_failed += 1;
             }
         }
@@ -941,18 +970,33 @@ fn supersedes(e: &&Entry) -> bool {
     e.kind != EntryKind::Rollback && e.verification != VerificationState::RolledBack
 }
 
-/// Whether an entry records a failed attempt. Attempt bodies open with
-/// `outcome: failed` (written by [`Gungnir::add_attempt`]); a session
-/// archive carries the same fact on transcript lines that read
-/// `- attempt: <summary> [failed]`. A raw substring match would count task
-/// text or a summary that merely mentions "[failed]".
-fn failed_attempt(h: &crate::recall::Hit) -> bool {
+/// Whether an entry records a failed attempt *on this topic*. Attempt
+/// bodies open with `outcome: failed` (written by
+/// [`Gungnir::add_attempt`]); a session archive carries the same fact on
+/// transcript lines that read `- attempt: <summary> [failed]`. A raw
+/// substring match would count task text or a summary that merely mentions
+/// "[failed]", and counting every failed line in a topic-matched session
+/// would blame the topic for an unrelated failure — the failed line must
+/// share stemmed tokens with `topic` to count.
+fn failed_attempt(h: &crate::recall::Hit, topic: &str) -> bool {
     let e = &h.entry;
-    e.body.starts_with("outcome: failed")
-        || (e.kind == EntryKind::Session
-            && e.body
-                .lines()
-                .any(|l| l.trim_start().starts_with("- attempt:") && l.ends_with("[failed]")))
+    if e.kind == EntryKind::Attempt {
+        // The entry matched the topic search, so the attempt itself is
+        // on-topic by construction.
+        return e.body.starts_with("outcome: failed");
+    }
+    if e.kind != EntryKind::Session {
+        return false;
+    }
+    let topic_tokens = recall::tokenize(topic);
+    e.body.lines().any(|l| {
+        let l = l.trim_start();
+        if !(l.starts_with("- attempt:") && l.ends_with("[failed]")) {
+            return false;
+        }
+        let line_tokens = recall::tokenize(l);
+        line_tokens.iter().any(|t| topic_tokens.contains(t))
+    })
 }
 
 /// Check one store's entries into `report`. Entry files that fail to parse
@@ -988,14 +1032,19 @@ fn check_evidence(root: &Path, entry: &Entry) -> Vec<EvidenceCheck> {
                 } else {
                     root.join(file)
                 };
-                let actual = std::fs::read(&file)
-                    .ok()
-                    .map(|raw| format!("{:x}", sha2::Sha256::digest(&raw)));
+                let (actual, read_error) = match std::fs::read(&file) {
+                    Ok(raw) => (Some(format!("{:x}", sha2::Sha256::digest(&raw))), None),
+                    // Missing and unreadable are different findings: one is
+                    // a moved file, the other a permissions or I/O problem.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+                    Err(e) => (None, Some(e.to_string())),
+                };
                 Some(EvidenceCheck {
                     entry: entry.id,
                     path: path.clone(),
                     expected_sha256: sha256.clone(),
                     actual_sha256: actual,
+                    read_error,
                 })
             }
             Evidence::Ref { .. } => None,
@@ -1307,7 +1356,7 @@ mod tests {
     fn peer_coverage_counts_other_journals_without_leaking_content() {
         let (_d, g) = gng();
         let scout = g.start_session("scout", "fix checkout latency");
-        g.add_attempt(&scout, "added index on orders", false)
+        g.add_attempt(&scout, "added index for checkout latency", false)
             .unwrap();
         g.end_session(&scout, "index did not help", vec![]).unwrap();
         let mine = g.start_session("builder", "fix checkout latency");
@@ -1430,6 +1479,52 @@ mod tests {
         assert_eq!(pc.agents_attempted, 0);
         let b = g.brief("builder", "checkout latency", 10).unwrap();
         assert!(!b.markdown.contains("Peers:"));
+    }
+
+    #[test]
+    fn peer_coverage_counts_only_topic_matched_failures() {
+        // A session matched on the topic must not have its unrelated
+        // failures blamed on it: only a failed line that shares stemmed
+        // tokens with the topic counts.
+        let (_d, g) = gng();
+        let scout = g.start_session("scout", "fix checkout latency");
+        g.add_attempt(&scout, "restart deploy runner", false)
+            .unwrap();
+        g.add_attempt(&scout, "patch checkout queue", true).unwrap();
+        g.end_session(&scout, "checkout fixed, runner still broken", vec![])
+            .unwrap();
+
+        let pc = g.peer_coverage(Some("builder"), "checkout").unwrap();
+        assert_eq!(pc.agents_attempted, 1);
+        assert_eq!(pc.agents_failed, 0);
+
+        // A topic that does match the failed line counts it.
+        let pc = g.peer_coverage(Some("builder"), "deploy runner").unwrap();
+        assert_eq!(pc.agents_failed, 1);
+    }
+
+    #[test]
+    fn revalidate_distinguishes_unreadable_from_missing() {
+        // A file that exists but can't be read reports its error instead
+        // of collapsing into the MISSING outcome.
+        let (d, g) = gng();
+        let f = d.path().join("adr.md");
+        std::fs::write(&f, "decision").unwrap();
+
+        let codex = g.codex().unwrap();
+        let e = Entry::new("ops", EntryKind::Decision, "use postgres");
+        codex.create(&e).unwrap();
+        g.verify_with_evidence(e.id, "team", None, std::slice::from_ref(&f))
+            .unwrap();
+
+        // Replace the file with a directory: exists, unreadable, portable
+        // across unix and Windows.
+        std::fs::remove_file(&f).unwrap();
+        std::fs::create_dir(&f).unwrap();
+        let checks = g.revalidate(e.id).unwrap();
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].intact());
+        assert!(checks[0].read_error.is_some());
     }
 
     #[test]

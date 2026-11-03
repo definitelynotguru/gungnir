@@ -72,6 +72,8 @@ rollback mark.
 If a store lacks a concept (private per-agent layers, coverage counts,
 as-of evaluation), the checks that need it score as failures. That is the
 point: the abilities are what is being measured, not the check strings.
+The schema is strict — unknown fields in either YAML file are rejected, so
+a misspelled assertion can never score a silent pass.
 
 ## Score interpretation
 
