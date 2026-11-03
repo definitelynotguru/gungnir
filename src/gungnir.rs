@@ -56,6 +56,10 @@ pub struct EndReport {
     /// Codex facts. The journal archive itself is session bookkeeping and
     /// never raises.
     pub conflicts: Vec<ConflictRecord>,
+    /// Conflict detection that degraded instead of surfacing candidates.
+    /// Non-empty means a scan or queue write failed; the session still
+    /// closed and every promoted entry landed.
+    pub warnings: Vec<String>,
 }
 
 /// What a claim write produced: the entry id plus any conflict candidates
@@ -65,6 +69,10 @@ pub struct EndReport {
 pub struct WriteOutcome {
     pub id: EntryId,
     pub conflicts: Vec<ConflictRecord>,
+    /// Advisory-path failures that could not fail the write: a scope that
+    /// failed to scan, or a candidate the queue could not persist. The
+    /// caller should surface these (stderr on the CLI); the entry stands.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -202,10 +210,18 @@ impl Gungnir {
         self.conflicts_queue().list()
     }
 
-    /// Candidates still awaiting a resolution verb. Reads past records that
-    /// fail to parse — the strict, corruption-reporting view is
-    /// [`Self::all_conflicts`].
+    /// Candidates still awaiting a resolution verb. Strict like
+    /// [`Self::all_conflicts`]: a record that fails to parse is an error,
+    /// not a skipped row — the audit surface is where corruption shows.
+    /// Briefings read through [`Self::open_conflicts_lenient`].
     pub fn open_conflicts(&self) -> Result<Vec<ConflictRecord>> {
+        self.conflicts_queue().list_open()
+    }
+
+    /// Open candidates, skipping records that fail to parse. For readers
+    /// that only want a count or a warning: one corrupt file must not fail
+    /// a briefing or hide the records that did parse.
+    pub fn open_conflicts_lenient(&self) -> Result<Vec<ConflictRecord>> {
         self.conflicts_queue().open_lenient()
     }
 
@@ -231,23 +247,42 @@ impl Gungnir {
     }
 
     /// Detect + record conflict candidates for `entry` across its scopes.
-    /// Detection runs after the write lands and can only add records — a
-    /// detection error surfaces to the caller but the entry stays written.
+    /// Detection runs after the write lands and can only add records, so a
+    /// failure is a warning the caller surfaces — never an error: returning
+    /// Err would report a completed write as failed and tempt a duplicate
+    /// retry (SPEC.md: the write still succeeds).
     fn scan_and_record(
         &self,
         home: &Store,
         entry: &Entry,
         embedder: Option<&dyn crate::embedding::Embedder>,
-    ) -> Result<Vec<ConflictRecord>> {
+    ) -> (Vec<ConflictRecord>, Vec<String>) {
         let queue = self.conflicts_queue();
         let mut records = Vec::new();
-        for (store, layer) in self.conflict_scopes(home)? {
-            for rec in conflicts::detect(&store, &layer, entry, embedder)? {
-                queue.record(&rec)?;
-                records.push(rec);
+        let mut warnings = Vec::new();
+        let scopes = match self.conflict_scopes(home) {
+            Ok(s) => s,
+            Err(e) => return (records, vec![format!("conflict detection skipped: {e}")]),
+        };
+        for (store, layer) in scopes {
+            let candidates = match conflicts::detect(&store, &layer, entry, embedder) {
+                Ok(c) => c,
+                Err(e) => {
+                    warnings.push(format!("conflict detection on {layer} failed: {e}"));
+                    continue;
+                }
+            };
+            for rec in candidates {
+                match queue.record(&rec) {
+                    Ok(()) => records.push(rec),
+                    Err(e) => warnings.push(format!(
+                        "conflict candidate {} could not be recorded: {e}",
+                        rec.id
+                    )),
+                }
             }
         }
-        Ok(records)
+        (records, warnings)
     }
 
     // -- writes --------------------------------------------------------------
@@ -286,10 +321,11 @@ impl Gungnir {
             }
         };
         store.create_with(&entry, &|id| self.exists_anywhere(id))?;
-        let conflicts = self.scan_and_record(&store, &entry, embedder)?;
+        let (conflicts, warnings) = self.scan_and_record(&store, &entry, embedder);
         Ok(WriteOutcome {
             id: entry.id,
             conflicts,
+            warnings,
         })
     }
 
@@ -522,6 +558,7 @@ impl Gungnir {
                 promoted,
                 already_ended: true,
                 conflicts: vec![],
+                warnings: vec![],
             });
         }
 
@@ -598,8 +635,11 @@ impl Gungnir {
         // were already scanned by the end that created them.
         let codex = self.codex()?;
         let mut conflicts = Vec::new();
+        let mut warnings = Vec::new();
         for c in &fresh {
-            conflicts.extend(self.scan_and_record(&codex, c, embedder)?);
+            let (records, w) = self.scan_and_record(&codex, c, embedder);
+            conflicts.extend(records);
+            warnings.extend(w);
         }
 
         Ok(EndReport {
@@ -607,6 +647,7 @@ impl Gungnir {
             promoted,
             already_ended: false,
             conflicts,
+            warnings,
         })
     }
 
@@ -706,7 +747,7 @@ impl Gungnir {
             .map(|h| h.entry.id)
             .collect();
         let open_conflicts = self
-            .open_conflicts()?
+            .open_conflicts_lenient()?
             .iter()
             .filter(|c| hit_ids.contains(&c.new_entry) || hit_ids.contains(&c.conflicting_entry))
             .count();
@@ -991,9 +1032,18 @@ impl Gungnir {
                         rec.conflicting_entry
                     )));
                 }
-                if entry.verification != (VerificationState::Contradicted { by: rec.new_entry }) {
-                    entry.contradict(rec.new_entry, actor, None);
-                    store.update_with(&entry, &|id| self.exists_anywhere(id))?;
+                match &entry.verification {
+                    VerificationState::Contradicted { by } if *by == rec.new_entry => {}
+                    VerificationState::Contradicted { by } => {
+                        return Err(Error::Invalid(format!(
+                            "{} is already contradicted by {by}; refusing to replace that refutation",
+                            rec.conflicting_entry
+                        )));
+                    }
+                    _ => {
+                        entry.contradict(rec.new_entry, actor, None);
+                        store.update_with(&entry, &|id| self.exists_anywhere(id))?;
+                    }
                 }
             }
             ConflictVerb::Dismiss => {}
@@ -1067,10 +1117,11 @@ impl Gungnir {
         next.evidence = evidence;
         next.body = body.into();
         store.create_with(&next, &|id| self.exists_anywhere(id))?;
-        let conflicts = self.scan_and_record(&store, &next, embedder)?;
+        let (conflicts, warnings) = self.scan_and_record(&store, &next, embedder);
         Ok(WriteOutcome {
             id: next.id,
             conflicts,
+            warnings,
         })
     }
 
@@ -1212,10 +1263,11 @@ impl Gungnir {
             c.review_of = Some(from);
         }
         codex.create_with(&c, &|id| self.exists_anywhere(id))?;
-        let conflicts = self.scan_and_record(&codex, &c, embedder)?;
+        let (conflicts, warnings) = self.scan_and_record(&codex, &c, embedder);
         Ok(WriteOutcome {
             id: c.id,
             conflicts,
+            warnings,
         })
     }
 
