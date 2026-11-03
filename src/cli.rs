@@ -42,6 +42,9 @@ enum Cmd {
         body: String,
         #[arg(long)]
         project: Option<String>,
+        /// The entry this review evaluates (required for --kind review)
+        #[arg(long)]
+        review_of: Option<EntryId>,
         /// Target layer: codex (default) or journal
         #[arg(long, default_value = "codex")]
         into: String,
@@ -80,6 +83,19 @@ enum Cmd {
         id: EntryId,
         #[arg(long, default_value = "human")]
         verifier: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// Mark an entry contradicted by another entry.
+    Contradict {
+        id: EntryId,
+        /// The entry that contradicts `id`
+        #[arg(long)]
+        by: EntryId,
+        #[arg(long, default_value = "human")]
+        verifier: String,
+        /// Free-text reason recorded in the verification log
         #[arg(long)]
         note: Option<String>,
     },
@@ -198,15 +214,30 @@ fn gng(root: &Option<PathBuf>) -> Result<Gungnir> {
     Gungnir::open(layout::resolve_root(root.clone()))
 }
 
-/// Rebuild a session handle from its persisted identity. The task text is
-/// not recoverable here; it only feeds briefing headers, which `brief`
-/// rebuilds from its own argument.
-fn session_handle(id: String, agent: String) -> crate::Session {
-    crate::Session {
+/// Rebuild a session handle from its persisted identity. `session start`
+/// writes `scratch/<id>/.session.yaml`, so a rebuilt handle recovers the
+/// real task text instead of archiving an empty `# Task`.
+fn session_handle(g: &Gungnir, id: String, agent: String) -> Result<crate::Session> {
+    if let Some(s) = g.load_session(&id)? {
+        return Ok(s);
+    }
+    Ok(crate::Session {
         id,
         agent,
         task: String::new(),
         started_at: chrono::Utc::now(),
+    })
+}
+
+/// Warn on stderr about files a read skipped, keeping stdout clean for
+/// pipelines.
+fn warn_skipped(skipped: &[crate::store::Skipped]) {
+    for s in skipped {
+        eprintln!(
+            "warning: skipped unreadable entry {}: {}",
+            s.path.display(),
+            s.error
+        );
     }
 }
 
@@ -218,7 +249,10 @@ fn dispatch(cli: Cli) -> Result<()> {
     use Cmd as C;
     let g = gng(&cli.root)?;
     match cli.cmd {
-        C::Init => println!("initialized {}", g.root().display()),
+        C::Init => {
+            g.init()?;
+            println!("initialized {}", g.root().display())
+        }
 
         C::Add {
             agent,
@@ -226,16 +260,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             summary,
             body,
             project,
+            review_of,
             into,
         } => {
             let mut e = crate::Entry::new(&agent, kind, summary);
             e.body = body;
             e.project_id = project;
+            e.review_of = review_of;
             let store = match layer_of(&into)? {
                 crate::layout::CODEX => g.codex()?,
                 _ => g.journal(&agent)?,
             };
-            store.create(&e)?;
+            // Cross-layer resolver so a journal review can cite a codex target.
+            store.create_with(&e, &|id| Ok(g.locate(id)?.is_some()))?;
             println!("{}", e.id);
         }
 
@@ -250,18 +287,19 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
 
         C::Ls { layer, agent } => {
-            let entries = match layer_of(&layer)? {
-                crate::layout::CODEX => g.codex()?.entries()?,
+            let scan = match layer_of(&layer)? {
+                crate::layout::CODEX => g.codex()?.scan()?,
                 _ => {
                     let a = agent
                         .as_deref()
                         .ok_or_else(|| Error::Invalid("ls journal requires --agent".into()))?;
-                    g.journal(a)?.entries()?
+                    g.journal(a)?.scan()?
                 }
             };
-            for e in entries {
+            for e in &scan.entries {
                 println!("{}  {}\t{}\t{}", e.id, e.kind, e.summary, e.agent);
             }
+            warn_skipped(&scan.skipped);
         }
 
         C::Recall {
@@ -291,23 +329,40 @@ fn dispatch(cli: Cli) -> Result<()> {
             for h in &out.hits {
                 println!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary);
             }
-            if out.hits.is_empty() && out.coverage.total_visible() == 0 {
-                println!("(no knowledge covers this topic)");
-            } else {
-                println!(
-                    "coverage: {} verified, {} unverified, {} contradicted ({} superseded, {} rolled back hidden)",
-                    out.coverage.verified,
-                    out.coverage.unverified,
-                    out.coverage.contradicted,
-                    out.coverage.hidden_superseded,
-                    out.coverage.hidden_rolled_back
-                );
+            if out.hits.is_empty() {
+                let hidden = out.coverage.hidden_superseded + out.coverage.hidden_rolled_back;
+                if out.coverage.total == 0 {
+                    println!("(no knowledge on file)");
+                } else if out.coverage.total_visible() == 0 && hidden > 0 {
+                    println!("(no live knowledge covers this topic; {hidden} superseded or rolled back hidden)");
+                } else {
+                    println!("(no knowledge matched this topic)");
+                }
             }
+            println!(
+                "coverage: {} verified, {} unverified, {} contradicted ({} superseded, {} rolled back hidden)",
+                out.coverage.verified,
+                out.coverage.unverified,
+                out.coverage.contradicted,
+                out.coverage.hidden_superseded,
+                out.coverage.hidden_rolled_back
+            );
+            warn_skipped(&out.skipped);
         }
 
         C::Verify { id, verifier, note } => {
             g.verify(id, &verifier, note)?;
             println!("verified {id}");
+        }
+
+        C::Contradict {
+            id,
+            by,
+            verifier,
+            note,
+        } => {
+            g.contradict(id, by, &verifier, note)?;
+            println!("contradicted {id} by {by}");
         }
 
         C::Supersede {
@@ -339,6 +394,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         C::Brief { agent, task, limit } => {
             let b = g.brief(&agent, &task, limit)?;
             print!("{}", b.markdown);
+            warn_skipped(&b.skipped);
         }
 
         C::Stats { agent, json } => {
@@ -356,7 +412,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 println!("superseded         {}", r.superseded);
                 println!("stale (>30d)       {}", r.stale_over_30d);
                 println!("verification rate  {:.0}%", r.verification_rate * 100.0);
+                println!("skipped (unparseable) {}", r.skipped.len());
             }
+            warn_skipped(&r.skipped);
         }
 
         C::Mcp => {
@@ -368,7 +426,7 @@ fn dispatch(cli: Cli) -> Result<()> {
 
         C::Session { cmd } => match cmd {
             SessionCmd::Start { agent, task } => {
-                let s = g.start_session(agent, task);
+                let s = g.start_session(agent, task)?;
                 println!("{}", s.id);
             }
             SessionCmd::Obs {
@@ -376,7 +434,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 agent,
                 text,
             } => {
-                let s = session_handle(session_id, agent);
+                let s = session_handle(&g, session_id, agent)?;
                 let id = g.add_observation(&s, text)?;
                 println!("{id}");
             }
@@ -386,7 +444,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 text,
                 succeeded,
             } => {
-                let s = session_handle(session_id, agent);
+                let s = session_handle(&g, session_id, agent)?;
                 let id = g.add_attempt(&s, text, succeeded)?;
                 println!("{id}");
             }
@@ -395,9 +453,13 @@ fn dispatch(cli: Cli) -> Result<()> {
                 agent,
                 summary,
             } => {
-                let s = session_handle(session_id, agent);
+                let s = session_handle(&g, session_id, agent)?;
                 let report = g.end_session(&s, summary, vec![])?;
-                println!("archived {}", report.journal_id);
+                if report.already_ended {
+                    println!("already ended (archive {})", report.journal_id);
+                } else {
+                    println!("archived {}", report.journal_id);
+                }
             }
         },
     }

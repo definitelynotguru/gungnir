@@ -4,6 +4,56 @@ All notable changes to Gungnir are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`contradict` on every surface.** New CLI subcommand
+  `gungnir contradict <id> --by <id> [--verifier] [--note]` and matching MCP
+  tool. `VerificationState::Contradicted` was previously unreachable outside
+  the Rust API; the coverage counts and briefing warnings it feeds are now
+  load-bearing.
+- **`add --review-of <id>`** so `--kind review` entries can name their
+  target from the CLI. Promoting with `kind=review` sets `review_of` to the
+  source entry.
+- **`Entry.outcome: bool`** for attempts. Session archives still render the
+  `[succeeded]`/`[failed]` marker, now from a structured field instead of
+  re-parsing the `outcome:` body line (which remains as legacy fallback).
+- **Read resilience.** `Store::scan()` returns every parseable entry plus a
+  `skipped` list of ULID-named files that failed to parse (torn writes, git
+  conflict markers, hand edits). Recall, list, briefing, and stats report
+  skips — stderr on the CLI, notes in MCP text results — instead of one
+  corrupt file aborting the whole layer.
+- **`Coverage.total`**: the count of entries in scope, so surfaces can
+  distinguish "nothing exists" from "entries exist but none matched".
+- **Session identity persistence.** `start_session` writes
+  `scratch/<id>/.session.yaml`, so `end_session` archives the real task
+  text even when the ending process only knows the session id.
+
+### Fixed
+
+- **`end_session` is idempotent.** Re-ending an archived session reports
+  `already_ended` rather than writing a second journal entry; a crash
+  between the journal write and scratch cleanup converges on retry.
+- **Reads never create directories.** `Store::open` no longer mkdirs;
+  `stats --agent nobody` no longer leaves `journal/nobody/` behind.
+  `Gungnir::open` is read-only; `gungnir init` lays out the store.
+- **Honest abstention.** The CLI verdict distinguishes "no knowledge on
+  file", "no knowledge matched this topic", and "no live knowledge (hidden
+  only)"; the coverage line is no longer suppressed when only hidden
+  matches exist. Briefings say "Entries matched ... but none are verified"
+  vs "No knowledge matched this task".
+- **`supersede` carries evidence forward** instead of dropping the parent's
+  evidence refs.
+- **`promote` requires a journal source** — a codex source would cite its
+  own layer, a scratch source would dangle when the session ends.
+- **Typed `VerificationRecord.status`.** A typo'd log status now fails
+  deserialization (and is reported by skip-and-report reads) instead of
+  silently downgrading the entry to unverified under `as_of`.
+- **Length caps count chars, not bytes**, matching SPEC.md's "≤ 200 chars".
+- **Rollback validates evidence refs cross-layer**, like `verify` already
+  did — necessary now that revisions carry evidence.
+
 ## [0.2.0] - 2026-08-26
 
 ### Added

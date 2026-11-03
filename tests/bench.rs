@@ -36,7 +36,9 @@ fn build() -> Corpus {
     let codex = g.codex().unwrap();
 
     // Session 1: failure.
-    let s1 = g.start_session("builder", "fix slow checkout query");
+    let s1 = g
+        .start_session("builder", "fix slow checkout query")
+        .unwrap();
     g.add_observation(&s1, "EXPLAIN shows seq scan on orders_archive")
         .unwrap();
     g.add_attempt(&s1, "added index on orders.user_id", false)
@@ -45,7 +47,9 @@ fn build() -> Corpus {
         .unwrap();
 
     // Session 2: success, promoted into the Codex with provenance.
-    let s2 = g.start_session("builder", "rewrite checkout query");
+    let s2 = g
+        .start_session("builder", "rewrite checkout query")
+        .unwrap();
     g.add_attempt(&s2, "rewrote query to use orders_archive_idx", true)
         .unwrap();
     let report = g
@@ -92,7 +96,9 @@ fn build() -> Corpus {
     codex.update_with(&rolled, &|id| codex.exists(id)).unwrap();
 
     // Another agent's private journal must never leak into briefings.
-    let s3 = g.start_session("scout", "investigate deploy timeouts");
+    let s3 = g
+        .start_session("scout", "investigate deploy timeouts")
+        .unwrap();
     g.add_observation(&s3, "deploy pipeline timeout in github actions runners")
         .unwrap();
     g.end_session(&s3, "runner timeouts documented", vec![])
@@ -335,12 +341,12 @@ fn abstention(c: &Corpus) -> Score {
     );
 
     // Unverified-only topic: facts exist, but the briefing says plainly that
-    // none are verified instead of staying silent about it.
+    // none are verified instead of staying silent about it. This corpus has
+    // nothing matching "cache tuning", so the verdict names the miss.
     let b = c.g.brief("builder", "cache tuning internals", 8).unwrap();
     s.check(
-        "abstention line when zero verified match",
-        b.markdown
-            .contains("No verified knowledge covers this task"),
+        "abstention line when nothing matched",
+        b.markdown.contains("No knowledge matched this task"),
     );
 
     s

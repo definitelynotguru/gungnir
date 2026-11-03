@@ -16,12 +16,15 @@ use crate::id::EntryId;
 use crate::layout::{self, CODEX, JOURNAL, SCRATCH};
 use crate::recall::{self, Hit, Query, SearchOutcome};
 use crate::rollback;
+use crate::store::Skipped;
 use crate::validate::MAX_SUMMARY_LEN;
 use crate::{Error, Result, Store};
 
-/// One open working session. Cheap value; nothing hits disk until the first
-/// observation lands.
-#[derive(Clone, Debug)]
+/// One open working session. Identity (`agent`, `task`, `started_at`) is
+/// persisted to `scratch/<id>/.session.yaml` at start so a session rebuilt
+/// from its id — after a CLI call boundary or an MCP restart — still knows
+/// its task.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub id: String,
     pub agent: String,
@@ -41,6 +44,8 @@ pub struct Promotion {
 pub struct EndReport {
     pub journal_id: EntryId,
     pub promoted: Vec<EntryId>,
+    /// The session had already been archived: this end was a no-op.
+    pub already_ended: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -66,15 +71,25 @@ pub struct StatsReport {
     pub stale_over_30d: usize,
     /// verified / (verified + unverified + contradicted), 0.0 when empty.
     pub verification_rate: f64,
+    /// ULID-named files that failed to parse and were skipped.
+    pub skipped: Vec<Skipped>,
 }
 
 impl Gungnir {
+    /// Open a facade rooted at `root`. Creates nothing: `gungnir init`
+    /// lays out the layer directories and the write path creates them
+    /// lazily, so read commands never touch the filesystem.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        for sub in [CODEX, JOURNAL, SCRATCH] {
-            std::fs::create_dir_all(root.join(sub))?;
-        }
         Ok(Self { root })
+    }
+
+    /// Create the layer directories for a fresh store (`gungnir init`).
+    pub fn init(&self) -> Result<()> {
+        for sub in [CODEX, JOURNAL, SCRATCH] {
+            std::fs::create_dir_all(self.root.join(sub))?;
+        }
+        Ok(())
     }
 
     /// Resolve from env / home default.
@@ -108,13 +123,68 @@ impl Gungnir {
 
     // -- session lifecycle ---------------------------------------------------
 
-    pub fn start_session(&self, agent: impl Into<String>, task: impl Into<String>) -> Session {
-        Session {
+    /// Begin a session, persisting its identity to scratch so the task text
+    /// survives across process boundaries (CLI `session` calls, MCP restarts).
+    pub fn start_session(
+        &self,
+        agent: impl Into<String>,
+        task: impl Into<String>,
+    ) -> Result<Session> {
+        let s = Session {
             id: EntryId::generate().to_string(),
             agent: agent.into(),
             task: task.into(),
             started_at: Utc::now(),
+        };
+        self.persist_session(&s)?;
+        Ok(s)
+    }
+
+    fn session_dir(&self, session_id: &str) -> PathBuf {
+        self.root
+            .join(SCRATCH)
+            .join(layout::sanitize_component(session_id))
+    }
+
+    fn session_meta_path(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join(".session.yaml")
+    }
+
+    /// Write the session's identity file. Skipped silently when it already
+    /// exists, so a session reconstructed with an empty task never clobbers
+    /// the real one.
+    fn persist_session(&self, session: &Session) -> Result<()> {
+        let path = self.session_meta_path(&session.id);
+        if path.exists() {
+            return Ok(());
         }
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let yaml = serde_yaml::to_string(session)
+            .map_err(|e| Error::Invalid(format!("cannot serialize session {}: {e}", session.id)))?;
+        std::fs::write(&path, yaml)?;
+        Ok(())
+    }
+
+    /// Load a persisted session, if `start_session` wrote one.
+    pub fn load_session(&self, session_id: &str) -> Result<Option<Session>> {
+        let path = self.session_meta_path(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        serde_yaml::from_str(&raw)
+            .map(Some)
+            .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))
+    }
+
+    /// The journal archive a session was ended into, if it was.
+    fn find_archive(&self, agent: &str, session_id: &str) -> Result<Option<EntryId>> {
+        for e in self.journal(agent)?.entries()? {
+            if e.kind == EntryKind::Session && e.session_id.as_deref() == Some(session_id) {
+                return Ok(Some(e.id));
+            }
+        }
+        Ok(None)
     }
 
     pub fn add_observation(&self, session: &Session, text: impl Into<String>) -> Result<EntryId> {
@@ -137,8 +207,10 @@ impl Gungnir {
         text: String,
         outcome: Option<bool>,
     ) -> Result<EntryId> {
+        self.persist_session(session)?;
         let mut entry = Entry::new(&session.agent, kind, summarize(&text));
         entry.session_id = Some(session.id.clone());
+        entry.outcome = outcome;
         entry.body = match outcome {
             Some(ok) => format!(
                 "outcome: {}\n\n{}",
@@ -152,9 +224,9 @@ impl Gungnir {
     }
 
     /// Archive the session into the Journal, promote findings into the Codex,
-    /// then clear the scratch directory. Idempotent-friendly: re-ending an
-    /// already-ended session errors on the missing scratch dir only after
-    /// the journal write succeeded, so callers can safely retry promotion.
+    /// then clear the scratch directory. Re-ending an already-archived
+    /// session is a no-op that reports `already_ended` instead of writing a
+    /// second journal entry.
     pub fn end_session(
         &self,
         session: &Session,
@@ -162,23 +234,66 @@ impl Gungnir {
         promotions: Vec<Promotion>,
     ) -> Result<EndReport> {
         let summary = summary.as_ref();
-        let scratch = self.scratch(&session.id)?;
-        let mut transcript = String::new();
-        for e in scratch.entries()? {
-            let outcome = if e.body.starts_with("outcome: ") {
-                format!(
-                    " [{}]",
-                    e.body["outcome: ".len()..].lines().next().unwrap_or("")
-                )
-            } else {
-                String::new()
+        let dir = self.session_dir(&session.id);
+        let scratch_exists = dir.exists();
+        let archive = self.find_archive(&session.agent, &session.id)?;
+        if archive.is_some() || !scratch_exists {
+            let Some(archive) = archive else {
+                return Err(Error::Invalid(format!(
+                    "session {} has no scratch or journal archive",
+                    session.id
+                )));
             };
+            // A crashed end can leave scratch behind; converge by clearing it.
+            if scratch_exists {
+                std::fs::remove_dir_all(&dir)?;
+            }
+            return Ok(EndReport {
+                journal_id: archive,
+                promoted: vec![],
+                already_ended: true,
+            });
+        }
+
+        let scratch = self.scratch(&session.id)?;
+        let scan = scratch.scan()?;
+        if let Some(bad) = scan.skipped.first() {
+            return Err(Error::Invalid(format!(
+                "session {} has unreadable scratch entry {}: {}",
+                session.id,
+                bad.path.display(),
+                bad.error
+            )));
+        }
+
+        let mut transcript = String::new();
+        for e in &scan.entries {
+            // Prefer the structured field; fall back to the legacy
+            // `outcome:` body line written by older versions.
+            let outcome = e
+                .outcome
+                .map(|ok| format!(" [{}]", if ok { "succeeded" } else { "failed" }))
+                .or_else(|| {
+                    e.body
+                        .strip_prefix("outcome: ")
+                        .and_then(|rest| rest.lines().next())
+                        .map(|w| format!(" [{w}]"))
+                })
+                .unwrap_or_default();
             transcript.push_str(&format!("- {}: {}{}\n", e.kind, e.summary, outcome));
         }
 
+        // The persisted task wins over whatever a rebuilt handle claims;
+        // fall back to the handle for pre-meta sessions.
+        let task = self
+            .load_session(&session.id)?
+            .map(|s| s.task)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| session.task.clone());
+
         let mut journal_entry = Entry::new(&session.agent, EntryKind::Session, summary);
         journal_entry.session_id = Some(session.id.clone());
-        journal_entry.body = format!("# Task\n{}\n\n# Transcript\n{}", session.task, transcript);
+        journal_entry.body = format!("# Task\n{task}\n\n# Transcript\n{transcript}");
         let journal_store = self.journal(&session.agent)?;
         journal_store.create(&journal_entry)?;
 
@@ -195,17 +310,12 @@ impl Gungnir {
             promoted_ids.push(c.id);
         }
 
-        let dir = self
-            .root
-            .join(SCRATCH)
-            .join(layout::sanitize_component(&session.id));
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
-        }
+        std::fs::remove_dir_all(&dir)?;
 
         Ok(EndReport {
             journal_id: journal_entry.id,
             promoted: promoted_ids,
+            already_ended: false,
         })
     }
 
@@ -229,6 +339,8 @@ impl Gungnir {
             journal_superseded: superseded_ids(&journal)?,
             codex_coverage: codex_out.coverage,
             journal_coverage: journal_out.coverage,
+            codex_skipped: codex_out.skipped,
+            journal_skipped: journal_out.skipped,
         }))
     }
 
@@ -264,17 +376,25 @@ impl Gungnir {
         store.update_with(&entry, &|id| self.exists_anywhere(id))
     }
 
-    pub fn contradict(&self, id: EntryId, by: EntryId, verifier: &str) -> Result<()> {
+    pub fn contradict(
+        &self,
+        id: EntryId,
+        by: EntryId,
+        verifier: &str,
+        note: Option<String>,
+    ) -> Result<()> {
         let store = self.locate(id)?.ok_or(Error::NotFound(id))?;
         if !self.exists_anywhere(by)? {
             return Err(Error::NotFound(by));
         }
         let mut entry = store.require(id)?;
-        entry.contradict(by, verifier);
+        entry.contradict(by, verifier, note);
         store.update_with(&entry, &|id| self.exists_anywhere(id))
     }
 
-    /// Write a revision of `old`: same kind and project, linked by `revises`.
+    /// Write a revision of `old`: same kind, project, and evidence, linked
+    /// by `revises`. The parent's evidence carries forward — a revision of
+    /// a fact still stands on the record that proved it.
     pub fn supersede(
         &self,
         old: EntryId,
@@ -288,6 +408,7 @@ impl Gungnir {
         next.revises = Some(old);
         next.project_id = prev.project_id.clone();
         next.session_id = prev.session_id.clone();
+        next.evidence = prev.evidence.clone();
         next.body = body.into();
         store.create_with(&next, &|id| self.exists_anywhere(id))?;
         Ok(next.id)
@@ -295,7 +416,7 @@ impl Gungnir {
 
     pub fn rollback(&self, target: EntryId, agent: &str) -> Result<EntryId> {
         let store = self.locate(target)?.ok_or(Error::NotFound(target))?;
-        rollback::rollback(&store, target, agent)
+        rollback::rollback(&store, target, agent, &|id| self.exists_anywhere(id))
     }
 
     /// Memory health across all layers. `agent` scopes the journal count;
@@ -312,18 +433,21 @@ impl Gungnir {
             superseded: 0,
             stale_over_30d: 0,
             verification_rate: 0.0,
+            skipped: vec![],
         };
 
         let mut all: Vec<Entry> = Vec::new();
-        let codex_entries = self.codex()?.entries()?;
-        r.codex_entries = codex_entries.len();
-        r.superseded = codex_entries
+        let codex_scan = self.codex()?.scan()?;
+        r.codex_entries = codex_scan.entries.len();
+        r.superseded = codex_scan
+            .entries
             .iter()
             .filter(supersedes)
             .filter_map(|e| e.revises)
             .collect::<HashSet<_>>()
             .len();
-        all.extend(codex_entries);
+        all.extend(codex_scan.entries);
+        r.skipped.extend(codex_scan.skipped);
 
         let journal_base = self.root.join(JOURNAL);
         let agents: Vec<_> = match agent {
@@ -331,18 +455,20 @@ impl Gungnir {
             None => layer_child_names(&journal_base)?,
         };
         for a in agents {
-            let entries = Store::open(journal_base.join(a))?.entries()?;
-            r.journal_entries += entries.len();
-            all.extend(entries);
+            let scan = Store::open(journal_base.join(a))?.scan()?;
+            r.journal_entries += scan.entries.len();
+            all.extend(scan.entries);
+            r.skipped.extend(scan.skipped);
         }
 
         let scratch_base = self.root.join(SCRATCH);
         for sess in layer_child_names(&scratch_base)? {
-            let entries = Store::open(scratch_base.join(&sess))?.entries()?;
-            if !entries.is_empty() {
+            let scan = Store::open(scratch_base.join(&sess))?.scan()?;
+            if !scan.entries.is_empty() {
                 r.scratch_sessions += 1;
             }
-            all.extend(entries);
+            all.extend(scan.entries);
+            r.skipped.extend(scan.skipped);
         }
 
         use chrono::Utc;
@@ -370,9 +496,10 @@ impl Gungnir {
         Ok(r)
     }
 
-    /// Promote an existing entry's finding into the Codex with a provenance
-    /// link back to `from`. Works across layers (e.g. Journal archive as
-    /// evidence for a Codex fact).
+    /// Promote a Journal entry's finding into the Codex with a provenance
+    /// link back to `from`. Sources must live in the Journal: a Codex
+    /// source would cite its own layer, and a Scratch source would cite a
+    /// file that `end_session` deletes.
     pub fn promote(
         &self,
         from: EntryId,
@@ -381,13 +508,19 @@ impl Gungnir {
         summary: impl Into<String>,
         body: impl Into<String>,
     ) -> Result<EntryId> {
-        if self.locate(from)?.is_none() {
-            return Err(Error::NotFound(from));
+        let store = self.locate(from)?.ok_or(Error::NotFound(from))?;
+        if !store.root().starts_with(self.root.join(JOURNAL)) {
+            return Err(Error::Invalid(format!(
+                "promote sources must be journal entries; {from} is not under journal/"
+            )));
         }
         let codex = self.codex()?;
         let mut c = Entry::new(agent, kind, summary);
         c.body = body.into();
         c.evidence.push(Evidence::Ref { id: from });
+        if kind == EntryKind::Review {
+            c.review_of = Some(from);
+        }
         codex.create_with(&c, &|id| self.exists_anywhere(id))?;
         Ok(c.id)
     }
@@ -493,7 +626,9 @@ mod tests {
     #[test]
     fn full_session_flow_archives_promotes_and_clears_scratch() {
         let (_d, g) = gng();
-        let s = g.start_session("builder", "fix slow checkout query");
+        let s = g
+            .start_session("builder", "fix slow checkout query")
+            .unwrap();
         g.add_observation(&s, "EXPLAIN shows seq scan on orders_archive")
             .unwrap();
         g.add_attempt(&s, "added index on orders.user_id", false)
@@ -544,13 +679,13 @@ mod tests {
         let (_d, g) = gng();
 
         // Another agent's failure must NOT appear in builder's briefing.
-        let other = g.start_session("scout", "checkout perf");
+        let other = g.start_session("scout", "checkout perf").unwrap();
         g.add_attempt(&other, "tried vacuum full on orders", false)
             .unwrap();
         g.end_session(&other, "vacuum did not help", vec![])
             .unwrap();
 
-        let mine = g.start_session("builder", "fix slow checkout");
+        let mine = g.start_session("builder", "fix slow checkout").unwrap();
         g.add_attempt(&mine, "added checkout cache", true).unwrap();
         g.end_session(&mine, "cache helped", vec![]).unwrap();
 
@@ -599,7 +734,7 @@ mod tests {
         // against one store only, so verifying a Codex entry whose evidence
         // cites its Journal archive failed.
         let (_d, g) = gng();
-        let s = g.start_session("builder", "tune cache");
+        let s = g.start_session("builder", "tune cache").unwrap();
         g.add_observation(&s, "cache hit rate 12%").unwrap();
         let report = g.end_session(&s, "raised hit rate", vec![]).unwrap();
 
@@ -624,7 +759,7 @@ mod tests {
     #[test]
     fn stats_reports_layer_counts_and_health() {
         let (_d, g) = gng();
-        let s = g.start_session("builder", "tune checkout");
+        let s = g.start_session("builder", "tune checkout").unwrap();
         g.add_observation(&s, "hit rate low").unwrap();
         let report = g
             .end_session(
@@ -682,7 +817,7 @@ mod tests {
         j2.revises = Some(j1.id);
         journal.create(&j2).unwrap();
 
-        let s = g.start_session("builder", "open work");
+        let s = g.start_session("builder", "open work").unwrap();
         g.add_observation(&s, "scratch note about checkout")
             .unwrap();
 

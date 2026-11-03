@@ -11,7 +11,8 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::entry::{Entry, EntryKind, VerificationState};
+use crate::entry::{Entry, EntryKind, RecordStatus, VerificationState};
+use crate::store::Skipped;
 use crate::{Result, Store};
 
 #[derive(Clone, Debug)]
@@ -61,6 +62,10 @@ pub struct Coverage {
     /// Chain tails excluded by `current_only`.
     pub hidden_superseded: usize,
     pub hidden_rolled_back: usize,
+    /// Every non-rolled-back entry in scope (after the `as_of` filter),
+    /// matched or not. Distinguishes "the layer is empty" from "entries
+    /// exist but none matched the topic".
+    pub total: usize,
 }
 
 impl Coverage {
@@ -73,6 +78,8 @@ impl Coverage {
 pub struct SearchOutcome {
     pub hits: Vec<Hit>,
     pub coverage: Coverage,
+    /// ULID-named files that failed to parse and were skipped.
+    pub skipped: Vec<Skipped>,
 }
 
 const STOPWORDS: &[&str] = &[
@@ -123,11 +130,11 @@ fn state_at(entry: &Entry, as_of: Option<DateTime<Utc>>) -> StateAt {
         .iter()
         .filter(|r| r.timestamp <= cutoff)
         .max_by_key(|r| r.timestamp)
-        .map(|r| match r.status.as_str() {
-            crate::entry::STATUS_VERIFIED => StateAt::Verified,
-            crate::entry::STATUS_CONTRADICTED => StateAt::Contradicted,
-            crate::entry::STATUS_ROLLED_BACK => StateAt::RolledBack,
-            _ => StateAt::Unverified,
+        .map(|r| match r.status {
+            RecordStatus::Verified => StateAt::Verified,
+            RecordStatus::Contradicted => StateAt::Contradicted,
+            RecordStatus::RolledBack => StateAt::RolledBack,
+            RecordStatus::Unverified => StateAt::Unverified,
         })
         .unwrap_or(StateAt::Unverified)
 }
@@ -177,12 +184,14 @@ pub fn search_with_coverage(store: &Store, query: &Query) -> Result<SearchOutcom
     // leaves A visible next to C.
     let mut revised: std::collections::HashSet<EntryId> = std::collections::HashSet::new();
 
-    for entry in store.entries()? {
+    let scan = store.scan()?;
+    for entry in scan.entries {
         if let Some(cutoff) = query.as_of {
             if entry.timestamp > cutoff {
                 continue;
             }
         }
+        coverage.total += 1;
         let state = state_at(&entry, query.as_of);
         // A rolled-back head must not hide its predecessor. Current view
         // should fall back to the last live revision. A rollback record's
@@ -240,7 +249,11 @@ pub fn search_with_coverage(store: &Store, query: &Query) -> Result<SearchOutcom
         .map(|(entry, score, _)| Hit { entry, score })
         .collect();
 
-    Ok(SearchOutcome { hits, coverage })
+    Ok(SearchOutcome {
+        hits,
+        coverage,
+        skipped: scan.skipped,
+    })
 }
 
 /// Search, best hits first. Entries with zero overlap are dropped.
@@ -298,12 +311,15 @@ mod tests {
     }
 
     #[test]
-    fn no_overlap_yields_no_hits_and_zero_coverage() {
+    fn no_overlap_yields_no_hits_and_zero_matched_coverage() {
         let e = Entry::new("a", EntryKind::Decision, "kubernetes ingress");
         let (_d, store) = store_with(vec![e]);
         let out = search_with_coverage(&store, &Query::new("quantum entanglement", 5)).unwrap();
         assert!(out.hits.is_empty());
-        assert_eq!(out.coverage, Coverage::default());
+        assert_eq!(out.coverage.total_visible(), 0);
+        // The entry exists but did not match: total counts the scanned
+        // corpus so callers can say "nothing matched" honestly.
+        assert_eq!(out.coverage.total, 1);
     }
 
     #[test]
@@ -411,7 +427,7 @@ mod tests {
         let counter = Entry::new("a", EntryKind::Observation, "counter evidence checkout");
         store.create(&counter).unwrap();
         let mut contradicted = Entry::new("a", EntryKind::Observation, "checkout contradicted");
-        contradicted.contradict(counter.id, "ops");
+        contradicted.contradict(counter.id, "ops", None);
         store.create(&contradicted).unwrap();
         let extra = Entry::new("a", EntryKind::Decision, "checkout extra verified");
         let mut extra = extra;
@@ -427,11 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_stopword_query_yields_zero_coverage() {
+    fn empty_and_stopword_query_yields_zero_matched_coverage() {
         let e = Entry::new("a", EntryKind::Decision, "the checkout query");
         let (_d, store) = store_with(vec![e]);
         let out = search_with_coverage(&store, &Query::new("the and", 10)).unwrap();
         assert!(out.hits.is_empty());
-        assert_eq!(out.coverage, Coverage::default());
+        assert_eq!(out.coverage.total_visible(), 0);
+        assert_eq!(out.coverage.total, 1);
     }
 }

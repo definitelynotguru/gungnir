@@ -88,16 +88,24 @@ impl std::str::FromStr for EntryKind {
     }
 }
 
-pub const STATUS_VERIFIED: &str = "verified";
-pub const STATUS_CONTRADICTED: &str = "contradicted";
-pub const STATUS_ROLLED_BACK: &str = "rolled_back";
+/// The status a [`VerificationRecord`] asserts. Typed so a misspelled log
+/// entry fails to parse instead of silently downgrading a verified fact.
+/// Serializes to the same snake_case strings the log has always used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordStatus {
+    Unverified,
+    Verified,
+    Contradicted,
+    RolledBack,
+}
 
 /// An appended record tracking who verified/contradicted/rolled back, when.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationRecord {
     pub verifier: String,
     pub timestamp: DateTime<Utc>,
-    pub status: String,
+    pub status: RecordStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -131,6 +139,11 @@ pub struct Entry {
     pub evidence: Vec<Evidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_tool: Option<String>,
+    /// Whether an `attempt` entry succeeded. Structured so session archives
+    /// and stats don't re-parse a magic prefix out of the body. Older files
+    /// carry the outcome as a `outcome: ...` body line instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<bool>,
     #[serde(skip)]
     pub body: String,
 }
@@ -154,6 +167,7 @@ impl Entry {
             verification_log: Vec::new(),
             evidence: Vec::new(),
             source_tool: None,
+            outcome: None,
             body: String::new(),
         }
     }
@@ -165,19 +179,19 @@ impl Entry {
         self.verification_log.push(VerificationRecord {
             verifier: verifier.into(),
             timestamp: Utc::now(),
-            status: STATUS_VERIFIED.into(),
+            status: RecordStatus::Verified,
             note,
         });
     }
 
     /// Mark contradicted by an existing entry, appending a log record.
-    pub fn contradict(&mut self, by: EntryId, verifier: impl Into<String>) {
+    pub fn contradict(&mut self, by: EntryId, verifier: impl Into<String>, note: Option<String>) {
         self.verification = VerificationState::Contradicted { by };
         self.verification_log.push(VerificationRecord {
             verifier: verifier.into(),
             timestamp: Utc::now(),
-            status: STATUS_CONTRADICTED.into(),
-            note: None,
+            status: RecordStatus::Contradicted,
+            note,
         });
     }
 
@@ -187,7 +201,7 @@ impl Entry {
         self.verification_log.push(VerificationRecord {
             verifier: verifier.into(),
             timestamp: Utc::now(),
-            status: STATUS_ROLLED_BACK.into(),
+            status: RecordStatus::RolledBack,
             note: None,
         });
     }
@@ -209,7 +223,18 @@ mod tests {
         e.verify("human-review", Some("confirmed".into()));
         assert_eq!(e.verification, VerificationState::Verified);
         assert_eq!(e.verification_log.len(), 1);
-        assert_eq!(e.verification_log[0].status, "verified");
+        assert_eq!(e.verification_log[0].status, RecordStatus::Verified);
+    }
+
+    #[test]
+    fn log_status_parses_known_spellings_and_rejects_typos() {
+        for status in ["unverified", "verified", "contradicted", "rolled_back"] {
+            let yaml = format!("verifier: ci\ntimestamp: 2026-01-01T00:00:00Z\nstatus: {status}\n");
+            serde_yaml::from_str::<VerificationRecord>(&yaml)
+                .unwrap_or_else(|e| panic!("{status} should parse: {e}"));
+        }
+        let yaml = "verifier: ci\ntimestamp: 2026-01-01T00:00:00Z\nstatus: verrified\n";
+        assert!(serde_yaml::from_str::<VerificationRecord>(yaml).is_err());
     }
 
     #[test]

@@ -20,10 +20,10 @@ pub type Exists<'a> = &'a dyn Fn(EntryId) -> Result<bool>;
 /// Used for both creates and updates; the store distinguishes them by
 /// checking id presence before calling here.
 pub fn validate_entry(entry: &Entry, exists: Exists<'_>) -> Result<()> {
-    if entry.summary.len() > MAX_SUMMARY_LEN {
+    if entry.summary.chars().count() > MAX_SUMMARY_LEN {
         return Err(crate::Error::Invalid(format!(
             "summary is {} chars; cap is {MAX_SUMMARY_LEN}",
-            entry.summary.len()
+            entry.summary.chars().count()
         )));
     }
 
@@ -60,10 +60,10 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>) -> Result<()> {
     for ev in &entry.evidence {
         match ev {
             Evidence::File { excerpt, .. } => {
-                if excerpt.len() > MAX_EXCERPT_LEN {
+                if excerpt.chars().count() > MAX_EXCERPT_LEN {
                     return Err(crate::Error::Invalid(format!(
                         "evidence excerpt is {} chars; cap is {MAX_EXCERPT_LEN}",
-                        excerpt.len()
+                        excerpt.chars().count()
                     )));
                 }
             }

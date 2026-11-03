@@ -26,6 +26,24 @@ const TMP_PREFIX: &str = ".tmp-";
 /// How long an orphaned temp file must be before the startup sweep removes it.
 const TMP_STALE_AFTER: Duration = Duration::from_secs(60);
 
+/// A file that looks like an entry (ULID-named `.md`) but failed to parse.
+/// Reads skip and report it; the write path still fails hard on the entry
+/// being written.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Skipped {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Result of scanning a layer: every parseable entry plus the files that
+/// were skipped. Corruption (torn writes, git conflict markers, hand edits)
+/// must not abort every read in the layer.
+#[derive(Clone, Debug, Default)]
+pub struct Scan {
+    pub entries: Vec<Entry>,
+    pub skipped: Vec<Skipped>,
+}
+
 /// An open store rooted at a directory.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -33,11 +51,10 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (creating if needed) the store at `root`.
+    /// Open the store at `root`. Read paths never create directories; the
+    /// root is created lazily by the write path ([`Store::lock`]).
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
-        fs::create_dir_all(&root)?;
-        let store = Self { root };
+        let store = Self { root: root.into() };
         store.sweep_stale_temps()?;
         Ok(store)
     }
@@ -111,9 +128,23 @@ impl Store {
         self.get(id)?.ok_or(Error::NotFound(id))
     }
 
-    /// All entries, oldest first (ULID order ≈ chronological).
+    /// All parseable entries, oldest first (ULID order ≈ chronological).
+    /// For skipped-file reporting use [`Store::scan`].
     pub fn entries(&self) -> Result<Vec<Entry>> {
-        let mut ids: Vec<EntryId> = Vec::new();
+        Ok(self.scan()?.entries)
+    }
+
+    /// All entries plus the ULID-named files that failed to parse. One
+    /// corrupt file (git conflict markers, a torn write) no longer aborts
+    /// every read in the layer — it lands in `skipped` instead.
+    pub fn scan(&self) -> Result<Scan> {
+        let mut scan = Scan::default();
+        if !self.root.exists() {
+            return Ok(scan);
+        }
+        // Parse the file where it was found rather than via path_for(id):
+        // a file in the wrong shard dir must be reported, not vanish.
+        let mut paths: Vec<(EntryId, PathBuf)> = Vec::new();
         for dent in walkdir::WalkDir::new(&self.root)
             .into_iter()
             .filter_entry(|e| e.file_name() != ".cache" && e.file_name() != ".lock")
@@ -131,12 +162,25 @@ impl Store {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
             match stem.parse::<EntryId>() {
-                Ok(id) => ids.push(id),
+                Ok(id) => paths.push((id, dent.path().to_path_buf())),
                 Err(_) => continue, // not ours; leave foreign files alone
             }
         }
-        ids.sort();
-        ids.into_iter().map(|id| self.require(id)).collect()
+        paths.sort_by_key(|(id, _)| *id);
+        for (file_id, path) in paths {
+            match parse_entry_file(&path) {
+                Ok(entry) if entry.id == file_id => scan.entries.push(entry),
+                Ok(entry) => scan.skipped.push(Skipped {
+                    path,
+                    error: format!("entry id {} does not match filename id {file_id}", entry.id),
+                }),
+                Err(e) => scan.skipped.push(Skipped {
+                    path,
+                    error: e.to_string(),
+                }),
+            }
+        }
+        Ok(scan)
     }
 
     // -- internals ----------------------------------------------------------
@@ -169,8 +213,10 @@ impl Store {
         Ok(())
     }
 
-    /// Exclusive cross-process lock. Held until the guard drops.
+    /// Exclusive cross-process lock. Held until the guard drops. Also the
+    /// lazy mkdir for the store root: only writers create directories.
     fn lock(&self) -> Result<fs::File> {
+        fs::create_dir_all(&self.root)?;
         let lock_path = self.root.join(".lock");
         let file = fs::OpenOptions::new()
             .read(true)
@@ -185,6 +231,9 @@ impl Store {
     /// Remove orphaned temp files from crashed writes older than
     /// [`TMP_STALE_AFTER`]. Fresh temps may belong to a live writer.
     fn sweep_stale_temps(&self) -> Result<()> {
+        if !self.root.exists() {
+            return Ok(());
+        }
         let now = std::time::SystemTime::now();
         for dent in walkdir::WalkDir::new(&self.root)
             .into_iter()

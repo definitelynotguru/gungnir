@@ -11,12 +11,14 @@ fn main() -> gungnir::Result<()> {
     let g = Gungnir::open(&root)?;
 
     // A prior session leaves a failure behind in this agent's journal.
-    let past = g.start_session("builder", "speed up checkout");
+    let past = g.start_session("builder", "speed up checkout").unwrap();
     g.add_attempt(&past, "added index on orders.user_id", false)?;
     g.end_session(&past, "index did not help", vec![])?;
 
     // Today's task starts with a briefing assembled from codex + journal.
-    let s = g.start_session("builder", "fix slow checkout query");
+    let s = g
+        .start_session("builder", "fix slow checkout query")
+        .unwrap();
     g.add_observation(&s, "EXPLAIN shows seq scan on orders_archive")?;
     g.add_attempt(&s, "rewrote query to use orders_archive_idx", true)?;
 

@@ -6,12 +6,15 @@ use std::collections::HashSet;
 use crate::entry::{EntryKind, VerificationState};
 use crate::id::EntryId;
 use crate::recall::{Coverage, Hit};
+use crate::store::Skipped;
 
 #[derive(Clone, Debug, Default)]
 pub struct Briefing {
     pub markdown: String,
     pub codex_hits: Vec<Hit>,
     pub journal_hits: Vec<Hit>,
+    /// Files that failed to parse while scanning either layer.
+    pub skipped: Vec<Skipped>,
 }
 
 /// Everything the compiler needs. One struct instead of seven positional
@@ -25,6 +28,8 @@ pub struct BriefingInput {
     pub journal_superseded: HashSet<EntryId>,
     pub codex_coverage: Coverage,
     pub journal_coverage: Coverage,
+    pub codex_skipped: Vec<Skipped>,
+    pub journal_skipped: Vec<Skipped>,
 }
 
 fn label(hit: &Hit, superseded: &HashSet<EntryId>, task_tokens: &[String]) -> String {
@@ -81,14 +86,19 @@ fn coverage_line(name: &str, cov: &Coverage) -> String {
 }
 
 /// Assemble the briefing. Coverage drives the abstention signal: when no
-/// verified fact matched the topic in either layer, say so outright.
+/// verified fact matched the topic in either layer, say so outright — and
+/// say whether nothing matched or nothing verified.
 pub fn compile(input: BriefingInput) -> Briefing {
     let task_tokens = crate::recall::tokenize(&input.task);
     let mut md = format!("# Briefing\n\nTask: {}\n", input.task);
 
     md.push_str("\n## Shared knowledge (Codex)\n");
     if input.codex_hits.is_empty() {
-        md.push_str("- nothing on file for this topic\n");
+        if input.codex_coverage.total == 0 {
+            md.push_str("- nothing on file\n");
+        } else {
+            md.push_str("- nothing on file matched this topic\n");
+        }
     } else {
         for h in &input.codex_hits {
             md.push_str(&label(h, &input.codex_superseded, &task_tokens));
@@ -98,7 +108,11 @@ pub fn compile(input: BriefingInput) -> Briefing {
 
     md.push_str("\n## Your prior attempts (Journal)\n");
     if input.journal_hits.is_empty() {
-        md.push_str("- no prior attempts on this topic\n");
+        if input.journal_coverage.total == 0 {
+            md.push_str("- no prior attempts on file\n");
+        } else {
+            md.push_str("- no prior attempts matched this topic\n");
+        }
     } else {
         for h in &input.journal_hits {
             md.push_str(&label(h, &input.journal_superseded, &task_tokens));
@@ -112,7 +126,15 @@ pub fn compile(input: BriefingInput) -> Briefing {
     md.push_str(&coverage_line("Journal", &input.journal_coverage));
     md.push('\n');
     if input.codex_coverage.verified == 0 && input.journal_coverage.verified == 0 {
-        md.push_str("\nNo verified knowledge covers this task. Proceed with caution.\n");
+        let matched_any =
+            (input.codex_coverage.total_visible() + input.journal_coverage.total_visible()) > 0;
+        if matched_any {
+            md.push_str(
+                "\nEntries matched this task but none are verified. Proceed with caution.\n",
+            );
+        } else {
+            md.push_str("\nNo knowledge matched this task. Proceed with caution.\n");
+        }
     }
 
     let contradicted = input.codex_coverage.contradicted + input.journal_coverage.contradicted;
@@ -122,10 +144,14 @@ pub fn compile(input: BriefingInput) -> Briefing {
         ));
     }
 
+    let mut skipped = input.codex_skipped;
+    skipped.extend(input.journal_skipped);
+
     Briefing {
         markdown: md,
         codex_hits: input.codex_hits,
         journal_hits: input.journal_hits,
+        skipped,
     }
 }
 
@@ -143,6 +169,8 @@ mod tests {
             journal_superseded: HashSet::new(),
             codex_coverage: Coverage::default(),
             journal_coverage: Coverage::default(),
+            codex_skipped: vec![],
+            journal_skipped: vec![],
         }
     }
 
@@ -151,9 +179,7 @@ mod tests {
         let b = compile(input());
         assert!(b.markdown.contains("nothing on file"));
         assert!(b.markdown.contains("no prior attempts"));
-        assert!(b
-            .markdown
-            .contains("No verified knowledge covers this task"));
+        assert!(b.markdown.contains("No knowledge matched this task"));
     }
 
     #[test]
@@ -168,7 +194,7 @@ mod tests {
     #[test]
     fn superseded_and_contradicted_are_flagged() {
         let mut e = Entry::new("a", EntryKind::Decision, "deploy on fridays");
-        e.contradict(EntryId::generate(), "reviewer");
+        e.contradict(EntryId::generate(), "reviewer", None);
         let mut i = input();
         i.codex_hits = vec![Hit {
             entry: e,
@@ -226,7 +252,7 @@ mod tests {
         let b = compile(i);
         assert!(b
             .markdown
-            .contains("No verified knowledge covers this task"));
+            .contains("Entries matched this task but none are verified"));
         assert!(b.markdown.contains("1 unverified"));
     }
 
@@ -246,7 +272,7 @@ mod tests {
         let b = compile(i);
         assert!(b
             .markdown
-            .contains("No verified knowledge covers this task"));
+            .contains("Entries matched this task but none are verified"));
         assert!(b.markdown.contains("1 unverified"));
     }
 
