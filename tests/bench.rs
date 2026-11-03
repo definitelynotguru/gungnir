@@ -1,159 +1,392 @@
-//! Gungnir Bench v1: a deterministic accuracy harness over a synthetic
-//! corpus, modeled on LongMemEval's five abilities (information extraction,
-//! multi-session reasoning, knowledge updates, temporal reasoning,
-//! abstention).
+//! Reference runner for gungnir-bench (see `bench/README.md` for the spec).
 //!
-//! Grading is exact and offline: each check runs against the library API on
-//! a freshly built corpus and asserts expected recall behavior. Scores print
-//! per ability with `cargo test --test bench -- --nocapture`.
+//! The corpus and the checks are data: `bench/corpus.yaml` describes the
+//! world to load, `bench/checks.yaml` the exact-match assertions over it,
+//! grouped by LongMemEval's five abilities (information extraction,
+//! multi-session reasoning, knowledge updates, temporal reasoning,
+//! abstention). Grading is exact and offline; scores print per ability with
+//! `cargo test --test bench -- --nocapture`.
+//!
+//! The `paraphrase` suite below stays in Rust: it measures retrieval
+//! machinery (BM25-lite vs hybrid fusion), not a store capability the data
+//! files express. It runs beside the YAML suite under the same bench.
 //!
 //! This is a self-benchmark, not LongMemEval. Vendor-published numbers from
 //! other systems are not comparable to it.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, TimeZone, Utc};
+use serde::Deserialize;
 
-use gungnir::{Entry, EntryKind, Gungnir, Promotion, Query};
+use gungnir::{Entry, EntryKind, Evidence, Gungnir, Layer, Promotion, Query, Store};
 
-fn at(hours_from_epoch_base: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_767_225_600 + hours_from_epoch_base * 3600, 0)
-        .unwrap()
+// ---------------------------------------------------------------------------
+// Corpus and check files
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CorpusFile {
+    epoch_base: i64,
+    sessions: Vec<CorpusSession>,
+    facts: Vec<CorpusFact>,
 }
 
-/// A corpus exercising every layer: two builder sessions on one topic (one
-/// failed attempt, one success promoted to the Codex), a supersession chain,
-/// a verified-then-rolled-back fact, another agent's private journal, and an
-/// unrelated verified fact.
+#[derive(Deserialize)]
+struct CorpusSession {
+    agent: String,
+    task: String,
+    transcript: Vec<CorpusLine>,
+    journal_summary: String,
+    #[serde(default)]
+    promote: Vec<CorpusPromotion>,
+}
+
+#[derive(Deserialize)]
+struct CorpusLine {
+    kind: String,
+    text: String,
+    #[serde(default)]
+    outcome: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CorpusPromotion {
+    label: String,
+    kind: EntryKind,
+    summary: String,
+    body: String,
+    verify_as: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CorpusFact {
+    label: String,
+    agent: String,
+    kind: EntryKind,
+    summary: String,
+    #[serde(default)]
+    body: String,
+    at_hours: Option<i64>,
+    revises: Option<String>,
+    verify_as: Option<String>,
+    verify_at: Option<i64>,
+    mark_rolled_back_as: Option<String>,
+    mark_rolled_back_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ChecksFile {
+    abilities: Vec<Ability>,
+}
+
+#[derive(Deserialize)]
+struct Ability {
+    name: String,
+    checks: Vec<Check>,
+}
+
+#[derive(Deserialize)]
+struct Check {
+    name: String,
+    run: Run,
+    expect: Expect,
+}
+
+#[derive(Deserialize)]
+struct Run {
+    search: Option<String>,
+    brief: Option<String>,
+    entry: Option<String>,
+    layer: Option<String>,
+    agent: Option<String>,
+    limit: Option<usize>,
+    #[serde(default)]
+    current: bool,
+    as_of: Option<i64>,
+}
+
+/// Exact-match assertions. Each present field is one independent check;
+/// `None` means "assert nothing about this". A check YAML entry may carry
+/// several fields; the runner evaluates them as one unit against the same
+/// run output.
+#[derive(Deserialize, Default)]
+struct Expect {
+    hits_exactly: Option<usize>,
+    hits_at_least: Option<usize>,
+    hit0_summary_contains: Option<String>,
+    codex_hit0_summary_contains: Option<String>,
+    markdown_contains: Option<String>,
+    markdown_not_contains: Option<String>,
+    evidence_ref_resolves_in: Option<String>,
+    verified: Option<usize>,
+    unverified: Option<usize>,
+    hidden_superseded: Option<usize>,
+    hidden_rolled_back: Option<usize>,
+    total_visible: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Built corpus
+// ---------------------------------------------------------------------------
+
+/// The store plus the label → id map from corpus.yaml and the epoch clock.
 struct Corpus {
     g: Gungnir,
     /// Holds the tempdir open for as long as the facade lives.
     _dir: tempfile::TempDir,
-    checkout_decision: gungnir::EntryId,
+    labels: HashMap<String, gungnir::EntryId>,
+    epoch_base: i64,
 }
 
-fn build() -> Corpus {
-    let dir = tempfile::tempdir().unwrap();
-    let g = Gungnir::open(dir.path()).unwrap();
-    let codex = g.codex().unwrap();
+impl Corpus {
+    fn at(&self, hours: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(self.epoch_base + hours * 3600, 0)
+            .unwrap()
+    }
 
-    // Session 1: failure.
-    let s1 = g
-        .start_session("builder", "fix slow checkout query")
-        .unwrap();
-    g.add_observation(&s1, "EXPLAIN shows seq scan on orders_archive")
-        .unwrap();
-    g.add_attempt(&s1, "added index on orders.user_id", false)
-        .unwrap();
-    g.end_session(&s1, "index hint did not help", vec![])
-        .unwrap();
-
-    // Session 2: success, promoted into the Codex with provenance.
-    let s2 = g
-        .start_session("builder", "rewrite checkout query")
-        .unwrap();
-    g.add_attempt(&s2, "rewrote query to use orders_archive_idx", true)
-        .unwrap();
-    let report = g
-        .end_session(
-            &s2,
-            "rewrote checkout query successfully",
-            vec![Promotion {
-                kind: EntryKind::Decision,
-                summary: "checkout queries must use orders_archive_idx".into(),
-                body: "seq scan on orders_archive was the bottleneck".into(),
-                review_of: None,
-            }],
-        )
-        .unwrap();
-    g.verify(report.promoted[0], "team-review", None).unwrap();
-
-    // Supersession chain with explicit timestamps for as-of checks.
-    let mut c1 = Entry::new("ops", EntryKind::Decision, "budget reviews happen in q3");
-    c1.timestamp = at(10);
-    codex.create(&c1).unwrap();
-    g.verify(c1.id, "ops-lead", None).unwrap();
-
-    let mut c2 = Entry::new("ops", EntryKind::Decision, "budget reviews moved to q1");
-    c2.timestamp = at(100);
-    c2.revises = Some(c1.id);
-    codex.create(&c2).unwrap();
-
-    // Verified then rolled back, both transitions stamped by hand.
-    let mut f1 = Entry::new(
-        "ops",
-        EntryKind::Decision,
-        "feature flags live in launchdarkly",
-    );
-    f1.timestamp = at(20);
-    codex.create(&f1).unwrap();
-    let mut verified = f1.clone();
-    verified.verify("ops-lead", None);
-    verified.verification_log[0].timestamp = at(30);
-    codex
-        .update_with(&verified, &|id| codex.exists(id))
-        .unwrap();
-    let mut rolled = verified;
-    rolled.mark_rolled_back("ops");
-    rolled.verification_log.last_mut().unwrap().timestamp = at(40);
-    codex.update_with(&rolled, &|id| codex.exists(id)).unwrap();
-
-    // Another agent's private journal must never leak into briefings.
-    let s3 = g
-        .start_session("scout", "investigate deploy timeouts")
-        .unwrap();
-    g.add_observation(&s3, "deploy pipeline timeout in github actions runners")
-        .unwrap();
-    g.end_session(&s3, "runner timeouts documented", vec![])
-        .unwrap();
-
-    // Unrelated verified fact far from every query below.
-    let mut unrelated = Entry::new("hr", EntryKind::Decision, "meeting room hera seats eight");
-    unrelated.body = "bookings through the calendar".into();
-    codex.create(&unrelated).unwrap();
-    g.verify(unrelated.id, "office-manager", None).unwrap();
-
-    Corpus {
-        g,
-        _dir: dir,
-        checkout_decision: report.promoted[0],
+    fn layer_store(&self, name: &str) -> Store {
+        if name == "codex" {
+            self.g.codex().unwrap()
+        } else if let Some(agent) = name
+            .strip_prefix("journal(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            self.g.journal(agent).unwrap()
+        } else {
+            panic!("unknown layer '{name}'")
+        }
     }
 }
 
+fn load_corpus() -> Corpus {
+    let raw: CorpusFile = serde_yaml::from_str(include_str!("../bench/corpus.yaml")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let mut corpus = Corpus {
+        g,
+        _dir: dir,
+        labels: HashMap::new(),
+        epoch_base: raw.epoch_base,
+    };
+
+    for s in &raw.sessions {
+        let session = corpus.g.start_session(&s.agent, &s.task).unwrap();
+        for line in &s.transcript {
+            match line.kind.as_str() {
+                "observation" => {
+                    corpus.g.add_observation(&session, &line.text).unwrap();
+                }
+                "attempt" => {
+                    corpus
+                        .g
+                        .add_attempt(
+                            &session,
+                            &line.text,
+                            line.outcome.as_deref() == Some("succeeded"),
+                        )
+                        .unwrap();
+                }
+                other => panic!("unknown transcript kind '{other}'"),
+            }
+        }
+        let report = corpus
+            .g
+            .end_session(
+                &session,
+                &s.journal_summary,
+                s.promote
+                    .iter()
+                    .map(|p| Promotion {
+                        kind: p.kind,
+                        summary: p.summary.clone(),
+                        body: p.body.clone(),
+                        review_of: None,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        for (p, id) in s.promote.iter().zip(&report.promoted) {
+            corpus.labels.insert(p.label.clone(), *id);
+            if let Some(verifier) = &p.verify_as {
+                corpus.g.verify(*id, verifier, None).unwrap();
+            }
+        }
+    }
+
+    let codex = corpus.g.codex().unwrap();
+    for f in &raw.facts {
+        let mut e = Entry::new(&f.agent, f.kind, &f.summary);
+        e.body = f.body.clone();
+        if let Some(h) = f.at_hours {
+            e.timestamp = corpus.at(h);
+        }
+        if let Some(tail) = &f.revises {
+            e.revises = Some(corpus.labels[tail]);
+        }
+        codex.create(&e).unwrap();
+        corpus.labels.insert(f.label.clone(), e.id);
+
+        // Timestamped transitions stamp the log record by hand so as-of
+        // checks interrogate recorded history, not ingest order.
+        if let Some(verifier) = &f.verify_as {
+            let mut v = e.clone();
+            v.verify(verifier, None);
+            if let Some(h) = f.verify_at {
+                v.verification_log[0].timestamp = corpus.at(h);
+            }
+            codex.update_with(&v, &|id| codex.exists(id)).unwrap();
+        }
+        if let Some(agent) = &f.mark_rolled_back_as {
+            let mut r = codex.require(e.id).unwrap();
+            r.mark_rolled_back(agent);
+            if let Some(h) = f.mark_rolled_back_at {
+                r.verification_log.last_mut().unwrap().timestamp = corpus.at(h);
+            }
+            codex.update_with(&r, &|id| codex.exists(id)).unwrap();
+        }
+    }
+    corpus
+}
+
+// ---------------------------------------------------------------------------
+// Check execution
+// ---------------------------------------------------------------------------
+
 struct Score {
-    ability: &'static str,
+    ability: String,
     passed: usize,
     total: usize,
 }
 
 impl Score {
-    fn new(ability: &'static str) -> Self {
+    fn new(ability: &str) -> Self {
         Self {
-            ability,
+            ability: ability.to_string(),
             passed: 0,
             total: 0,
         }
     }
-    fn check(&mut self, name: &str, ok: bool) -> bool {
+    fn check(&mut self, name: &str, ok: bool) {
         self.total += 1;
         if ok {
             self.passed += 1;
         } else {
             println!("  FAIL {name}");
         }
-        ok
+    }
+}
+
+fn run_checks(c: &Corpus) -> Vec<Score> {
+    let file: ChecksFile = serde_yaml::from_str(include_str!("../bench/checks.yaml")).unwrap();
+    file.abilities
+        .iter()
+        .map(|a| {
+            let mut s = Score::new(&a.name);
+            for check in &a.checks {
+                s.check(&check.name, eval(c, check));
+            }
+            s
+        })
+        .collect()
+}
+
+/// Evaluate one check: dispatch on whichever run shape is set.
+fn eval(c: &Corpus, check: &Check) -> bool {
+    if check.run.search.is_some() {
+        eval_search(c, check)
+    } else if check.run.brief.is_some() {
+        eval_brief(c, check)
+    } else if check.run.entry.is_some() {
+        eval_entry(c, check)
+    } else {
+        panic!("check '{}' has no run shape", check.name)
+    }
+}
+
+fn eval_search(c: &Corpus, check: &Check) -> bool {
+    let run = &check.run;
+    let mut q = Query::new(run.search.as_deref().unwrap(), run.limit.unwrap_or(10));
+    if run.current {
+        q = q.current();
+    }
+    if let Some(h) = run.as_of {
+        q = q.as_of(c.at(h));
+    }
+    let layer = match run.layer.as_deref().unwrap_or("codex") {
+        "codex" => Layer::Codex,
+        name if name.starts_with("journal(") && name.ends_with(')') => Layer::Journal {
+            agent: &name[8..name.len() - 1],
+        },
+        other => panic!("unknown layer '{other}'"),
+    };
+    let out = c.g.search_layer(layer, &q).unwrap();
+
+    let e = &check.expect;
+    field(e.hits_exactly, |v| out.hits.len() == v)
+        && field(e.hits_at_least, |v| out.hits.len() >= v)
+        && field(e.hit0_summary_contains.as_deref(), |v| {
+            out.hits
+                .first()
+                .is_some_and(|h| h.entry.summary.contains(v))
+        })
+        && field(e.verified, |v| out.coverage.verified == v)
+        && field(e.unverified, |v| out.coverage.unverified == v)
+        && field(e.hidden_superseded, |v| out.coverage.hidden_superseded == v)
+        && field(e.hidden_rolled_back, |v| {
+            out.coverage.hidden_rolled_back == v
+        })
+        && field(e.total_visible, |v| out.coverage.total_visible() == v)
+}
+
+fn eval_brief(c: &Corpus, check: &Check) -> bool {
+    let run = &check.run;
+    let b =
+        c.g.brief(
+            run.agent.as_deref().expect("brief run needs agent"),
+            run.brief.as_deref().unwrap(),
+            run.limit.unwrap_or(10),
+        )
+        .unwrap();
+    let e = &check.expect;
+    field(e.markdown_contains.as_deref(), |v| b.markdown.contains(v))
+        && field(e.markdown_not_contains.as_deref(), |v| {
+            !b.markdown.contains(v)
+        })
+        && field(e.codex_hit0_summary_contains.as_deref(), |v| {
+            b.codex_hits
+                .first()
+                .is_some_and(|h| h.entry.summary.contains(v))
+        })
+}
+
+fn eval_entry(c: &Corpus, check: &Check) -> bool {
+    let run = &check.run;
+    let e = &check.expect;
+    field(e.evidence_ref_resolves_in.as_deref(), |layer| {
+        let id = c.labels[run.entry.as_deref().unwrap()];
+        let entry = c.g.codex().unwrap().require(id).unwrap();
+        match entry.evidence.first() {
+            Some(Evidence::Ref { id: ev }) => c.layer_store(layer).exists(*ev).unwrap_or(false),
+            _ => false,
+        }
+    })
+}
+
+/// Assert `want` against `actual` when the expect field is set; an unset
+/// field always passes.
+fn field<T>(expect: Option<T>, f: impl FnOnce(T) -> bool) -> bool {
+    match expect {
+        Some(want) => f(want),
+        None => true,
     }
 }
 
 #[test]
 fn gungnir_bench() {
-    let c = build();
-    let scores = vec![
-        extraction(&c),
-        multi_session(&c),
-        knowledge_updates(&c),
-        temporal(&c),
-        abstention(&c),
-        paraphrase(),
-    ];
+    let c = load_corpus();
+    let mut scores = run_checks(&c);
+    scores.push(paraphrase());
 
     let total: usize = scores.iter().map(|s| s.total).sum();
     let passed: usize = scores.iter().map(|s| s.passed).sum();
@@ -165,193 +398,6 @@ fn gungnir_bench() {
         passed, total,
         "bench regressions detected; see FAIL lines above"
     );
-}
-
-fn extraction(c: &Corpus) -> Score {
-    let mut s = Score::new("information extraction");
-    let codex = c.g.codex().unwrap();
-    let journal = c.g.journal("builder").unwrap();
-
-    // The promoted decision is retrievable by its own content.
-    let hits =
-        c.g.recall_layer(
-            gungnir::Layer::Codex,
-            &Query::new("orders archive bottleneck", 5),
-        )
-        .unwrap();
-    s.check(
-        "promoted fact recalled",
-        hits.first()
-            .is_some_and(|h| h.entry.summary.contains("orders_archive")),
-    );
-
-    // Provenance survived promotion: evidence resolves to the journal entry.
-    let d1 = codex.require(c.checkout_decision).unwrap();
-    let evidence_ok = match d1.evidence.first() {
-        Some(gungnir::Evidence::Ref { id }) => journal.exists(*id).unwrap_or(false),
-        _ => false,
-    };
-    s.check("promotion links to journal source", evidence_ok);
-
-    // Archived transcript detail is searchable in the journal.
-    let obs =
-        c.g.recall_layer(
-            gungnir::Layer::Journal { agent: "builder" },
-            &Query::new("explain seq scan orders", 5),
-        )
-        .unwrap();
-    s.check("session observation recalled from journal", !obs.is_empty());
-
-    // Briefing surfaces the transcript excerpt under the journal hit.
-    let b = c.g.brief("builder", "slow checkout orders", 8).unwrap();
-    s.check("briefing includes excerpt", b.markdown.contains("> -"));
-
-    s
-}
-
-fn multi_session(c: &Corpus) -> Score {
-    let mut s = Score::new("multi-session reasoning");
-    let b = c.g.brief("builder", "slow checkout rewrite", 10).unwrap();
-
-    // Both sessions' outcomes appear in one briefing.
-    s.check(
-        "failed attempt present",
-        b.markdown.contains("index hint did not help"),
-    );
-    s.check(
-        "successful rewrite present",
-        b.markdown.contains("rewrote checkout query"),
-    );
-
-    // Another agent's private knowledge does not leak.
-    s.check(
-        "other agent's journal excluded",
-        !b.markdown.contains("github actions timeout"),
-    );
-
-    // The shared verified fact ranks above everything else for the topic.
-    s.check(
-        "verified promotion leads codex hits",
-        b.codex_hits
-            .first()
-            .is_some_and(|h| h.entry.summary.contains("orders_archive_idx")),
-    );
-
-    s
-}
-
-fn knowledge_updates(c: &Corpus) -> Score {
-    let mut s = Score::new("knowledge updates");
-
-    let current =
-        c.g.search_layer(
-            gungnir::Layer::Codex,
-            &Query::new("budget reviews", 10).current(),
-        )
-        .unwrap();
-    s.check(
-        "current view keeps chain head only",
-        current.hits.len() == 1 && current.hits[0].entry.summary.contains("q1"),
-    );
-    s.check(
-        "superseded tail counted as hidden",
-        current.coverage.hidden_superseded == 1,
-    );
-
-    // Honest coverage: the head is unverified even though its ancestor was
-    // verified. Abstention reflects what is true now, not history.
-    s.check(
-        "head unverified reported honestly",
-        current.coverage.unverified == 1 && current.coverage.verified == 0,
-    );
-
-    // Plain recall shows both generations with the stale one flagged.
-    let b = c.g.brief("ops", "budget reviews", 10).unwrap();
-    s.check(
-        "stale generation flagged superseded",
-        b.markdown.contains(", superseded]"),
-    );
-
-    s
-}
-
-fn temporal(c: &Corpus) -> Score {
-    let mut s = Score::new("temporal reasoning");
-
-    // Before the revision exists, the old fact is the only candidate.
-    let early =
-        c.g.search_layer(
-            gungnir::Layer::Codex,
-            &Query::new("budget reviews", 10).as_of(at(50)).current(),
-        )
-        .unwrap();
-    s.check(
-        "point-in-time before revision",
-        early.hits.len() == 1 && early.hits[0].entry.summary.contains("q3"),
-    );
-
-    // After it lands, the head moves.
-    let late =
-        c.g.search_layer(
-            gungnir::Layer::Codex,
-            &Query::new("budget reviews", 10).as_of(at(150)).current(),
-        )
-        .unwrap();
-    s.check(
-        "point-in-time after revision",
-        late.hits.len() == 1 && late.hits[0].entry.summary.contains("q1"),
-    );
-
-    // Rollback visibility flips at the recorded time, not at write time.
-    let flag_before =
-        c.g.search_layer(
-            gungnir::Layer::Codex,
-            &Query::new("feature flags", 10).as_of(at(35)),
-        )
-        .unwrap();
-    s.check(
-        "fact verified as-of before rollback",
-        flag_before.coverage.verified == 1 && flag_before.hits.len() == 1,
-    );
-    let flag_after =
-        c.g.search_layer(
-            gungnir::Layer::Codex,
-            &Query::new("feature flags", 10).as_of(at(50)),
-        )
-        .unwrap();
-    s.check(
-        "rolled back fact hidden after rollback",
-        flag_after.hits.is_empty() && flag_after.coverage.hidden_rolled_back == 1,
-    );
-
-    s
-}
-
-fn abstention(c: &Corpus) -> Score {
-    let mut s = Score::new("abstention");
-
-    let nothing =
-        c.g.search_layer(
-            gungnir::Layer::Codex,
-            &Query::new("quarterly revenue forecast spreadsheet", 10),
-        )
-        .unwrap();
-    s.check("unknown topic returns no hits", nothing.hits.is_empty());
-    s.check(
-        "coverage is empty for unknown topic",
-        nothing.coverage.total_visible() == 0,
-    );
-
-    // Unverified-only topic: facts exist, but the briefing says plainly that
-    // none are verified instead of staying silent about it. This corpus has
-    // nothing matching "cache tuning", so the verdict names the miss.
-    let b = c.g.brief("builder", "cache tuning internals", 8).unwrap();
-    s.check(
-        "abstention line when nothing matched",
-        b.markdown.contains("No knowledge matched this task"),
-    );
-
-    s
 }
 
 // ---------------------------------------------------------------------------

@@ -46,6 +46,18 @@ jobs:
       - name: Tests
         run: cargo test --all-targets --features embed,test-embedder
 
+  bench:
+    name: gungnir-bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The bench artifact in bench/ is public; this job prints its score
+      # and fails on any regression in the YAML checks.
+      - name: Run the public bench
+        run: cargo test --test bench -- --nocapture
+
   audit:
     name: dependency audit
     runs-on: ubuntu-latest

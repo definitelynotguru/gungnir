@@ -1,0 +1,103 @@
+# gungnir-bench checks v1.
+#
+# Exact-match expectations over the corpus in corpus.yaml. No LLM judge:
+# every assertion reduces to a string match, an id equality, or a count.
+# `as_of` offsets are hours added to the corpus `epoch_base`.
+#
+# Run shapes:
+#   search — query a layer, assert on hits and coverage counts
+#   brief  — compile a briefing for an agent, assert on its markdown and hits
+#   entry  — fetch one labeled entry, assert on its provenance
+#
+# Layers are named codex or journal(<agent>). A store without journal
+# partitions maps journal(<agent>) to its per-agent private layer; a store
+# without privacy partitions cannot satisfy the privacy checks and scores
+# them failed.
+version: 1
+
+abilities:
+  - name: information extraction
+    checks:
+      - name: promoted fact recalled
+        run: {search: "orders archive bottleneck", layer: codex, limit: 5}
+        expect: {hit0_summary_contains: "orders_archive"}
+
+      - name: promotion links to journal source
+        run: {entry: checkout_decision}
+        expect: {evidence_ref_resolves_in: "journal(builder)"}
+
+      - name: session observation recalled from journal
+        run: {search: "explain seq scan orders", layer: "journal(builder)", limit: 5}
+        expect: {hits_at_least: 1}
+
+      - name: briefing includes excerpt
+        run: {brief: "slow checkout orders", agent: builder, limit: 8}
+        expect: {markdown_contains: "> -"}
+
+  - name: multi-session reasoning
+    checks:
+      - name: failed attempt present
+        run: {brief: "slow checkout rewrite", agent: builder, limit: 10}
+        expect: {markdown_contains: "index hint did not help"}
+
+      - name: successful rewrite present
+        run: {brief: "slow checkout rewrite", agent: builder, limit: 10}
+        expect: {markdown_contains: "rewrote checkout query"}
+
+      - name: other agent's journal excluded
+        run: {brief: "slow checkout rewrite", agent: builder, limit: 10}
+        expect: {markdown_not_contains: "github actions timeout"}
+
+      - name: verified promotion leads codex hits
+        run: {brief: "slow checkout rewrite", agent: builder, limit: 10}
+        expect: {codex_hit0_summary_contains: "orders_archive_idx"}
+
+  - name: knowledge updates
+    checks:
+      - name: current view keeps chain head only
+        run: {search: "budget reviews", layer: codex, limit: 10, current: true}
+        expect: {hits_exactly: 1, hit0_summary_contains: "q1"}
+
+      - name: superseded tail counted as hidden
+        run: {search: "budget reviews", layer: codex, limit: 10, current: true}
+        expect: {hidden_superseded: 1}
+
+      - name: head unverified reported honestly
+        run: {search: "budget reviews", layer: codex, limit: 10, current: true}
+        expect: {verified: 0, unverified: 1}
+
+      - name: stale generation flagged superseded
+        run: {brief: "budget reviews", agent: ops, limit: 10}
+        expect: {markdown_contains: ", superseded]"}
+
+  - name: temporal reasoning
+    checks:
+      - name: point-in-time before revision
+        run: {search: "budget reviews", layer: codex, limit: 10, current: true, as_of: 50}
+        expect: {hits_exactly: 1, hit0_summary_contains: "q3"}
+
+      - name: point-in-time after revision
+        run: {search: "budget reviews", layer: codex, limit: 10, current: true, as_of: 150}
+        expect: {hits_exactly: 1, hit0_summary_contains: "q1"}
+
+      - name: fact verified as-of before rollback
+        run: {search: "feature flags", layer: codex, limit: 10, as_of: 35}
+        expect: {verified: 1, hits_exactly: 1}
+
+      - name: rolled back fact hidden after rollback
+        run: {search: "feature flags", layer: codex, limit: 10, as_of: 50}
+        expect: {hits_exactly: 0, hidden_rolled_back: 1}
+
+  - name: abstention
+    checks:
+      - name: unknown topic returns no hits
+        run: {search: "quarterly revenue forecast spreadsheet", layer: codex, limit: 10}
+        expect: {hits_exactly: 0}
+
+      - name: coverage is empty for unknown topic
+        run: {search: "quarterly revenue forecast spreadsheet", layer: codex, limit: 10}
+        expect: {total_visible: 0}
+
+      - name: abstention line when zero verified match
+        run: {brief: "cache tuning internals", agent: builder, limit: 8}
+        expect: {markdown_contains: "No knowledge matched this task"}
