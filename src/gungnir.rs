@@ -746,10 +746,24 @@ impl Gungnir {
             .chain(&journal_out.hits)
             .map(|h| h.entry.id)
             .collect();
+        // A candidate is "on this topic" when an endpoint was a hit, or its
+        // snapshot shares a task token — hits truncate to `limit`, so
+        // hit-only matching would hide conflicts between facts that ranked
+        // just below the briefing cutoff.
+        let task_tokens: HashSet<String> = recall::tokenize(task).into_iter().collect();
         let open_conflicts = self
             .open_conflicts_lenient()?
             .iter()
-            .filter(|c| hit_ids.contains(&c.new_entry) || hit_ids.contains(&c.conflicting_entry))
+            .filter(|c| {
+                hit_ids.contains(&c.new_entry)
+                    || hit_ids.contains(&c.conflicting_entry)
+                    || recall::tokenize(&c.new_summary)
+                        .iter()
+                        .any(|t| task_tokens.contains(t))
+                    || recall::tokenize(&c.conflicting_summary)
+                        .iter()
+                        .any(|t| task_tokens.contains(t))
+            })
             .count();
         Ok(briefing::compile(BriefingInput {
             task: task.to_string(),
@@ -973,8 +987,15 @@ impl Gungnir {
     ///   uses everywhere.
     /// - `Dismiss` ("not a conflict"): close the record; entries untouched.
     ///
-    /// Entry mutations run first and the record closes last, so a crash
-    /// leaves the candidate open rather than resolved-but-unapplied.
+    /// The whole resolution — re-read, the Open check, the entry mutation,
+    /// and the record close — runs inside the queue's flock via
+    /// `Conflicts::resolve_locked`, so two resolvers can't both observe Open
+    /// and race different verbs onto the same candidate. Entry mutations
+    /// still run before the record closes: a crash leaves the candidate
+    /// open rather than resolved-but-unapplied. Lock order is queue →
+    /// entry-store, the only composite acquisition in the codebase, so no
+    /// cycle exists (writers take a store lock then release it before ever
+    /// touching the queue).
     pub fn resolve_conflict(
         &self,
         id: ConflictId,
@@ -982,82 +1003,76 @@ impl Gungnir {
         actor: &str,
     ) -> Result<ConflictRecord> {
         let queue = self.conflicts_queue();
-        let mut rec = queue.require(id)?;
-        if rec.status != ConflictStatus::Open {
-            return Err(Error::Invalid(format!(
-                "conflict {id} is already {status}",
-                status = rec.status
-            )));
-        }
-
-        match verb {
-            ConflictVerb::Supersede => {
-                let store = self
-                    .locate(rec.new_entry)?
-                    .ok_or(Error::NotFound(rec.new_entry))?;
-                let old_store = self
-                    .locate(rec.conflicting_entry)?
-                    .ok_or(Error::NotFound(rec.conflicting_entry))?;
-                if old_store.root() != store.root() {
-                    return Err(Error::Invalid(
-                        "supersede cannot span layers: the revision would not hide the superseded fact (use --contradict or --dismiss)".into(),
-                    ));
-                }
-                let mut entry = store.require(rec.new_entry)?;
-                match entry.revises {
-                    None => {
-                        entry.revises = Some(rec.conflicting_entry);
-                        store.update_with(&entry, &|id| self.exists_anywhere(id))?;
+        queue.resolve_locked(id, |rec| {
+            let mut rec = rec.clone();
+            match verb {
+                ConflictVerb::Supersede => {
+                    let store = self
+                        .locate(rec.new_entry)?
+                        .ok_or(Error::NotFound(rec.new_entry))?;
+                    let old_store = self
+                        .locate(rec.conflicting_entry)?
+                        .ok_or(Error::NotFound(rec.conflicting_entry))?;
+                    if old_store.root() != store.root() {
+                        return Err(Error::Invalid(
+                            "supersede cannot span layers: the revision would not hide the superseded fact (use --contradict or --dismiss)".into(),
+                        ));
                     }
-                    Some(prev) if prev == rec.conflicting_entry => {}
-                    Some(prev) => {
-                        return Err(Error::Invalid(format!(
-                            "{} already revises {prev}; refusing to relink",
-                            rec.new_entry
-                        )));
+                    let mut entry = store.require(rec.new_entry)?;
+                    match entry.revises {
+                        None => {
+                            entry.revises = Some(rec.conflicting_entry);
+                            store.update_with(&entry, &|id| self.exists_anywhere(id))?;
+                        }
+                        Some(prev) if prev == rec.conflicting_entry => {}
+                        Some(prev) => {
+                            return Err(Error::Invalid(format!(
+                                "{} already revises {prev}; refusing to relink",
+                                rec.new_entry
+                            )));
+                        }
                     }
                 }
-            }
-            ConflictVerb::Contradict => {
-                if !self.exists_anywhere(rec.new_entry)? {
-                    return Err(Error::NotFound(rec.new_entry));
-                }
-                let store = self
-                    .locate(rec.conflicting_entry)?
-                    .ok_or(Error::NotFound(rec.conflicting_entry))?;
-                let mut entry = store.require(rec.conflicting_entry)?;
-                if entry.verification == VerificationState::RolledBack {
-                    return Err(Error::Invalid(format!(
-                        "{} is rolled back; contradict applies to live facts",
-                        rec.conflicting_entry
-                    )));
-                }
-                match &entry.verification {
-                    VerificationState::Contradicted { by } if *by == rec.new_entry => {}
-                    VerificationState::Contradicted { by } => {
+                ConflictVerb::Contradict => {
+                    if !self.exists_anywhere(rec.new_entry)? {
+                        return Err(Error::NotFound(rec.new_entry));
+                    }
+                    let store = self
+                        .locate(rec.conflicting_entry)?
+                        .ok_or(Error::NotFound(rec.conflicting_entry))?;
+                    let mut entry = store.require(rec.conflicting_entry)?;
+                    if entry.verification == VerificationState::RolledBack {
                         return Err(Error::Invalid(format!(
-                            "{} is already contradicted by {by}; refusing to replace that refutation",
+                            "{} is rolled back; contradict applies to live facts",
                             rec.conflicting_entry
                         )));
                     }
-                    _ => {
-                        entry.contradict(rec.new_entry, actor, None);
-                        store.update_with(&entry, &|id| self.exists_anywhere(id))?;
+                    match &entry.verification {
+                        VerificationState::Contradicted { by } if *by == rec.new_entry => {}
+                        VerificationState::Contradicted { by } => {
+                            return Err(Error::Invalid(format!(
+                                "{} is already contradicted by {by}; refusing to replace that refutation",
+                                rec.conflicting_entry
+                            )));
+                        }
+                        _ => {
+                            entry.contradict(rec.new_entry, actor, None);
+                            store.update_with(&entry, &|id| self.exists_anywhere(id))?;
+                        }
                     }
                 }
+                ConflictVerb::Dismiss => {}
             }
-            ConflictVerb::Dismiss => {}
-        }
 
-        rec.status = match verb {
-            ConflictVerb::Supersede => ConflictStatus::ResolvedSuperseded,
-            ConflictVerb::Contradict => ConflictStatus::ResolvedContradicted,
-            ConflictVerb::Dismiss => ConflictStatus::Dismissed,
-        };
-        rec.resolved_by = Some(actor.to_string());
-        rec.resolved_at = Some(Utc::now());
-        queue.update(&rec)?;
-        Ok(rec)
+            rec.status = match verb {
+                ConflictVerb::Supersede => ConflictStatus::ResolvedSuperseded,
+                ConflictVerb::Contradict => ConflictStatus::ResolvedContradicted,
+                ConflictVerb::Dismiss => ConflictStatus::Dismissed,
+            };
+            rec.resolved_by = Some(actor.to_string());
+            rec.resolved_at = Some(Utc::now());
+            Ok(rec)
+        })
     }
 
     /// Write a revision of `old`: same kind and project, linked by `revises`.

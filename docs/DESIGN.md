@@ -161,7 +161,9 @@ digit-bearing tokens). Each record carries the signal that raised it, so a
 reviewer sees *why* the candidate exists. The trade is deliberate: flag the
 same-frame divergence and let people dismiss the noise, rather than miss a
 real contradiction. Near-duplicates never flag — an identical token set is
-corroboration. With the `embed` build, `--semantic` on `add`/`supersede`/
+corroboration (the semantic channel judges it over the full claim text,
+summary and body, so same-summary writes with disagreeing bodies still
+flag). With the `embed` build, `--semantic` on `add`/`supersede`/
 `promote` adds a fourth signal, `semantic_overlap` (cosine ≥ 0.70), which
 catches paraphrased contradictions at a higher false-positive cost.
 
