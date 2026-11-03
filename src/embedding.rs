@@ -164,9 +164,11 @@ pub fn hybrid_search(
 ) -> Result<SearchOutcome> {
     let (pool, revised, skipped) = recall::temporal_pool(store, query)?;
     let pool_len = pool.len();
-    let stats = CorpusStats::new(pool.iter().map(|c| &c.entry));
+    let stats = CorpusStats::new(recall::stats_pool(&pool, &revised, query).into_iter());
 
-    // Keyword channel.
+    // Keyword channel. The ranking holds only candidates with signal:
+    // zero-score entries have no keyword relevance, and letting them into
+    // RRF would make store order influence a vector-only query's results.
     let qtokens = {
         let mut t = recall::tokenize(&query.text);
         t.sort();
@@ -177,7 +179,7 @@ pub fn hybrid_search(
         .iter()
         .map(|c| recall::score(&c.entry, &qtokens, &stats))
         .collect();
-    let mut kw_rank: Vec<usize> = (0..pool.len()).collect();
+    let mut kw_rank: Vec<usize> = (0..pool.len()).filter(|&i| kw_scores[i] > 0.0).collect();
     kw_rank.sort_by(|a, b| kw_scores[*b].total_cmp(&kw_scores[*a]));
 
     // Vector channel. Rolled-back candidates stay out of the embedder:
@@ -201,7 +203,9 @@ pub fn hybrid_search(
     for (i, v) in embedded.iter().zip(vectors.iter()) {
         vec_scores[*i] = cosine(qv, v);
     }
-    let mut vec_rank: Vec<usize> = (0..pool.len()).collect();
+    let mut vec_rank: Vec<usize> = (0..pool.len())
+        .filter(|&i| vec_scores[i] > VECTOR_MATCH_FLOOR)
+        .collect();
     vec_rank.sort_by(|a, b| vec_scores[*b].total_cmp(&vec_scores[*a]));
 
     let fused = rrf_fuse(&[kw_rank, vec_rank], pool.len(), 60.0);
