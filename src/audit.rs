@@ -91,10 +91,11 @@ pub fn entry_report(id: EntryId, all: &[Located]) -> Option<EntryReport> {
     let cited_by: Vec<Located> = all
         .iter()
         .filter(|l| {
-            l.entry.evidence.iter().any(|ev| {
-                matches!(ev, Evidence::Ref { id: rid } if *rid == id)
-                    || l.entry.wikilink_ids().contains(&id)
-            })
+            l.entry
+                .evidence
+                .iter()
+                .any(|ev| matches!(ev, Evidence::Ref { id: rid } if *rid == id))
+                || l.entry.wikilink_ids().contains(&id)
         })
         .cloned()
         .collect();

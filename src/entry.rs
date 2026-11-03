@@ -269,18 +269,27 @@ impl Entry {
     }
 }
 
-/// Extract `[[target]]` markers from arbitrary text.
+/// Extract `[[target]]` markers from arbitrary text. A link cannot span
+/// lines: an unterminated `[[` is literal text, not a link that swallows
+/// everything up to the next `]]` it can find.
 fn wikilink_targets(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find("[[") {
-        rest = &rest[open + 2..];
-        let Some(close) = rest.find("]]") else { break };
-        let target = rest[..close].trim();
-        if !target.is_empty() {
-            out.push(target.to_string());
+        let after_open = &rest[open + 2..];
+        let line_end = after_open.find('\n').unwrap_or(after_open.len());
+        match after_open[..line_end].find("]]") {
+            Some(close) => {
+                let target = after_open[..close].trim();
+                if !target.is_empty() {
+                    out.push(target.to_string());
+                }
+                rest = &after_open[close + 2..];
+            }
+            // Literal `[[` on this line: skip to the next line so a real
+            // link later in the body still registers.
+            None => rest = &after_open[line_end..],
         }
-        rest = &rest[close + 2..];
     }
     out
 }
