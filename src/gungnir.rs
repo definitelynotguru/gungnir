@@ -991,11 +991,16 @@ fn failed_attempt(h: &crate::recall::Hit, topic: &str) -> bool {
     let topic_tokens = recall::tokenize(topic);
     e.body.lines().any(|l| {
         let l = l.trim_start();
-        if !(l.starts_with("- attempt:") && l.ends_with("[failed]")) {
-            return false;
+        // Tokenize only the attempt summary: the archive's own wrapper
+        // tokens ("attempt", "failed") are formatting, not topic evidence,
+        // and would make every failed line match a topic about failures.
+        let summary = l
+            .strip_prefix("- attempt:")
+            .and_then(|s| s.strip_suffix("[failed]"));
+        match summary {
+            None => false,
+            Some(s) => recall::tokenize(s).iter().any(|t| topic_tokens.contains(t)),
         }
-        let line_tokens = recall::tokenize(l);
-        line_tokens.iter().any(|t| topic_tokens.contains(t))
     })
 }
 
@@ -1501,6 +1506,12 @@ mod tests {
         // A topic that does match the failed line counts it.
         let pc = g.peer_coverage(Some("builder"), "deploy runner").unwrap();
         assert_eq!(pc.agents_failed, 1);
+
+        // The archive's own wrapper tokens ("attempt", "failed") are
+        // formatting, not topic evidence: a topic mentioning failures
+        // must not match every failed line through the label alone.
+        let pc = g.peer_coverage(Some("builder"), "failed checkout").unwrap();
+        assert_eq!(pc.agents_failed, 0);
     }
 
     #[test]
