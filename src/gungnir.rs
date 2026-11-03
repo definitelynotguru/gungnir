@@ -765,24 +765,16 @@ impl Gungnir {
         // agent-scoped (codex + own journal), and a record's layer label is
         // where the scan ran, not who the claim belongs to: a journal
         // write's codex-scope candidate is labeled "codex" but its new
-        // claim is private. Counting it would leak another agent's journal
-        // activity into this briefing.
-        let codex_root = codex.root().to_path_buf();
-        let journal_root = journal.root().to_path_buf();
+        // claim is private. Existence checks run against the already-open
+        // stores — locate() would reopen and resweep a store per endpoint.
         let mut open_conflicts = 0;
         for c in self.open_conflicts_lenient()? {
             if !on_topic(&c) {
                 continue;
             }
-            let visible =
-                [c.new_entry, c.conflicting_entry]
-                    .iter()
-                    .all(|id| match self.locate(*id) {
-                        Ok(Some(store)) => {
-                            store.root() == codex_root || store.root() == journal_root
-                        }
-                        _ => false,
-                    });
+            let visible = [c.new_entry, c.conflicting_entry].iter().all(|id| {
+                codex.exists(*id).unwrap_or(false) || journal.exists(*id).unwrap_or(false)
+            });
             if visible {
                 open_conflicts += 1;
             }
