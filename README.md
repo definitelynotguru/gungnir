@@ -84,6 +84,11 @@ Key behaviors:
 - **Non-destructive rollback.** Rolling back walks the revision chain to the
   first verified ancestor, marks intermediates rolled back, and writes a
   rollback entry. No file is ever deleted.
+- **Cross-agent coverage without leaks.** Briefings and `stats --topic`
+  report aggregate counts over other agents' journals (how many attempted
+  the topic, how many failed) so a second agent stops repeating a
+  documented failure. Counts only: no peer summary or body ever leaves its
+  journal. Topic existence does leak; see docs/PROVENANCE.md.
 - **Recall you can reason about.** Keyword scoring over summary (2x) and body,
   ordered by verification bucket: verified > unverified > contradicted;
   rolled-back entries hidden. `--current` resolves supersession chains to

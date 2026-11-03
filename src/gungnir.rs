@@ -57,6 +57,20 @@ pub struct Gungnir {
     root: PathBuf,
 }
 
+/// Topic-scoped counts over journal partitions other than the caller's.
+/// Counts only: no agent name, summary, or body ever leaves the journal.
+/// Caveat: a positive count still reveals *that* some agent wrote about
+/// the topic; existence leaks, content does not. See docs/PROVENANCE.md.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PeerCoverage {
+    /// Journal partitions holding at least one topic-matched entry.
+    pub agents_attempted: usize,
+    /// Topic-matched journal entries across those partitions.
+    pub entries: usize,
+    /// Of `agents_attempted`, how many recorded a failed attempt.
+    pub agents_failed: usize,
+}
+
 /// Memory health snapshot: counts by layer and verification state,
 /// supersession depth, staleness. Powers `gungnir stats`.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -498,7 +512,36 @@ impl Gungnir {
             journal_coverage: journal_out.coverage,
             codex_skipped: codex_out.skipped,
             journal_skipped: journal_out.skipped,
+            peers: self.peer_coverage(Some(agent), task)?,
         }))
+    }
+
+    /// Cross-agent coverage for one topic: aggregate counts over every
+    /// journal partition except `agent`'s. Stops a second agent repeating a
+    /// documented failure without ever reading the failure itself; entries
+    /// are counted, never surfaced.
+    ///
+    /// `agent: None` counts every journal partition.
+    pub fn peer_coverage(&self, agent: Option<&str>, topic: &str) -> Result<PeerCoverage> {
+        let base = self.root.join(JOURNAL);
+        let exclude = agent.map(layout::sanitize_component);
+        let q = Query::new(topic, usize::MAX);
+        let mut pc = PeerCoverage::default();
+        for name in layer_child_names(&base)? {
+            if Some(&name) == exclude.as_ref() {
+                continue;
+            }
+            let out = recall::search_with_coverage(&Store::open(base.join(&name))?, &q)?;
+            if out.hits.is_empty() {
+                continue;
+            }
+            pc.agents_attempted += 1;
+            pc.entries += out.hits.len();
+            if out.hits.iter().any(failed_attempt) {
+                pc.agents_failed += 1;
+            }
+        }
+        Ok(pc)
     }
 
     /// Search one layer with coverage accounting.
@@ -787,6 +830,15 @@ fn layer_child_names(base: &Path) -> Result<Vec<String>> {
 /// revision no longer stands, so neither hides its predecessor.
 fn supersedes(e: &&Entry) -> bool {
     e.kind != EntryKind::Rollback && e.verification != VerificationState::RolledBack
+}
+
+/// Whether an entry records a failed attempt. Attempt bodies open with
+/// `outcome: failed` (written by [`Gungnir::add_attempt`]); a session
+/// archive carries the same fact as a `[failed]` transcript tag.
+fn failed_attempt(h: &crate::recall::Hit) -> bool {
+    let e = &h.entry;
+    e.body.starts_with("outcome: failed")
+        || (e.kind == EntryKind::Session && e.body.contains("[failed]"))
 }
 
 /// Ids that some newer live entry revises, i.e. facts with a newer
@@ -1087,6 +1139,43 @@ mod tests {
         assert_eq!(st.verification_rate, st.verified as f64 / decidable as f64);
         assert!(st.rolled_back > 0);
         assert!(decidable > st.verified);
+    }
+
+    #[test]
+    fn peer_coverage_counts_other_journals_without_leaking_content() {
+        let (_d, g) = gng();
+        let scout = g.start_session("scout", "fix checkout latency");
+        g.add_attempt(&scout, "added index on orders", false)
+            .unwrap();
+        g.end_session(&scout, "index did not help", vec![]).unwrap();
+        let mine = g.start_session("builder", "fix checkout latency");
+        g.add_attempt(&mine, "increased pool size", true).unwrap();
+        g.end_session(&mine, "pool resize worked", vec![]).unwrap();
+
+        let pc = g
+            .peer_coverage(Some("builder"), "checkout latency")
+            .unwrap();
+        assert_eq!(pc.agents_attempted, 1);
+        assert_eq!(pc.agents_failed, 1);
+        assert!(pc.entries >= 1);
+
+        // The requester's own journal is excluded; scout sees builder.
+        let pc = g.peer_coverage(Some("scout"), "checkout latency").unwrap();
+        assert_eq!(pc.agents_attempted, 1);
+        assert_eq!(pc.agents_failed, 0);
+        // No scope counts every journal.
+        let pc = g.peer_coverage(None, "checkout latency").unwrap();
+        assert_eq!(pc.agents_attempted, 2);
+
+        // Counts surface in the briefing; peer text never does.
+        let b = g.brief("builder", "checkout latency", 10).unwrap();
+        assert!(
+            b.markdown
+                .contains("1 other agent attempted this topic; 1 failed"),
+            "{}",
+            b.markdown
+        );
+        assert!(!b.markdown.contains("index did not help"), "{}", b.markdown);
     }
 
     #[cfg(unix)]

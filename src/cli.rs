@@ -160,6 +160,11 @@ enum Cmd {
         agent: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Cross-journal coverage for this topic: how many other agents'
+        /// journals touch it and how many recorded a failed attempt.
+        /// Counts only; no peer content is exposed.
+        #[arg(long)]
+        topic: Option<String>,
     },
 
     /// Run the MCP server on stdio (for Claude Code, Cursor, etc.).
@@ -466,10 +471,18 @@ fn dispatch(cli: Cli) -> Result<()> {
             warn_skipped(&b.skipped);
         }
 
-        C::Stats { agent, json } => {
+        C::Stats { agent, json, topic } => {
             let r = g.stats(agent.as_deref())?;
+            let peers = match &topic {
+                Some(t) => Some(g.peer_coverage(agent.as_deref(), t)?),
+                None => None,
+            };
             if json {
-                println!("{}", serde_json::to_string_pretty(&r)?);
+                let mut out = serde_json::to_value(&r)?;
+                if let Some(p) = &peers {
+                    out["peer_coverage"] = serde_json::to_value(p)?;
+                }
+                println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 println!("codex entries      {}", r.codex_entries);
                 println!("journal entries    {}", r.journal_entries);
@@ -482,6 +495,12 @@ fn dispatch(cli: Cli) -> Result<()> {
                 println!("stale (>30d)       {}", r.stale_over_30d);
                 println!("verification rate  {:.0}%", r.verification_rate * 100.0);
                 println!("skipped (unparseable) {}", r.skipped.len());
+                if let Some(p) = &peers {
+                    println!(
+                        "peer coverage      {} agents attempted, {} failed ({} entries)",
+                        p.agents_attempted, p.agents_failed, p.entries
+                    );
+                }
             }
             warn_skipped(&r.skipped);
         }
