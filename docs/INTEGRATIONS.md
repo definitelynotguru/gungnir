@@ -117,9 +117,17 @@ cargo run --example quickstart
 
 ## Embeddings (optional)
 
-The default build does keyword recall only and makes zero network calls. To
-enable hybrid vector + keyword search, implement the `Embedder` trait against
-your provider and wrap it in the content-addressed cache:
+The default build does BM25-lite keyword recall and makes zero network
+calls. Two ways to get hybrid vector + keyword search:
+
+**Shipped local model.** Build with `cargo build --features embed` and pass
+`--semantic` to `recall`/`brief` (or `"semantic": true` on the MCP tools).
+The first semantic query downloads bge-small-en-v1.5 (~100MB) into
+`<root>/.cache/fastembed` — the only network call gungnir makes, and only
+with the feature compiled in.
+
+**Your own embedder.** Implement the `Embedder` trait against your provider
+and wrap it in the content-addressed cache:
 
 ```rust
 use gungnir::embedding::{CachedEmbedder, Embedder};
@@ -136,8 +144,10 @@ impl Embedder for MyClient {
 }
 
 let cached = CachedEmbedder::new(MyClient { /* ... */ }, "~/gungnir");
-let hits = gungnir::embedding::hybrid_search(
+let out = gungnir::embedding::hybrid_search(
     &g.codex()?, &Query::new("slow checkout", 10), &cached)?;
+// out.hits, plus out.coverage — the same abstention signal keyword recall
+// returns, so briefings stay honest in hybrid mode.
 ```
 
 Vectors cache under `<root>/.cache/embeddings/<model>/` keyed by

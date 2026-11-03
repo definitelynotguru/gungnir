@@ -453,12 +453,41 @@ impl Gungnir {
     /// attempts relevant to `task`, with coverage driving the abstention
     /// signal.
     pub fn brief(&self, agent: &str, task: &str, limit: usize) -> Result<Briefing> {
+        self.brief_inner(agent, task, limit, None)
+    }
+
+    /// Briefing through the hybrid vector + keyword path. The abstention
+    /// signal is the same one the keyword briefing uses; it only gets more
+    /// honest, since paraphrased knowledge now counts toward coverage.
+    pub fn brief_semantic(
+        &self,
+        agent: &str,
+        task: &str,
+        limit: usize,
+        embedder: &dyn crate::embedding::Embedder,
+    ) -> Result<Briefing> {
+        self.brief_inner(agent, task, limit, Some(embedder))
+    }
+
+    fn brief_inner(
+        &self,
+        agent: &str,
+        task: &str,
+        limit: usize,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> Result<Briefing> {
         let codex = self.codex()?;
         let journal = self.journal(agent)?;
         let q = Query::new(task, limit);
 
-        let codex_out = recall::search_with_coverage(&codex, &q)?;
-        let journal_out = recall::search_with_coverage(&journal, &q)?;
+        let search = |store: &Store, q: &Query| -> Result<SearchOutcome> {
+            match embedder {
+                Some(e) => crate::embedding::hybrid_search(store, q, e),
+                None => recall::search_with_coverage(store, q),
+            }
+        };
+        let codex_out = search(&codex, &q)?;
+        let journal_out = search(&journal, &q)?;
         Ok(briefing::compile(BriefingInput {
             task: task.to_string(),
             codex_hits: codex_out.hits,
@@ -479,6 +508,26 @@ impl Gungnir {
             Layer::Journal { agent } => recall::search_with_coverage(&self.journal(agent)?, query),
             Layer::Scratch { session_id } => {
                 recall::search_with_coverage(&self.scratch(session_id)?, query)
+            }
+        }
+    }
+
+    /// Hybrid vector + keyword search over one layer. Same candidate pool,
+    /// same coverage accounting as [`Self::search_layer`]; the vector channel
+    /// only widens what "topic-matched" means.
+    pub fn search_layer_semantic(
+        &self,
+        layer: Layer<'_>,
+        query: &Query,
+        embedder: &dyn crate::embedding::Embedder,
+    ) -> Result<SearchOutcome> {
+        match layer {
+            Layer::Codex => crate::embedding::hybrid_search(&self.codex()?, query, embedder),
+            Layer::Journal { agent } => {
+                crate::embedding::hybrid_search(&self.journal(agent)?, query, embedder)
+            }
+            Layer::Scratch { session_id } => {
+                crate::embedding::hybrid_search(&self.scratch(session_id)?, query, embedder)
             }
         }
     }

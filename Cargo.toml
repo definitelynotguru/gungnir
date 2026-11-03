@@ -8,6 +8,12 @@ repository = "https://github.com/definitelynotguru/gungnir"
 keywords = ["agent", "memory", "mcp", "llm", "markdown"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+# Local embedding model (bge-small-en-v1.5 via fastembed/ONNX) for
+# `--semantic` recall and briefings. Default build stays zero-network:
+# the model downloads on first semantic use only, into `<root>/.cache`.
+embed = ["dep:fastembed"]
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -20,6 +26,10 @@ sha2 = "0.10"
 thiserror = "2"
 ulid = { version = "1", features = ["serde"] }
 walkdir = "2"
+fastembed = { version = "7.5", optional = true, default-features = false, features = [
+    "hf-hub-native-tls",
+    "ort-download-binaries-native-tls",
+] }
 
 [dev-dependencies]
 tempfile = "3"

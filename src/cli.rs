@@ -74,6 +74,10 @@ enum Cmd {
         /// Evaluate facts as they stood at this instant (RFC3339).
         #[arg(long)]
         as_of: Option<String>,
+        /// Fuse in embedding-similarity ranking (requires the `embed`
+        /// feature; downloads a ~100MB local model on first use).
+        #[arg(long)]
+        semantic: bool,
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
@@ -136,6 +140,10 @@ enum Cmd {
         #[arg(long)]
         agent: String,
         task: String,
+        /// Fuse in embedding-similarity ranking (requires the `embed`
+        /// feature; downloads a ~100MB local model on first use).
+        #[arg(long)]
+        semantic: bool,
         #[arg(long, default_value_t = 8)]
         limit: usize,
     },
@@ -245,6 +253,24 @@ fn layer_of(name: &str) -> Result<&'static str> {
     layout::parse_layer_name(Some(name)).map_err(Error::Invalid)
 }
 
+/// The shipped local embedder (fastembed bge-small-en-v1.5), wrapped in the
+/// content-addressed vector cache under `<root>/.cache`.
+#[cfg(feature = "embed")]
+fn embedder_for(
+    g: &Gungnir,
+) -> Result<crate::embedding::CachedEmbedder<crate::embedding::local::Fastembed>> {
+    let inner = crate::embedding::local::Fastembed::new(g.root())?;
+    Ok(crate::embedding::CachedEmbedder::new(inner, g.root()))
+}
+
+#[cfg(not(feature = "embed"))]
+fn embedder_for(_g: &Gungnir) -> Result<()> {
+    Err(Error::Invalid(
+        "--semantic requires the `embed` feature: rebuild with `cargo build --features embed`"
+            .into(),
+    ))
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
     use Cmd as C;
     let g = gng(&cli.root)?;
@@ -308,6 +334,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             agent,
             current,
             as_of,
+            semantic,
             limit,
         } => {
             let mut q = Query::new(&query, limit);
@@ -317,14 +344,27 @@ fn dispatch(cli: Cli) -> Result<()> {
             if let Some(raw) = as_of {
                 q = q.as_of(parse_as_of(&raw)?);
             }
-            let out = match layer_of(&layer)? {
-                crate::layout::CODEX => g.search_layer(crate::gungnir::Layer::Codex, &q)?,
-                _ => {
-                    let a = agent
+            let layer_sel = match layer_of(&layer)? {
+                crate::layout::CODEX => crate::gungnir::Layer::Codex,
+                _ => crate::gungnir::Layer::Journal {
+                    agent: agent
                         .as_deref()
-                        .ok_or_else(|| Error::Invalid("recall journal requires --agent".into()))?;
-                    g.search_layer(crate::gungnir::Layer::Journal { agent: a }, &q)?
+                        .ok_or_else(|| Error::Invalid("recall journal requires --agent".into()))?,
+                },
+            };
+            let out = if semantic {
+                #[cfg(feature = "embed")]
+                {
+                    let e = embedder_for(&g)?;
+                    g.search_layer_semantic(layer_sel, &q, &e)?
                 }
+                #[cfg(not(feature = "embed"))]
+                {
+                    embedder_for(&g)?;
+                    unreachable!("--semantic errors without the embed feature")
+                }
+            } else {
+                g.search_layer(layer_sel, &q)?
             };
             for h in &out.hits {
                 println!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary);
@@ -393,8 +433,26 @@ fn dispatch(cli: Cli) -> Result<()> {
             println!("{id}");
         }
 
-        C::Brief { agent, task, limit } => {
-            let b = g.brief(&agent, &task, limit)?;
+        C::Brief {
+            agent,
+            task,
+            semantic,
+            limit,
+        } => {
+            let b = if semantic {
+                #[cfg(feature = "embed")]
+                {
+                    let e = embedder_for(&g)?;
+                    g.brief_semantic(&agent, &task, limit, &e)?
+                }
+                #[cfg(not(feature = "embed"))]
+                {
+                    embedder_for(&g)?;
+                    unreachable!("--semantic errors without the embed feature")
+                }
+            } else {
+                g.brief(&agent, &task, limit)?
+            };
             print!("{}", b.markdown);
             warn_skipped(&b.skipped);
         }
