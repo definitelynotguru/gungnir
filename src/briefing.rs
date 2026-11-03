@@ -126,8 +126,16 @@ pub fn compile(input: BriefingInput) -> Briefing {
     md.push_str(&coverage_line("Journal", &input.journal_coverage));
     md.push('\n');
     if input.codex_coverage.verified == 0 && input.journal_coverage.verified == 0 {
-        let matched_any =
-            (input.codex_coverage.total_visible() + input.journal_coverage.total_visible()) > 0;
+        // Contradicted and hidden (superseded, rolled back) matches count:
+        // the briefing lists them above, so "nothing matched" must not
+        // contradict its own output.
+        let matched_any = input
+            .codex_coverage
+            .total_visible()
+            .saturating_add(input.codex_coverage.contradicted)
+            .saturating_add(input.journal_coverage.total_visible())
+            .saturating_add(input.journal_coverage.contradicted)
+            > 0;
         if matched_any {
             md.push_str(
                 "\nEntries matched this task but none are verified. Proceed with caution.\n",
