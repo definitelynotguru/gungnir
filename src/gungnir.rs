@@ -1411,7 +1411,7 @@ mod tests {
         let codex = g.codex().unwrap();
         let e = Entry::new("ops", EntryKind::Decision, "use postgres");
         codex.create(&e).unwrap();
-        g.verify_with_evidence(e.id, "team", None, &[adr.clone()])
+        g.verify_with_evidence(e.id, "team", None, std::slice::from_ref(&adr))
             .unwrap();
 
         let entry = codex.require(e.id).unwrap();
