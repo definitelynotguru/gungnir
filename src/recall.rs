@@ -43,6 +43,9 @@ pub struct Query {
     pub as_of: Option<DateTime<Utc>>,
     /// Keep only revises-chain heads and drop contradicted facts.
     pub current_only: bool,
+    /// Return only verified hits. Coverage still counts the whole matched
+    /// pool, so a caller can abstain explicitly when verified is zero.
+    pub require_verified: bool,
 }
 
 impl Query {
@@ -52,6 +55,7 @@ impl Query {
             limit,
             as_of: None,
             current_only: false,
+            require_verified: false,
         }
     }
 
@@ -64,9 +68,14 @@ impl Query {
         self.current_only = true;
         self
     }
+
+    pub fn require_verified(mut self) -> Self {
+        self.require_verified = true;
+        self
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Hit {
     pub entry: Entry,
     pub score: f64,
@@ -74,7 +83,7 @@ pub struct Hit {
 
 /// Topic-scoped counts behind a result set. Powers the abstention signal:
 /// "no verified knowledge" is a claim about coverage, not just empty output.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Coverage {
     pub verified: usize,
     pub unverified: usize,
@@ -92,9 +101,14 @@ impl Coverage {
     pub fn total_visible(&self) -> usize {
         self.verified + self.unverified
     }
+
+    /// Total entries the topic matched, across every visible state.
+    pub fn total_matched(&self) -> usize {
+        self.verified + self.unverified + self.contradicted
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct SearchOutcome {
     pub hits: Vec<Hit>,
     pub coverage: Coverage,
@@ -210,8 +224,10 @@ pub fn bucket(entry: &Entry) -> u8 {
 
 /// Verification state evaluated from the append-only log at `as_of`.
 /// The log is the historical record; the frontmatter field only holds now.
+/// Public because audit snapshots expose it as the state of an entry at a
+/// point in time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StateAt {
+pub enum StateAt {
     Verified,
     Unverified,
     Contradicted,
@@ -371,6 +387,7 @@ pub(crate) fn finish(
 
     let hits = scored
         .into_iter()
+        .filter(|(_, st, _)| !query.require_verified || *st == StateAt::Verified)
         .take(query.limit)
         .map(|(entry, _, score)| Hit { entry, score })
         .collect();

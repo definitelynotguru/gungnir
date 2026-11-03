@@ -100,6 +100,18 @@ pub enum RecordStatus {
     RolledBack,
 }
 
+impl std::fmt::Display for RecordStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Unverified => "unverified",
+            Self::Verified => "verified",
+            Self::Contradicted => "contradicted",
+            Self::RolledBack => "rolled_back",
+        };
+        f.write_str(s)
+    }
+}
+
 /// An appended record tracking who verified/contradicted/rolled back, when.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationRecord {
@@ -144,6 +156,12 @@ pub struct Entry {
     /// carry the outcome as a `outcome: ...` body line instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<bool>,
+    /// Names of entities this entry is about. Free-form strings ("checkout",
+    /// "orders_archive"), not a graph; body `[[name]]` mentions merge with
+    /// these when the entry is scanned. `[[<entry-id>]]` wikilinks are
+    /// validated like evidence refs instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
     #[serde(skip)]
     pub body: String,
 }
@@ -168,6 +186,7 @@ impl Entry {
             evidence: Vec::new(),
             source_tool: None,
             outcome: None,
+            entities: Vec::new(),
             body: String::new(),
         }
     }
@@ -205,6 +224,65 @@ impl Entry {
             note: None,
         });
     }
+
+    /// `[[target]]` links inside the body, in order, without the brackets.
+    /// A target may be an entity name or an [`EntryId`]; the caller
+    /// distinguishes via parse.
+    pub fn wikilink_targets(&self) -> Vec<String> {
+        wikilink_targets(&self.body)
+    }
+
+    /// Id-shaped `[[target]]` links in the body. These are validated like
+    /// evidence refs at write time; name-shaped targets are entity mentions.
+    pub fn wikilink_ids(&self) -> Vec<EntryId> {
+        self.wikilink_targets()
+            .into_iter()
+            .filter_map(|t| t.parse::<EntryId>().ok())
+            .collect()
+    }
+
+    /// Every entity name this entry claims, frontmatter `entities:` merged
+    /// with non-id `[[name]]` body mentions, deduped case-insensitively.
+    pub fn entity_mentions(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |name: String| {
+            let key = name.trim().to_lowercase();
+            if !key.is_empty() && !out.iter().any(|n| n.to_lowercase() == key) {
+                out.push(key);
+            }
+        };
+        for e in &self.entities {
+            push(e.clone());
+        }
+        for t in self.wikilink_targets() {
+            if t.parse::<EntryId>().is_err() {
+                push(t);
+            }
+        }
+        out
+    }
+
+    /// Whether `name` matches an entity mention, case-insensitively.
+    pub fn entity_matches(&self, name: &str) -> bool {
+        let key = name.trim().to_lowercase();
+        !key.is_empty() && self.entity_mentions().iter().any(|n| n == &key)
+    }
+}
+
+/// Extract `[[target]]` markers from arbitrary text.
+fn wikilink_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("[[") {
+        rest = &rest[open + 2..];
+        let Some(close) = rest.find("]]") else { break };
+        let target = rest[..close].trim();
+        if !target.is_empty() {
+            out.push(target.to_string());
+        }
+        rest = &rest[close + 2..];
+    }
+    out
 }
 
 #[cfg(test)]

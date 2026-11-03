@@ -124,23 +124,26 @@ impl Server {
             },
             {
                 "name": "recall",
-                "description": "Keyword search. layer: codex (default) or journal. semantic: fuse in embedding similarity (needs the `embed` build).",
+                "description": "Keyword search. layer: codex (default) or journal. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: only verified hits — the result always ends with a machine-readable coverage JSON line including `abstained`. as_of: evaluate history at an RFC3339 instant.",
                 "inputSchema": schema(json!({
                     "query": {"type": "string"},
                     "layer": {"type": "string", "enum": ["codex", "journal"]},
                     "agent": {"type": "string"},
                     "limit": {"type": "integer"},
-                    "semantic": {"type": "boolean"}
+                    "semantic": {"type": "boolean"},
+                    "require_verified": {"type": "boolean"},
+                    "as_of": {"type": "string"}
                 }), &["query"])
             },
             {
                 "name": "brief",
-                "description": "Compile the pre-task briefing without opening a session. semantic: fuse in embedding similarity (needs the `embed` build).",
+                "description": "Compile the pre-task briefing without opening a session. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: verified facts only; when none exist the briefing's abstention line fires.",
                 "inputSchema": schema(json!({
                     "agent": {"type": "string"},
                     "task": {"type": "string"},
                     "limit": {"type": "integer"},
-                    "semantic": {"type": "boolean"}
+                    "semantic": {"type": "boolean"},
+                    "require_verified": {"type": "boolean"}
                 }), &["agent", "task"])
             },
             {
@@ -290,7 +293,20 @@ impl Server {
             "recall" => {
                 let query = arg("query").ok_or_else(|| Error::Invalid("query required".into()))?;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-                let q = Query::new(query, limit);
+                let require_verified = args
+                    .get("require_verified")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut q = Query::new(query, limit);
+                if require_verified {
+                    q = q.require_verified();
+                }
+                if let Some(raw) = arg("as_of") {
+                    let t = chrono::DateTime::parse_from_rfc3339(raw)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                        .map_err(|e| Error::Invalid(format!("bad as_of: {e}")))?;
+                    q = q.as_of(t);
+                }
                 let layer = match parse_layer(arg("layer"))? {
                     LayerSel::Journal => crate::gungnir::Layer::Journal {
                         agent: arg("agent").ok_or_else(|| {
@@ -314,7 +330,12 @@ impl Server {
                 } else {
                     self.g.search_layer(layer, &q)?
                 };
-                let mut text = if out.hits.is_empty() {
+                let abstained = require_verified && out.hits.is_empty();
+                let mut coverage = serde_json::to_value(out.coverage)?;
+                coverage["abstained"] = Value::Bool(abstained);
+                // Coverage is always emitted — the abstention signal is the
+                // contract, not a side note. Last line so it parses cleanly.
+                let mut hits_text = if out.hits.is_empty() {
                     "no matches".to_string()
                 } else {
                     out.hits
@@ -324,33 +345,40 @@ impl Server {
                         .join("\n")
                 };
                 for s in &out.skipped {
-                    text.push_str(&format!(
+                    hits_text.push_str(&format!(
                         "\n(skipped unreadable entry {}: {})",
                         s.path.display(),
                         s.error
                     ));
                 }
-                Ok(text)
+                Ok(format!(
+                    "{hits_text}\ncoverage: {}",
+                    serde_json::to_string(&coverage)?
+                ))
             }
             "brief" => {
                 let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let task = arg("task").ok_or_else(|| Error::Invalid("task required".into()))?;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
+                let mut q = Query::new(task, limit);
+                if args
+                    .get("require_verified")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    q = q.require_verified();
+                }
                 let b = if self.semantic_enabled(args)? {
                     #[cfg(feature = "embed")]
                     {
                         self.ensure_embedder()?;
-                        self.g.brief_semantic(
-                            agent,
-                            task,
-                            limit,
-                            self.embedder.as_deref().unwrap(),
-                        )?
+                        self.g
+                            .brief_with_semantic(agent, &q, self.embedder.as_deref().unwrap())?
                     }
                     #[cfg(not(feature = "embed"))]
                     unreachable!("semantic_enabled errors without the embed feature")
                 } else {
-                    self.g.brief(agent, task, limit)?
+                    self.g.brief_with(agent, &q)?
                 };
                 let mut text = b.markdown;
                 for s in &b.skipped {

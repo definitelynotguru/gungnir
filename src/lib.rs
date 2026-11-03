@@ -8,6 +8,7 @@
 //! Before each task, a [`briefing`] compiles what's current, superseded,
 //! and previously failed into a short context payload.
 
+pub mod audit;
 pub mod briefing;
 pub mod cli;
 pub mod conflicts;

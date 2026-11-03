@@ -63,6 +63,43 @@ Point-in-time questions work too:
 gungnir recall "deploys" --as-of 2026-08-01T00:00:00Z
 ```
 
+## Auditing what it believes
+
+Gungnir is `git log`/`diff`/`blame` for belief — the same versioning story
+the store keeps internally, readable daily:
+
+```bash
+gungnir log <id>                        # verification log + revises lineage
+gungnir log --since 2026-10-01T00:00:00Z [--agent builder] [--layer codex]
+gungnir diff 2026-09-01T00:00:00Z 2026-10-01T00:00:00Z [--topic checkout]
+gungnir blame <id-or-topic>             # who vouched, what it revises, what replaced it
+gungnir review                          # unverified beliefs grouped for triage
+gungnir entities [name]                 # entity index: names+counts, or entries under a name
+```
+
+All of them are pure reads over the store across every partition (codex,
+each journal, scratch); `--layer` narrows the scan. Entries can carry
+`entities:` names in frontmatter and `[[id]]` wikilinks or `[[name]]`
+mentions in the body — id links are validated like evidence refs, and
+supersede inherits the parent's entity list.
+
+## Abstaining on purpose
+
+The coverage claim is machine-readable, not just a prose line:
+
+```bash
+gungnir recall "postgres" --require-verified   # verified hits only
+echo $?                                        # 2 = explicit "no verified knowledge"
+gungnir recall "postgres" --require-verified --json   # {hits, coverage, abstained}
+gungnir brief --agent builder "postgres" --require-verified
+```
+
+Exit codes: 0 success, 1 error, 2 abstention. On MCP, `recall` accepts
+`require_verified` and `as_of` and always ends its result with a `coverage:`
+JSON line including `abstained`; `brief` accepts `require_verified` and
+says "N unverified or contradicted match(es) exist, none verified" when the
+verdict fires.
+
 ## How it works
 
 Three layers under one root:

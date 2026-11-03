@@ -60,18 +60,22 @@ YAML frontmatter + markdown body. Fields:
 | `evidence`        | list                | `{kind: file, path, excerpt ≤ 500, sha256}` or `{kind: ref, id}` (refs must exist) |
 | `source_tool`     | string?             |                                         |
 | `outcome`         | bool?               | whether an `attempt` entry succeeded    |
+| `entities`        | list of strings     | entity names, 1..64 chars each          |
 
-Body: free-form markdown after the closing `---`.
+Body: free-form markdown after the closing `---`. `[[target]]` wikilinks in
+the body are parsed: id-shaped targets are links (validated like evidence
+refs), other targets count as entity mentions, merged with `entities` when
+the entity index is scanned.
 
 ## Write-time validation
 
 - id unique within store
 - every referenced id (`revises`, `review_of`, `evidence[].ref`,
-  `contradicted_by`) resolves to an existing entry
+  `contradicted_by`, body `[[id]]` wikilinks) resolves to an existing entry
 - `open` ⇒ `assigned_to` present
 - `kind = review` ⇒ `review_of` present
 - entries are born `unverified`; `verified` reachable only via `verify()`
-- length caps enforced (summary 200, excerpt 500)
+- length caps enforced (summary 200, excerpt 500, entity name 64)
 
 ## Recall
 
@@ -123,6 +127,13 @@ aggregate counts over journal partitions other than the caller's (agents
 who attempted the topic, agents with a recorded failure, matched entries).
 Only counts cross the privacy boundary: peer summaries, bodies, and ids
 never surface; topic existence per agent is not hidden.
+
+`require_verified` restricts hits to verified entries while coverage still
+counts the whole matched pool, so abstention stays honest about what exists.
+CLI `--require-verified` on `recall`/`brief` prints an explicit verdict and
+exits 2 (a machine-checkable abstention) when no verified knowledge covers
+the topic; `recall --json` emits `{hits, coverage, abstained}`, and MCP
+`recall` always ends with a `coverage:` JSON line carrying the same fields.
 
 Hybrid mode (`--semantic` on CLI, `semantic: true` on MCP) fuses keyword
 ranks with embedding cosine ranks via reciprocal rank fusion (k = 60) over
@@ -182,14 +193,42 @@ contradict <id> --by <id>` exposes the underlying verb directly.
 - Crash mid-write leaves the previous version intact plus an orphaned
   `.tmp-*` sibling; startup sweep may delete stale temporaries.
 
+## Audit surface
+
+`git log`/`diff`/`blame` for belief — pure reads over the store; nothing
+here writes.
+
+- `gungnir log <id>` — the entry's verification records plus its revises
+  lineage (ancestors above, successors below), citations, and entity
+  mentions.
+- `gungnir log [--since <t>] [--agent <a>] [--layer <l>]` — a chronological
+  scan across every partition. Events are entry creations and each
+  verification-log transition; `--agent` matches the actor (entry agent for
+  creations, verifier for transitions). `--since` also applies to `log <id>`,
+  filtering the records shown.
+- `gungnir diff <t1> <t2> [--topic <q>] [--layer <l>]` — two snapshots
+  evaluated through the same temporal machinery as `as_of` recall, diffed:
+  added, verified, superseded, contradicted, rolled-back.
+- `gungnir blame <id-or-topic>` — vouching (who verified/contradicted, when,
+  with what note), what the belief revises, what replaced it, what cites it.
+  A non-id argument resolves to the best topic match.
+- `gungnir review [--layer <l>]` — the human ritual: belief-kind entries
+  still `unverified`, grouped by partition then project, chain tails
+  excluded, machine-extracted entries flagged, with the
+  verify/supersede/contradict verbs printed per entry.
+- `gungnir entities [name] [--layer <l>]` — the entity index: names with
+  counts, or the entries under one name.
+
 ## Surfaces
 
 - **Library** (`gungnir` crate): everything above.
 - **CLI** (`gungnir` bin): `init`, `add`, `get`, `ls`, `recall`, `verify`
   (`--evidence` records file hashes at verify time; `--revalidate` re-hashes
   and flags drift, `--all` sweeps the store), `contradict`, `supersede`,
-  `rollback`, `promote`, `brief`, `conflicts`, `session`, `stats`
-  (`--topic` reports cross-journal coverage counts), `mcp`.
+  `rollback`, `promote`, `brief`, `conflicts`, `log`, `diff`, `blame`,
+  `review`, `entities`, `session`, `stats`
+  (`--topic` reports cross-journal coverage counts), `mcp`. Exit codes: 0
+  success, 1 error, 2 explicit abstention under `--require-verified`.
 - **MCP server**: tools `start_session`, `end_session`, `add_observation`,
   `add_attempt`, `recall`, `brief`, `verify`, `contradict`, `promote`,
   `supersede`, `rollback`, `conflicts`, `resolve_conflict`, `list`, `get`.

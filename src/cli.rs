@@ -46,6 +46,9 @@ enum Cmd {
         /// The entry this review evaluates (required for --kind review)
         #[arg(long)]
         review_of: Option<EntryId>,
+        /// Entity names this entry is about (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',')]
+        entities: Vec<String>,
         /// Target layer: codex (default) or journal
         #[arg(long, default_value = "codex")]
         into: String,
@@ -83,6 +86,13 @@ enum Cmd {
         /// feature; downloads a ~100MB local model on first use).
         #[arg(long)]
         semantic: bool,
+        /// Return only verified hits. When none verify, prints an explicit
+        /// empty verdict and exits 2 — a machine-checkable abstention.
+        #[arg(long)]
+        require_verified: bool,
+        /// Emit JSON: {hits, coverage, abstained}.
+        #[arg(long)]
+        json: bool,
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
@@ -182,8 +192,71 @@ enum Cmd {
         /// feature; downloads a ~100MB local model on first use).
         #[arg(long)]
         semantic: bool,
+        /// List only verified facts. When none verify, the briefing's
+        /// abstention line fires and the command exits 2.
+        #[arg(long)]
+        require_verified: bool,
         #[arg(long, default_value_t = 8)]
         limit: usize,
+    },
+
+    /// Audit log: one entry's history, or a chronological scan of events.
+    ///
+    /// `gungnir log <id>` prints the entry's verification log and its
+    /// revises lineage. `gungnir log [--since <t>] [--agent <a>]
+    /// [--layer <l>]` scans every partition chronologically — creation and
+    /// verification events alike.
+    Log {
+        /// Entry id. Omit to scan events instead.
+        id: Option<EntryId>,
+        /// Only events at or after this instant (RFC3339). With an id,
+        /// filters the verification records shown.
+        #[arg(long)]
+        since: Option<String>,
+        /// Scan only: actor filter — entry agent for creations, verifier
+        /// for transitions.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Scan only: codex, journal, or scratch.
+        #[arg(long)]
+        layer: Option<String>,
+    },
+
+    /// What our beliefs were at two instants: added, verified, superseded,
+    /// contradicted, and rolled-back entries between <t1> and <t2>.
+    Diff {
+        /// Earlier instant (RFC3339).
+        t1: String,
+        /// Later instant (RFC3339).
+        t2: String,
+        /// Restrict both snapshots to entries matching this topic.
+        #[arg(long)]
+        topic: Option<String>,
+        /// Restrict to one layer: codex, journal, or scratch.
+        #[arg(long)]
+        layer: Option<String>,
+    },
+
+    /// Vouching and supersession lineage of one belief: an id, or a topic
+    /// resolved to its best match.
+    Blame { id_or_query: String },
+
+    /// The human review ritual: unverified (and machine-extracted) beliefs
+    /// grouped by partition and project, with the verbs to act on them.
+    Review {
+        /// Restrict to one layer: codex, journal, or scratch.
+        #[arg(long)]
+        layer: Option<String>,
+    },
+
+    /// Entity index: every entity name with its entry count, or the entries
+    /// under one name.
+    Entities {
+        /// Optional entity name to list entries for.
+        name: Option<String>,
+        /// Restrict to one layer: codex, journal, or scratch.
+        #[arg(long)]
+        layer: Option<String>,
     },
 
     /// Working-session lifecycle.
@@ -266,10 +339,14 @@ enum SessionCmd {
     },
 }
 
+/// Exit codes: 0 success, 1 error, 2 an explicit abstention verdict
+/// (`--require-verified` matched no verified knowledge).
+pub const EXIT_ABSTAINED: i32 = 2;
+
 pub fn run_from_env() -> i32 {
     let cli = Cli::parse();
     match dispatch(cli) {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
             1
@@ -277,10 +354,10 @@ pub fn run_from_env() -> i32 {
     }
 }
 
-fn parse_as_of(raw: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+fn parse_instant(raw: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(raw)
         .map(|t| t.with_timezone(&chrono::Utc))
-        .map_err(|e| Error::Invalid(format!("bad --as-of: {e}")))
+        .map_err(|e| Error::Invalid(format!("bad timestamp '{raw}': {e}")))
 }
 
 fn gng(root: &Option<PathBuf>) -> Result<Gungnir> {
@@ -370,9 +447,10 @@ fn note_conflicts(conflicts: &[crate::conflicts::ConflictRecord], warnings: &[St
     }
 }
 
-fn dispatch(cli: Cli) -> Result<()> {
+fn dispatch(cli: Cli) -> Result<i32> {
     use Cmd as C;
     let g = gng(&cli.root)?;
+    let mut code = 0;
     match cli.cmd {
         C::Init => {
             g.init()?;
@@ -386,6 +464,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             body,
             project,
             review_of,
+            entities,
             into,
             semantic,
         } => {
@@ -393,6 +472,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             e.body = body;
             e.project_id = project;
             e.review_of = review_of;
+            e.entities = entities;
             let layer = match layer_of(&into)? {
                 crate::layout::CODEX => crate::gungnir::Layer::Codex,
                 _ => crate::gungnir::Layer::Journal { agent: &agent },
@@ -420,6 +500,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             let e = store.require(id)?;
             println!("{}  {}  {:?}  [{}]", e.id, e.kind, e.verification, e.agent);
             println!("{}", e.summary);
+            let mentions = e.entity_mentions();
+            if !mentions.is_empty() {
+                println!("entities: {}", mentions.join(", "));
+            }
             if !e.body.is_empty() {
                 println!("\n{}", e.body);
             }
@@ -448,14 +532,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             current,
             as_of,
             semantic,
+            require_verified,
+            json,
             limit,
         } => {
             let mut q = Query::new(&query, limit);
             if current {
                 q = q.current();
             }
+            if require_verified {
+                q = q.require_verified();
+            }
             if let Some(raw) = as_of {
-                q = q.as_of(parse_as_of(&raw)?);
+                q = q.as_of(parse_instant(&raw)?);
             }
             let layer_sel = match layer_of(&layer)? {
                 crate::layout::CODEX => crate::gungnir::Layer::Codex,
@@ -479,29 +568,45 @@ fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 g.search_layer(layer_sel, &q)?
             };
-            for h in &out.hits {
-                println!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary);
-            }
-            if out.hits.is_empty() {
-                let hidden = out.coverage.hidden_superseded + out.coverage.hidden_rolled_back;
-                if out.coverage.total == 0 {
-                    println!("(no knowledge on file)");
-                } else if out.coverage.contradicted > 0 {
-                    println!("(only contradicted knowledge matched this topic)");
-                } else if out.coverage.total_visible() == 0 && hidden > 0 {
-                    println!("(no live knowledge covers this topic; {hidden} superseded or rolled back hidden)");
-                } else {
-                    println!("(no knowledge matched this topic)");
+            let abstained = require_verified && out.hits.is_empty();
+            if json {
+                let mut doc = serde_json::to_value(&out)?;
+                doc["abstained"] = serde_json::Value::Bool(abstained);
+                println!("{}", serde_json::to_string_pretty(&doc)?);
+            } else {
+                for h in &out.hits {
+                    println!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary);
+                }
+                if out.hits.is_empty() {
+                    let hidden = out.coverage.hidden_superseded + out.coverage.hidden_rolled_back;
+                    if out.coverage.total == 0 {
+                        println!("(no knowledge on file)");
+                    } else if out.coverage.contradicted > 0 {
+                        println!("(only contradicted knowledge matched this topic)");
+                    } else if out.coverage.total_visible() == 0 && hidden > 0 {
+                        println!("(no live knowledge covers this topic; {hidden} superseded or rolled back hidden)");
+                    } else {
+                        println!("(no knowledge matched this topic)");
+                    }
+                }
+                println!(
+                    "coverage: {} verified, {} unverified, {} contradicted ({} superseded, {} rolled back hidden)",
+                    out.coverage.verified,
+                    out.coverage.unverified,
+                    out.coverage.contradicted,
+                    out.coverage.hidden_superseded,
+                    out.coverage.hidden_rolled_back
+                );
+                if abstained {
+                    println!(
+                        "no verified knowledge covers this topic ({} matched, 0 verified)",
+                        out.coverage.total_matched()
+                    );
                 }
             }
-            println!(
-                "coverage: {} verified, {} unverified, {} contradicted ({} superseded, {} rolled back hidden)",
-                out.coverage.verified,
-                out.coverage.unverified,
-                out.coverage.contradicted,
-                out.coverage.hidden_superseded,
-                out.coverage.hidden_rolled_back
-            );
+            if abstained {
+                code = EXIT_ABSTAINED;
+            }
             warn_skipped(&out.skipped);
         }
 
@@ -693,13 +798,18 @@ fn dispatch(cli: Cli) -> Result<()> {
             agent,
             task,
             semantic,
+            require_verified,
             limit,
         } => {
+            let mut q = Query::new(&task, limit);
+            if require_verified {
+                q = q.require_verified();
+            }
             let b = if semantic {
                 #[cfg(feature = "embed")]
                 {
                     let e = embedder_for(&g)?;
-                    g.brief_semantic(&agent, &task, limit, e.as_ref())?
+                    g.brief_with_semantic(&agent, &q, e.as_ref())?
                 }
                 #[cfg(not(feature = "embed"))]
                 {
@@ -707,10 +817,100 @@ fn dispatch(cli: Cli) -> Result<()> {
                     unreachable!("--semantic errors without the embed feature")
                 }
             } else {
-                g.brief(&agent, &task, limit)?
+                g.brief_with(&agent, &q)?
             };
             print!("{}", b.markdown);
+            if require_verified && b.codex_coverage.verified + b.journal_coverage.verified == 0 {
+                code = EXIT_ABSTAINED;
+            }
             warn_skipped(&b.skipped);
+        }
+
+        C::Log {
+            id,
+            since,
+            agent,
+            layer,
+        } => {
+            let since_t = since.as_deref().map(parse_instant).transpose()?;
+            match id {
+                Some(id) => {
+                    if agent.is_some() || layer.is_some() {
+                        return Err(Error::Invalid(
+                            "log <id> takes only --since; --agent/--layer apply to the scan".into(),
+                        ));
+                    }
+                    let all = g.all_entries()?;
+                    let report = crate::audit::entry_report(id, &all).ok_or(Error::NotFound(id))?;
+                    print!("{}", crate::audit::format_report(&report, since_t));
+                }
+                None => {
+                    let all = g.all_entries()?;
+                    let all = match layer {
+                        Some(l) => {
+                            let l = scan_layer(&l)?;
+                            all.into_iter()
+                                .filter(|e| crate::audit::in_layer(&e.partition, l))
+                                .collect()
+                        }
+                        None => all,
+                    };
+                    let events = crate::audit::scan_events(&all, since_t, agent.as_deref());
+                    print!("{}", crate::audit::format_events(&events));
+                }
+            }
+        }
+
+        C::Diff {
+            t1,
+            t2,
+            topic,
+            layer,
+        } => {
+            let from = parse_instant(&t1)?;
+            let to = parse_instant(&t2)?;
+            if to < from {
+                return Err(Error::Invalid("diff needs t1 <= t2".into()));
+            }
+            let mut all = g.all_entries()?;
+            if let Some(l) = layer {
+                let l = scan_layer(&l)?;
+                all.retain(|e| crate::audit::in_layer(&e.partition, l));
+            }
+            let snap_from = crate::audit::snapshot(&all, from, topic.as_deref());
+            let snap_to = crate::audit::snapshot(&all, to, topic.as_deref());
+            let diff = crate::audit::snapshot_diff(&snap_from, &snap_to);
+            print!(
+                "{}",
+                crate::audit::format_diff(&diff, from, to, topic.as_deref())
+            );
+        }
+
+        C::Blame { id_or_query } => {
+            let all = g.all_entries()?;
+            let located = crate::audit::resolve(&all, &id_or_query)?;
+            let report = crate::audit::entry_report(located.entry.id, &all)
+                .ok_or(Error::NotFound(located.entry.id))?;
+            print!("{}", crate::audit::format_blame(&report));
+        }
+
+        C::Review { layer } => {
+            let mut all = g.all_entries()?;
+            if let Some(l) = layer {
+                let l = scan_layer(&l)?;
+                all.retain(|e| crate::audit::in_layer(&e.partition, l));
+            }
+            let queue = crate::audit::review_queue(&all);
+            print!("{}", crate::audit::format_review(&queue));
+        }
+
+        C::Entities { name, layer } => {
+            let mut all = g.all_entries()?;
+            if let Some(l) = layer {
+                let l = scan_layer(&l)?;
+                all.retain(|e| crate::audit::in_layer(&e.partition, l));
+            }
+            print!("{}", crate::audit::format_entities(&all, name.as_deref()));
         }
 
         C::Stats { agent, json, topic } => {
@@ -794,7 +994,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         },
     }
-    Ok(())
+    Ok(code)
+}
+
+/// Layer filter for the audit scans: codex, journal, or scratch.
+fn scan_layer(raw: &str) -> Result<&'static str> {
+    match raw {
+        crate::layout::CODEX => Ok(crate::layout::CODEX),
+        crate::layout::JOURNAL => Ok(crate::layout::JOURNAL),
+        crate::layout::SCRATCH => Ok(crate::layout::SCRATCH),
+        other => Err(Error::Invalid(format!(
+            "unknown layer '{other}' (codex|journal|scratch)"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -803,10 +1015,10 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn as_of_rejects_garbage_and_accepts_rfc3339() {
-        let err = parse_as_of("not-rfc3339").unwrap_err().to_string();
-        assert!(err.contains("bad --as-of"), "{err}");
-        assert!(parse_as_of("2026-08-01T00:00:00Z").is_ok());
+    fn timestamps_reject_garbage_and_accept_rfc3339() {
+        let err = parse_instant("not-rfc3339").unwrap_err().to_string();
+        assert!(err.contains("bad timestamp"), "{err}");
+        assert!(parse_instant("2026-08-01T00:00:00Z").is_ok());
     }
 
     fn verify_cli(root: &std::path::Path, cmd: Cmd) -> Cli {

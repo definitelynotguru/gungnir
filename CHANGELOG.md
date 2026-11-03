@@ -85,6 +85,25 @@ All notable changes to Gungnir are documented here. The format follows
   contradiction lifecycle that previously existed only in the Rust API.
 - `Gungnir::add`, `supersede`, `promote`, and `end_session` now return
   outcomes carrying any conflict candidates the write raised.
+- **Audit surface.** `gungnir log <id>` prints an entry's verification
+  records and revises lineage; `log [--since <t>] [--agent <a>] [--layer
+  <l>]` scans creations and verification transitions chronologically across
+  every partition, scratch included. `gungnir diff <t1> <t2>` diffs two
+  as-of snapshots (added / verified / superseded / contradicted / rolled
+  back, with `--topic` and `--layer` scoping). `gungnir blame <id-or-topic>`
+  reports vouching and supersession lineage. `gungnir review` is the triage
+  ritual — unverified belief-kind entries grouped by partition and project
+  with the verbs to act on them.
+- **Entities-lite.** Frontmatter `entities:` names plus `[[name]]` body
+  mentions index through `gungnir entities [name]`; `[[id]]` wikilinks are
+  validated like evidence refs at write time; `supersede` inherits the
+  parent's entities.
+- **Abstention as a surface.** `--require-verified` on `recall`/`brief`
+  (CLI + MCP) returns verified hits only while coverage keeps counting the
+  whole matched pool; an empty verified set is an explicit verdict — CLI
+  exit code 2, `abstained` in `recall --json`, a `coverage:` JSON line on
+  every MCP recall, and a briefing line that states verified-vs-matching
+  precisely.
 
 ### Changed (breaking)
 
