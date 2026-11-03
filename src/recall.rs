@@ -147,6 +147,12 @@ fn stem(word: &str) -> String {
             ("es", ""),
             ("s", ""),
         ] {
+            // A terminal "ss" is never a plural ("access", "class");
+            // stripping it would split the family ("accessing" → "acces"
+            // vs "access" → "acce").
+            if suffix == "s" && w.ends_with("ss") {
+                continue;
+            }
             if let Some(base) = w.strip_suffix(suffix) {
                 if base.len() >= 2 {
                     w = base.to_string() + repl;
@@ -437,6 +443,24 @@ pub fn score(entry: &Entry, query_tokens: &[String], stats: &CorpusStats) -> f64
     raw
 }
 
+/// The entries whose text may influence scoring — the same set `finish`
+/// returns as hits. Hidden entries (rolled back always; superseded tails
+/// and contradicted facts under `current_only`) still count toward
+/// coverage, but they must not shift IDF for visible results, or
+/// retracted history would reorder the present.
+pub(crate) fn stats_pool<'a>(
+    pool: &'a [Candidate],
+    revised: &HashSet<EntryId>,
+    query: &Query,
+) -> Vec<&'a Entry> {
+    pool.iter()
+        .filter(|c| c.state != StateAt::RolledBack)
+        .filter(|c| !query.current_only || !revised.contains(&c.entry.id))
+        .filter(|c| !query.current_only || c.state != StateAt::Contradicted)
+        .map(|c| &c.entry)
+        .collect()
+}
+
 /// Search with coverage accounting for abstention signals.
 ///
 /// Candidate pool = topic-matched entries (score > 0) after temporal filters.
@@ -448,7 +472,7 @@ pub fn search_with_coverage(store: &Store, query: &Query) -> Result<SearchOutcom
     qtokens.dedup();
 
     let (pool, revised, skipped) = temporal_pool(store, query)?;
-    let stats = CorpusStats::new(pool.iter().map(|c| &c.entry));
+    let stats = CorpusStats::new(stats_pool(&pool, &revised, query).into_iter());
     let total = pool.len();
 
     let matched: Vec<(Entry, StateAt, f64)> = pool
@@ -517,6 +541,10 @@ mod tests {
                 );
             }
         }
+        assert_eq!(stem("accessing"), stem("access"));
+        assert_eq!(stem("accessed"), stem("access"));
+        assert_eq!(stem("accesses"), stem("access"));
+        assert_eq!(stem("class"), stem("classes"));
         // Short words stay untouched.
         assert_eq!(stem("db"), "db");
         assert_eq!(stem("go"), "go");

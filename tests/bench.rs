@@ -618,9 +618,10 @@ fn paraphrase() -> Score {
             hybrid_hits += 1;
         }
 
-        // False abstention: knowledge exists under different words, so the
-        // coverage line must not claim none.
-        if hy_found && hy.coverage.total_visible() == 0 {
+        // False abstention: the target exists in the corpus, so the
+        // coverage line must never claim none — whether or not the hit
+        // list found it. An empty-coverage miss is the dangerous direction.
+        if hy.coverage.total_visible() == 0 {
             false_abstentions += 1;
         }
 
