@@ -37,6 +37,10 @@ fn parse_layer(raw: Option<&str>) -> Result<LayerSel> {
 pub struct Server {
     g: Gungnir,
     sessions: HashMap<String, Session>,
+    /// One embedder for the server's life: the inner model loads lazily on
+    /// the first semantic call and stays resident for every later one.
+    #[cfg(feature = "embed")]
+    embedder: Option<crate::embedding::CachedEmbedder<crate::embedding::local::Fastembed>>,
 }
 
 impl Server {
@@ -44,6 +48,8 @@ impl Server {
         Self {
             g,
             sessions: HashMap::new(),
+            #[cfg(feature = "embed")]
+            embedder: None,
         }
     }
 
@@ -242,8 +248,9 @@ impl Server {
                 let out = if self.semantic_enabled(args)? {
                     #[cfg(feature = "embed")]
                     {
+                        self.ensure_embedder()?;
                         self.g
-                            .search_layer_semantic(layer, &q, &self.embedder()?)?
+                            .search_layer_semantic(layer, &q, self.embedder.as_ref().unwrap())?
                     }
                     #[cfg(not(feature = "embed"))]
                     unreachable!("semantic_enabled errors without the embed feature")
@@ -275,8 +282,9 @@ impl Server {
                 let b = if self.semantic_enabled(args)? {
                     #[cfg(feature = "embed")]
                     {
+                        self.ensure_embedder()?;
                         self.g
-                            .brief_semantic(agent, task, limit, &self.embedder()?)?
+                            .brief_semantic(agent, task, limit, self.embedder.as_ref().unwrap())?
                     }
                     #[cfg(not(feature = "embed"))]
                     unreachable!("semantic_enabled errors without the embed feature")
@@ -418,14 +426,17 @@ impl Server {
         Ok(on)
     }
 
+    /// The init borrows end when this returns; call sites then hold a
+    /// plain `&` on `self.embedder` alongside `&self.g`.
     #[cfg(feature = "embed")]
-    fn embedder(
-        &self,
-    ) -> Result<crate::embedding::CachedEmbedder<crate::embedding::local::Fastembed>> {
-        Ok(crate::embedding::CachedEmbedder::new(
-            crate::embedding::local::Fastembed::new(self.g.root())?,
-            self.g.root(),
-        ))
+    fn ensure_embedder(&mut self) -> Result<()> {
+        if self.embedder.is_none() {
+            self.embedder = Some(crate::embedding::CachedEmbedder::new(
+                crate::embedding::local::Fastembed::new(self.g.root())?,
+                self.g.root(),
+            ));
+        }
+        Ok(())
     }
 
     /// Reconstruct the session handle; works across server restarts because
