@@ -35,5 +35,5 @@ pub use gungnir::{
     WriteOutcome,
 };
 pub use id::EntryId;
-pub use recall::{Coverage, Hit, Query, SearchOutcome};
+pub use recall::{Coverage, Hit, Query, SearchOutcome, StateAt};
 pub use store::{Scan, Skipped, Store};

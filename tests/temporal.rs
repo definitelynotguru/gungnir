@@ -421,3 +421,44 @@ fn rollback_restores_ancestor_without_superseding_it() {
     let stats = g.stats(None).unwrap();
     assert_eq!(stats.superseded, 0);
 }
+
+#[test]
+fn require_verified_as_of_reports_the_state_it_filtered_on() {
+    // A verified-only temporal query must serialize the *historical* state
+    // it filtered by, not today's frontmatter state.
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+
+    let counter = Entry::new("a", EntryKind::Observation, "counter data");
+    codex.create(&counter).unwrap();
+
+    let mut e = Entry::new("a", EntryKind::Decision, "sessions pool at ten");
+    e.timestamp = h(0);
+    e.verify("team", None);
+    e.verification_log[0].timestamp = h(0);
+    e.verification_log.push(VerificationRecord {
+        verifier: "ops".into(),
+        timestamp: h(2),
+        status: "contradicted".into(),
+        note: None,
+    });
+    e.verification = gungnir::VerificationState::Contradicted { by: counter.id };
+    codex.create(&e).unwrap();
+
+    let out = g
+        .search_layer(
+            gungnir::Layer::Codex,
+            &Query::new("sessions pool", 10)
+                .require_verified()
+                .as_of(h(1)),
+        )
+        .unwrap();
+    assert_eq!(out.hits.len(), 1);
+    assert_eq!(out.hits[0].state, gungnir::StateAt::Verified);
+    // The entry itself is contradicted *now*; only the hit's state is temporal.
+    assert!(matches!(
+        out.hits[0].entry.verification,
+        gungnir::VerificationState::Contradicted { .. }
+    ));
+}

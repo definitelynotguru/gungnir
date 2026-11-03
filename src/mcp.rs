@@ -330,7 +330,7 @@ impl Server {
                 } else {
                     self.g.search_layer(layer, &q)?
                 };
-                let abstained = require_verified && out.hits.is_empty();
+                let abstained = require_verified && out.coverage.verified == 0;
                 let mut coverage = serde_json::to_value(out.coverage)?;
                 coverage["abstained"] = Value::Bool(abstained);
                 // Coverage is always emitted — the abstention signal is the

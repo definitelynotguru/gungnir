@@ -197,6 +197,7 @@ enum Cmd {
         limit: usize,
     },
 
+
     /// Audit log: one entry's history, or a chronological scan of events.
     ///
     /// `gungnir log <id>` prints the entry's verification log and its
@@ -544,7 +545,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             } else {
                 g.search_layer(layer_sel, &q)?
             };
-            let abstained = require_verified && out.hits.is_empty();
+            let abstained = require_verified && out.coverage.verified == 0;
             if json {
                 let mut doc = serde_json::to_value(&out)?;
                 doc["abstained"] = serde_json::Value::Bool(abstained);

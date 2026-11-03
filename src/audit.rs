@@ -50,8 +50,12 @@ pub struct EntryReport {
     pub entry: Entry,
     /// Ancestors oldest-first (the chain root last in print order).
     pub ancestors: Vec<Located>,
-    /// Entries that revise this one, newest-first.
-    pub successors: Vec<Located>,
+    /// The full descendant chain: every entry reachable through `revises`,
+    /// oldest-first, including rollback records and rolled-back revisions.
+    pub chain: Vec<Located>,
+    /// The live head that replaced this entry, by current-recall rules —
+    /// rollback records and rolled-back revisions do not replace.
+    pub replacement: Option<Located>,
     /// Entries anywhere that cite this one as evidence.
     pub cited_by: Vec<Located>,
     /// Entries anywhere contradicted *by this one*.
@@ -81,12 +85,44 @@ pub fn entry_report(id: EntryId, all: &[Located]) -> Option<EntryReport> {
     }
     ancestors.reverse();
 
-    let mut successors: Vec<Located> = all
+    // The complete descendant lineage, walked transitively so `log` shows
+    // every generation, not just direct children.
+    let mut chain: Vec<Located> = Vec::new();
+    let mut seen: HashSet<EntryId> = HashSet::from([id]);
+    let mut frontier: Vec<Located> = all
         .iter()
         .filter(|l| l.entry.revises == Some(id))
         .cloned()
         .collect();
-    successors.sort_by_key(|l| std::cmp::Reverse(l.entry.id));
+    while !frontier.is_empty() {
+        let mut next_frontier = Vec::new();
+        for l in frontier {
+            if !seen.insert(l.entry.id) {
+                continue; // revises cycle: degrade, don't abort an audit read
+            }
+            next_frontier.extend(
+                all.iter()
+                    .filter(|c| c.entry.revises == Some(l.entry.id))
+                    .cloned(),
+            );
+            chain.push(l);
+        }
+        frontier = next_frontier;
+    }
+    chain.sort_by_key(|l| l.entry.timestamp);
+
+    // `replaced by` applies the same live-revision rule as current recall:
+    // a rollback record restores, it does not replace, and a rolled-back
+    // revision cannot be the current head either.
+    let superseded = superseded_ids(all, None);
+    let replacement = chain
+        .iter()
+        .find(|l| {
+            l.entry.kind != EntryKind::Rollback
+                && l.entry.verification != VerificationState::RolledBack
+                && !superseded.contains_key(&l.entry.id)
+        })
+        .cloned();
 
     let cited_by: Vec<Located> = all
         .iter()
@@ -112,7 +148,8 @@ pub fn entry_report(id: EntryId, all: &[Located]) -> Option<EntryReport> {
         partition: located.partition.clone(),
         entry: located.entry.clone(),
         ancestors,
-        successors,
+        chain,
+        replacement,
         cited_by,
         contradicts,
     })
@@ -148,7 +185,7 @@ pub fn format_report(r: &EntryReport, since: Option<DateTime<Utc>>) -> String {
         fmt_state(&r.entry),
         r.entry.summary
     ));
-    for s in &r.successors {
+    for s in &r.chain {
         out.push_str(&format!(
             "  {}  {}  {}\n",
             s.entry.id,
@@ -598,7 +635,7 @@ pub fn format_blame(r: &EntryReport) -> String {
         (None, _) => {}
     }
 
-    match r.successors.first() {
+    match &r.replacement {
         Some(l) => out.push_str(&format!(
             "replaced by: {}  \"{}\"  [{}]\n",
             l.entry.id,

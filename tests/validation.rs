@@ -121,3 +121,25 @@ fn update_requires_existing_entry() {
     let e = Entry::new("a", EntryKind::Observation, "ghost update");
     assert!(matches!(store.update(&e), Err(Error::NotFound(_))));
 }
+
+#[test]
+fn update_rejects_newly_introduced_dangling_reference() {
+    // Delta rule: existing refs are grandfathered (their target may vanish
+    // with a deleted partition), but a ref the update introduces must
+    // resolve, same as at create.
+    let (_d, store) = setup();
+    let e = Entry::new("a", EntryKind::Decision, "plain decision");
+    store.create(&e).unwrap();
+
+    let mut edited = e.clone();
+    edited.evidence.push(Evidence::Ref {
+        id: gungnir::EntryId::generate(),
+    });
+    match store.update(&edited) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("missing entry"), "{msg}"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+
+    // A reference already present on the stored entry still writes through.
+    store.update(&e).unwrap();
+}
