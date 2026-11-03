@@ -275,7 +275,7 @@ fn mcp_conflict_tools_close_the_loop() {
     let list = p.rpc(&msg(
         1,
         "tools/call",
-        serde_json::json!({"name": "conflicts"}),
+        serde_json::json!({"name": "conflicts", "arguments": {"agent": "ops"}}),
     ));
     let text = list["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("open"), "{text}");
@@ -295,7 +295,7 @@ fn mcp_conflict_tools_close_the_loop() {
     let list = p.rpc(&msg(
         3,
         "tools/call",
-        serde_json::json!({"name": "conflicts"}),
+        serde_json::json!({"name": "conflicts", "arguments": {"agent": "ops"}}),
     ));
     let text = list["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("no open"), "{text}");
@@ -303,7 +303,7 @@ fn mcp_conflict_tools_close_the_loop() {
     let list = p.rpc(&msg(
         4,
         "tools/call",
-        serde_json::json!({"name": "conflicts", "arguments": {"all": true}}),
+        serde_json::json!({"name": "conflicts", "arguments": {"agent": "ops", "all": true}}),
     ));
     let text = list["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("resolved-contradicted"), "{text}");

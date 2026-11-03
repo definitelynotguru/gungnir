@@ -584,3 +584,125 @@ fn briefing_hides_other_agents_journal_conflicts() {
     let theirs = format!("{:?}", g.brief("a", "sessions", 5).unwrap());
     assert!(!theirs.contains("conflict"), "a must not warn: {theirs}");
 }
+
+#[test]
+fn acknowledgment_words_are_not_negations() {
+    let (_d, g) = gng();
+    write_verified(&g, "migration is slow");
+
+    // "noted" stems to `not`; decided on raw tokens it is an
+    // acknowledgment, not a negation, so no candidate is recorded.
+    let out = add_entry(&g, "noted migration is slow");
+    assert!(out.conflicts.is_empty());
+    assert!(g.open_conflicts().unwrap().is_empty());
+}
+
+#[test]
+fn direct_contradict_refuses_to_replace_an_earlier_refutation() {
+    let (_d, g) = gng();
+    let old = write_verified(&g, "sessions use mysql");
+    let first = add_entry(&g, "sessions use postgres");
+    let second = add_entry(&g, "sessions use sqlite");
+
+    g.contradict(old.id, first.id, "ops", None).unwrap();
+
+    // The bare verb now shares the resolve path's refutation policy: a
+    // second contradict cannot swap contradicted_by.
+    let err = g.contradict(old.id, second.id, "ops", None).unwrap_err();
+    assert!(err.to_string().contains("already contradicted"), "{err}");
+
+    let entry = g.codex().unwrap().require(old.id).unwrap();
+    assert_eq!(
+        entry.verification,
+        VerificationState::Contradicted { by: first.id }
+    );
+}
+
+#[test]
+fn direct_contradict_refuses_rolled_back_targets() {
+    let (_d, g) = gng();
+    let old = write_verified(&g, "sessions use mysql");
+    let out = add_entry(&g, "sessions use postgres");
+
+    let codex = g.codex().unwrap();
+    let mut stale = codex.require(old.id).unwrap();
+    stale.mark_rolled_back("ops");
+    codex.update(&stale).unwrap();
+
+    let err = g.contradict(old.id, out.id, "ops", None).unwrap_err();
+    assert!(err.to_string().contains("rolled back"), "{err}");
+}
+
+#[test]
+fn end_session_reports_warnings_when_candidates_cannot_record() {
+    let (d, g) = gng();
+    write_verified(&g, "sessions use mysql");
+    // A regular file where the queue wants its directory: every record
+    // call fails, and the report must surface that as warnings.
+    std::fs::write(d.path().join(".conflicts"), "not a directory").unwrap();
+
+    let s = g.start_session("builder", "migrate sessions").unwrap();
+    let report = g
+        .end_session(
+            &s,
+            "migrated sessions",
+            vec![gungnir::Promotion {
+                kind: EntryKind::Decision,
+                summary: "sessions use postgres".into(),
+                body: "benchmarked".into(),
+                review_of: None,
+            }],
+        )
+        .unwrap();
+    assert!(report.conflicts.is_empty());
+    assert!(!report.warnings.is_empty());
+    // Advisory only: the promotion still landed in the codex.
+    assert!(g.codex().unwrap().exists(report.promoted[0]).unwrap());
+}
+
+#[test]
+fn two_resolvers_cannot_both_close_one_candidate() {
+    let (d, g) = gng();
+    write_verified(&g, "sessions use mysql");
+    let out = add_entry(&g, "sessions use postgres");
+    let cid = out.conflicts[0].id;
+
+    // A second handle over the same root: the queue flock serializes the
+    // Open recheck, so only the first resolver closes the record.
+    let g2 = Gungnir::open(d.path()).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b2 = barrier.clone();
+    let t = std::thread::spawn(move || {
+        b2.wait();
+        g2.resolve_conflict(cid, ConflictVerb::Dismiss, "other")
+    });
+    barrier.wait();
+    let mine = g.resolve_conflict(cid, ConflictVerb::Contradict, "ops");
+    let theirs = t.join().unwrap();
+
+    let (oks, errs): (Vec<_>, Vec<_>) = [mine, theirs].into_iter().partition(|r| r.is_ok());
+    assert_eq!(oks.len(), 1);
+    assert_eq!(errs.len(), 1);
+    let err = errs[0].as_ref().unwrap_err().to_string();
+    assert!(err.contains("already"), "{err}");
+    assert_eq!(g.all_conflicts().unwrap().len(), 1);
+}
+
+#[test]
+fn re_resolving_a_crash_applied_contradiction_closes_the_candidate() {
+    let (_d, g) = gng();
+    let old = write_verified(&g, "sessions use mysql");
+    let out = add_entry(&g, "sessions use postgres");
+    let cid = out.conflicts[0].id;
+
+    // Crash mid-resolve: the entry mutation applied, the record never
+    // closed — the candidate must stay open and re-resolvable.
+    g.contradict(old.id, out.id, "ops", None).unwrap();
+    assert_eq!(g.open_conflicts().unwrap().len(), 1);
+
+    let rec = g
+        .resolve_conflict(cid, ConflictVerb::Contradict, "ops")
+        .unwrap();
+    assert_eq!(rec.status, ConflictStatus::ResolvedContradicted);
+    assert!(g.open_conflicts().unwrap().is_empty());
+}

@@ -100,7 +100,10 @@ Key behaviors:
   `.conflicts/`. `gungnir conflicts` lists them;
   `gungnir conflicts resolve <id> --supersede|--contradict|--dismiss`
   closes the loop through the same logged verbs. Briefings warn while a
-  candidate on the topic stays open.
+  candidate on the topic stays open. Over MCP, `conflicts` and
+  `resolve_conflict` take `agent` and only reach candidates visible to
+  that agent — shared-codex endpoints plus the agent's own journal — so
+  another agent's private claim text never crosses the boundary.
 - **Recall you can reason about.** Keyword scoring over summary (2x) and body,
   ordered by verification bucket: verified > unverified > contradicted;
   rolled-back entries hidden. `--current` resolves supersession chains to

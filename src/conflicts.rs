@@ -69,19 +69,29 @@ const CANDIDATE_LIMIT: usize = 64;
 /// must be about the *same* claim, not merely the same topic.
 const SEMANTIC_CONFLICT_FLOOR: f32 = 0.70;
 
-/// Tokens that flip a claim's truth value, as they survive the tokenizer:
-/// apostrophes split contractions, so "don't" arrives as `don` ("t" is too
-/// short to keep) and "won't" as `won`. `can` is deliberately absent:
-/// "can't" tokenizes to `can`, the same token as positive "can", so it
-/// cannot be told apart without flagging every positive "can" claim — a
-/// documented blind spot. `don`/`won`/`cant`/`wont`/`dont` are kept since
-/// their ordinary senses are rare in fact claims.
+/// Raw (pre-stem) tokens that flip a claim's truth value. Matched before
+/// stemming because the stemmer collapses ordinary words into negations:
+/// "noted"/"noting" stem to `not`. Apostrophes split contractions, so
+/// "don't" still arrives as `don` and "won't" as `won` (kept: the
+/// contraction dwarfs the past-tense verb in claim text). `can` is
+/// deliberately absent — "can't" tokenizes to `can`, indistinguishable
+/// from positive "can", a documented blind spot.
 const NEGATIONS: &[&str] = &[
     "no", "not", "never", "cannot", "cant", "dont", "don", "wont", "won", "isnt", "isn", "arent",
     "aren", "wasnt", "wasn", "werent", "weren", "didnt", "didn", "doesnt", "doesn", "couldnt",
     "couldn", "shouldnt", "shouldn", "mustnt", "mustn", "neednt", "needn", "hasnt", "hasn",
     "hadnt", "hadn", "aint", "ain", "shant", "shan",
 ];
+
+/// Lowercase alphanumeric tokens as written — the shape negations have
+/// before the tokenizer's stopword filter and stemmer run.
+fn raw_tokens(text: &str) -> HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
 
 /// Unique id for a conflict-candidate record. ULID-backed like [`EntryId`]
 /// but a separate type: a candidate id is not an entry id, and passing one
@@ -363,12 +373,15 @@ impl Conflicts {
         self.ids()?.into_iter().map(|id| self.require(id)).collect()
     }
 
-    /// Open candidates, skipping records that fail to parse. Briefings read
-    /// through this so one corrupt file degrades a warning instead of
-    /// failing the read; `conflicts`/`resolve` stay strict and report it.
+    /// Open candidates, tolerating every read failure: unparseable records
+    /// are skipped and an unreadable queue directory reads as empty.
+    /// Briefings read through this — a corrupt or missing queue degrades
+    /// the warning, never the briefing; `conflicts`/`resolve` stay strict
+    /// and report it.
     pub fn open_lenient(&self) -> Result<Vec<ConflictRecord>> {
         Ok(self
-            .ids()?
+            .ids()
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|id| self.get(id).ok().flatten())
             .filter(|c| c.status == ConflictStatus::Open)
@@ -475,8 +488,11 @@ fn lexical_signals(new: &str, old: &str) -> Vec<ConflictSignal> {
     if shared.len() >= 2 && new_private && old_private {
         signals.push(ConflictSignal::SharedFrame);
     }
-    let negates = |t: &HashSet<String>| NEGATIONS.iter().any(|n| t.contains(*n));
-    if negates(&new_t) != negates(&old_t) {
+    // Negation is decided on raw tokens: the stemmer turns "noted" into
+    // `not`, so stemmed sets would read acknowledgment words as negations.
+    let new_neg = NEGATIONS.iter().any(|n| raw_tokens(new).contains(*n));
+    let old_neg = NEGATIONS.iter().any(|n| raw_tokens(old).contains(*n));
+    if new_neg != old_neg {
         signals.push(ConflictSignal::NegationAsymmetry);
     }
     let new_nums = digit_tokens(new);
@@ -498,126 +514,161 @@ pub fn detect(
     entry: &Entry,
     embedder: Option<&dyn Embedder>,
 ) -> Result<Vec<ConflictRecord>> {
-    if !detectable(entry) {
+    detect_many(store, layer, std::slice::from_ref(entry), embedder)
+}
+
+/// `detect` for several claims in one pass: the temporal pool, corpus
+/// stats, and the embedder call are built once for all `entries`, so
+/// `end_session` promoting N claims pays one store scan instead of N.
+pub fn detect_many(
+    store: &Store,
+    layer: &str,
+    entries: &[Entry],
+    embedder: Option<&dyn Embedder>,
+) -> Result<Vec<ConflictRecord>> {
+    let entries: Vec<&Entry> = entries.iter().filter(|e| detectable(e)).collect();
+    if entries.is_empty() {
         return Ok(vec![]);
     }
-    let excluded = excluded_ids(entry);
-    let live_verified = |e: &Entry| {
-        detectable(e) && e.verification == VerificationState::Verified && !excluded.contains(&e.id)
+    let excluded: Vec<HashSet<EntryId>> = entries.iter().map(|e| excluded_ids(e)).collect();
+
+    // One `current`-view pool for both channels: `state`/`revised` hide
+    // superseded tails and contradicted facts from candidacy.
+    let q = Query::new("", CANDIDATE_LIMIT).current();
+    let (pool, revised, _skipped) = recall::temporal_pool(store, &q)?;
+    let stats = recall::CorpusStats::new(pool.iter().map(|c| &c.entry));
+
+    // Semantic vectors: every pool text, then one per new claim — a single
+    // embed call covers the batch.
+    let vectors = match embedder {
+        None => None,
+        Some(embedder) => {
+            let mut texts: Vec<String> = pool
+                .iter()
+                .map(|c| format!("{}\n{}", c.entry.summary, c.entry.body))
+                .collect();
+            texts.extend(entries.iter().map(|e| format!("{}\n{}", e.summary, e.body)));
+            let vectors = embedder.embed(&texts)?;
+            // The trait documents no length contract; a count that differs
+            // in either direction would misalign candidates with vectors
+            // or panic.
+            if vectors.len() != texts.len() {
+                return Err(Error::Invalid(format!(
+                    "embedder returned {} vectors for {} texts",
+                    vectors.len(),
+                    texts.len()
+                )));
+            }
+            Some(vectors)
+        }
     };
 
-    let mut signals_by_id: BTreeMap<EntryId, Vec<ConflictSignal>> = BTreeMap::new();
-    // Record order for the candidate cap: keyword hits by rank first, then
-    // semantic-only matches in pool order.
-    let mut order: Vec<EntryId> = Vec::new();
-    let mut summaries: HashMap<EntryId, String> = HashMap::new();
+    let now = Utc::now();
+    let mut records = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let excluded = &excluded[i];
+        let eligible = |cand: &recall::Candidate| {
+            cand.state == StateAt::Verified
+                && !revised.contains(&cand.entry.id)
+                && detectable(&cand.entry)
+                && cand.entry.verification == VerificationState::Verified
+                && !excluded.contains(&cand.entry.id)
+        };
 
-    // Keyword channel: BM25-lite topic match under the `current` view, so
-    // superseded tails and contradicted facts can't be candidates.
-    let q = Query::new(
-        format!("{}\n{}", entry.summary, entry.body),
-        CANDIDATE_LIMIT,
-    )
-    .current();
-    let outcome = recall::search_with_coverage(store, &q)?;
-    for hit in outcome.hits {
-        if !live_verified(&hit.entry) {
-            continue;
-        }
-        let signals = lexical_signals(&entry.summary, &hit.entry.summary);
-        summaries.insert(hit.entry.id, hit.entry.summary.clone());
-        if signals.is_empty() {
-            continue;
-        }
-        order.push(hit.entry.id);
-        signals_by_id.insert(hit.entry.id, signals);
-    }
+        let mut signals_by_id: BTreeMap<EntryId, Vec<ConflictSignal>> = BTreeMap::new();
+        // Record order for the candidate cap: keyword hits by relevance
+        // first, then semantic-only matches in pool order.
+        let mut order: Vec<EntryId> = Vec::new();
+        let mut summaries: HashMap<EntryId, String> = HashMap::new();
 
-    // Semantic channel: cosine over the same temporal pool. A paraphrased
-    // contradiction has no shared tokens; vectors still put it next to the
-    // claim it disputes.
-    if let Some(embedder) = embedder {
-        let (pool, revised, _skipped) = recall::temporal_pool(store, &q)?;
-        let mut texts: Vec<String> = pool
+        // Keyword channel: BM25-lite topic match over the same pool.
+        let q_tokens = recall::tokenize(&format!("{}\n{}", entry.summary, entry.body));
+        let mut scored: Vec<(f64, &recall::Candidate)> = pool
             .iter()
-            .map(|c| format!("{}\n{}", c.entry.summary, c.entry.body))
+            .filter(|c| eligible(c))
+            .map(|c| (recall::score(&c.entry, &q_tokens, &stats), c))
+            .filter(|(s, _)| *s > 0.0)
             .collect();
-        texts.push(format!("{}\n{}", entry.summary, entry.body));
-        let vectors = embedder.embed(&texts)?;
-        // The trait documents no length contract; a count that differs in
-        // either direction would misalign candidates with vectors or panic.
-        if vectors.len() != texts.len() {
-            return Err(Error::Invalid(format!(
-                "embedder returned {} vectors for {} texts",
-                vectors.len(),
-                texts.len()
-            )));
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (_, cand) in scored {
+            let signals = lexical_signals(&entry.summary, &cand.entry.summary);
+            summaries.insert(cand.entry.id, cand.entry.summary.clone());
+            if signals.is_empty() {
+                continue;
+            }
+            order.push(cand.entry.id);
+            signals_by_id.insert(cand.entry.id, signals);
         }
-        let qv = &vectors[vectors.len() - 1];
-        let new_t: HashSet<String> =
-            recall::tokenize(&format!("{}\n{}", entry.summary, entry.body))
-                .into_iter()
-                .collect();
-        for (cand, vec) in pool.iter().zip(&vectors) {
-            if cand.state != StateAt::Verified
-                || revised.contains(&cand.entry.id)
-                || !live_verified(&cand.entry)
-            {
-                continue;
-            }
-            if embedding::cosine(qv, vec) < SEMANTIC_CONFLICT_FLOOR {
-                continue;
-            }
-            // Same guard lexical_signals applies on the keyword channel: an
-            // identical stemmed token set is corroboration, never a
-            // candidate — identical text always embeds above the floor.
-            // Compared over summary + body, the text that was embedded: a
-            // same-summary pair whose bodies disagree can be a real
-            // contradiction the keyword channel can't see.
-            let cand_t: HashSet<String> =
-                recall::tokenize(&format!("{}\n{}", cand.entry.summary, cand.entry.body))
+
+        // Semantic channel: cosine against this claim's vector. A
+        // paraphrased contradiction has no shared tokens; vectors still
+        // put it next to the claim it disputes.
+        if let Some(vectors) = &vectors {
+            let qv = &vectors[pool.len() + i];
+            let new_t: HashSet<String> =
+                recall::tokenize(&format!("{}\n{}", entry.summary, entry.body))
                     .into_iter()
                     .collect();
-            if cand_t == new_t {
-                continue;
-            }
-            summaries
-                .entry(cand.entry.id)
-                .or_insert_with(|| cand.entry.summary.clone());
-            let mut signals = lexical_signals(&entry.summary, &cand.entry.summary);
-            signals.push(ConflictSignal::SemanticOverlap);
-            let existing = signals_by_id.entry(cand.entry.id).or_default();
-            if existing.is_empty() {
-                order.push(cand.entry.id);
-            }
-            for s in signals {
-                if !existing.contains(&s) {
-                    existing.push(s);
+            for (cand, vec) in pool.iter().zip(&vectors[..pool.len()]) {
+                if !eligible(cand) {
+                    continue;
                 }
+                if embedding::cosine(qv, vec) < SEMANTIC_CONFLICT_FLOOR {
+                    continue;
+                }
+                // Same guard lexical_signals applies on the keyword
+                // channel: an identical stemmed token set is
+                // corroboration, never a candidate — identical text
+                // always embeds above the floor. Compared over
+                // summary + body, the text that was embedded: a
+                // same-summary pair whose bodies disagree can be a
+                // real contradiction the keyword channel can't see.
+                let cand_t: HashSet<String> =
+                    recall::tokenize(&format!("{}\n{}", cand.entry.summary, cand.entry.body))
+                        .into_iter()
+                        .collect();
+                if cand_t == new_t {
+                    continue;
+                }
+                summaries
+                    .entry(cand.entry.id)
+                    .or_insert_with(|| cand.entry.summary.clone());
+                let mut signals = lexical_signals(&entry.summary, &cand.entry.summary);
+                signals.push(ConflictSignal::SemanticOverlap);
+                let existing = signals_by_id.entry(cand.entry.id).or_default();
+                if existing.is_empty() {
+                    order.push(cand.entry.id);
+                }
+                for s in signals {
+                    if !existing.contains(&s) {
+                        existing.push(s);
+                    }
+                }
+                existing.sort();
             }
-            existing.sort();
         }
-    }
 
-    let now = Utc::now();
-    Ok(order
-        .into_iter()
-        .take(CANDIDATE_LIMIT)
-        .filter_map(|id| signals_by_id.remove(&id).map(|signals| (id, signals)))
-        .map(|(conflicting_entry, signals)| ConflictRecord {
-            id: ConflictId::generate(),
-            layer: layer.to_string(),
-            new_entry: entry.id,
-            conflicting_entry,
-            new_summary: entry.summary.clone(),
-            conflicting_summary: summaries.remove(&conflicting_entry).unwrap_or_default(),
-            signals,
-            detected_at: now,
-            status: ConflictStatus::Open,
-            resolved_by: None,
-            resolved_at: None,
-        })
-        .collect())
+        records.extend(
+            order
+                .into_iter()
+                .take(CANDIDATE_LIMIT)
+                .filter_map(|id| signals_by_id.remove(&id).map(|signals| (id, signals)))
+                .map(|(conflicting_entry, signals)| ConflictRecord {
+                    id: ConflictId::generate(),
+                    layer: layer.to_string(),
+                    new_entry: entry.id,
+                    conflicting_entry,
+                    new_summary: entry.summary.clone(),
+                    conflicting_summary: summaries.remove(&conflicting_entry).unwrap_or_default(),
+                    signals,
+                    detected_at: now,
+                    status: ConflictStatus::Open,
+                    resolved_by: None,
+                    resolved_at: None,
+                }),
+        );
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
