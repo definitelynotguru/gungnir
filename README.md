@@ -91,7 +91,11 @@ Key behaviors:
   history from the verification log, no schema change required. Every search
   reports coverage, and briefings say plainly when no verified knowledge
   covers a task. Hybrid vector+keyword fusion via reciprocal rank fusion is
-  available by plugging in an embedder (`src/embedding.rs`).
+  available per query: `--semantic` on `recall`/`brief` (or
+  `"semantic": true` on the MCP tools) when built with
+  `cargo build --features embed`, which ships a local bge-small-en-v1.5
+  model (~100MB, downloaded once into `.cache`). Without the feature,
+  scoring is BM25-lite with stemming — still zero network.
 
 ## Library
 

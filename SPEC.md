@@ -75,11 +75,14 @@ Body: free-form markdown after the closing `---`.
 
 ## Recall
 
-Default mode: keyword scoring — token overlap across `summary` + body,
-case-folded, split on non-alphanumerics; summary hits weigh double over body
-hits. Filtering happens before scoring. Sort key: `(verification_bucket,
-score)` where bucket orders verified > unverified > contradicted;
-rolled-back entries are always hidden.
+Default mode: BM25-lite keyword scoring — `idf × tf` across `summary`
+(weight 2) + body, length-normalized, over a stemmed, stopword-stripped
+vocabulary so inflections collapse ("migrating" matches "migration").
+Filtering happens before scoring. Sort key: `(verification_bucket,
+final_score)` where bucket orders verified > unverified > contradicted
+and `final_score = relevance × trust × recency` — trust weights the bucket
+(1.0 / 0.75 / 0.35) and recency decays at a 90-day half-life floored at
+0.25. Rolled-back entries are always hidden.
 
 Temporal modes:
 
@@ -115,9 +118,15 @@ real task text even when the ending process only knows the session id.
 `end_session` is idempotent: re-ending an already-archived session reports
 `already_ended` instead of writing a second journal entry.
 
-Hybrid mode (pluggable embedder): fuse keyword ranks with embedding cosine
-ranks via reciprocal rank fusion (k = 60). Vector cache keyed by
-`(model, sha256(normalized text))` — content-addressed, immune to mtime skew.
+Hybrid mode (`--semantic` on CLI, `semantic: true` on MCP) fuses keyword
+ranks with embedding cosine ranks via reciprocal rank fusion (k = 60) over
+the same temporal pool, coverage, and ordering rule. A candidate is
+topic-matched on a keyword hit or cosine ≥ 0.45. The `embed` cargo feature
+ships a local embedder (bge-small-en-v1.5, ~100MB into `.cache` on first
+use); without it, semantic requests error. Vector cache keyed by
+`(model, sha256(normalized text))` — content-addressed, immune to mtime
+skew. Scoring is O(N) cosine per query; ~10k entries is the practical
+ceiling before a real index is worth its corruption modes.
 
 ## Rollback (non-destructive)
 

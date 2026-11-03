@@ -29,6 +29,27 @@ All notable changes to Gungnir are documented here. The format follows
 - **Session identity persistence.** `start_session` writes
   `scratch/<id>/.session.yaml`, so `end_session` archives the real task
   text even when the ending process only knows the session id.
+- **Semantic recall.** `recall --semantic` and `brief --semantic` (CLI), plus
+  `semantic: true` on the MCP `recall`/`brief` tools, fuse embedding cosine
+  ranks with keyword ranks via RRF. The `embed` cargo feature ships a local
+  embedder: bge-small-en-v1.5 quantized via fastembed/ONNX, ~100MB of weights
+  lazily downloaded into `.cache/fastembed` on first use — the only network
+  call gungnir makes, and only when the feature is compiled in. Without the
+  feature, semantic requests error instead of silently degrading. Default
+  build stays zero-network and makes no new dependencies.
+- **BM25-lite keyword scoring.** The recall scorer is now `idf × tf` over a
+  stemmed vocabulary (a compact built-in stemmer collapses inflections like
+  "migrating" → "migration") with summary weight 2 and length normalization —
+  strictly stronger than the previous boolean token-presence score.
+- **Trust-weighted ranking.** Final order is `(verification_bucket,
+  relevance × trust × recency)` where trust weights verified 1.0 /
+  unverified 0.75 / contradicted 0.35 and recency decays at a 90-day
+  half-life floored at 0.25. Formula documented in docs/DESIGN.md; applies
+  identically in keyword and hybrid mode.
+- **Paraphrase bench.** The bench adds a 18-check paraphrase suite measuring
+  legacy boolean scoring vs BM25-lite vs hybrid recall and asserting hybrid
+  coverage never falsely abstains when knowledge exists under different
+  words.
 
 ### Changed (breaking)
 
@@ -73,6 +94,11 @@ All notable changes to Gungnir are documented here. The format follows
 - **Length caps count chars, not bytes**, matching SPEC.md's "≤ 200 chars".
 - **Rollback validates evidence refs cross-layer**, like `verify` already
   did — necessary now that revisions carry evidence.
+- **`hybrid_search` honors the temporal contract.** It previously ignored
+  `Query::as_of` and `Query::current_only`, which would have broken temporal
+  recall in hybrid mode, and returned no `Coverage`, which would have
+  disabled the abstention signal. It now shares the keyword path's temporal
+  pool and coverage accounting.
 
 ## [0.2.0] - 2026-08-26
 

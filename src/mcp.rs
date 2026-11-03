@@ -94,21 +94,23 @@ impl Server {
             },
             {
                 "name": "recall",
-                "description": "Keyword search. layer: codex (default) or journal.",
+                "description": "Keyword search. layer: codex (default) or journal. semantic: fuse in embedding similarity (needs the `embed` build).",
                 "inputSchema": schema(json!({
                     "query": {"type": "string"},
                     "layer": {"type": "string", "enum": ["codex", "journal"]},
                     "agent": {"type": "string"},
-                    "limit": {"type": "integer"}
+                    "limit": {"type": "integer"},
+                    "semantic": {"type": "boolean"}
                 }), &["query"])
             },
             {
                 "name": "brief",
-                "description": "Compile the pre-task briefing without opening a session.",
+                "description": "Compile the pre-task briefing without opening a session. semantic: fuse in embedding similarity (needs the `embed` build).",
                 "inputSchema": schema(json!({
                     "agent": {"type": "string"},
                     "task": {"type": "string"},
-                    "limit": {"type": "integer"}
+                    "limit": {"type": "integer"},
+                    "semantic": {"type": "boolean"}
                 }), &["agent", "task"])
             },
             {
@@ -229,15 +231,24 @@ impl Server {
                 let query = arg("query").ok_or_else(|| Error::Invalid("query required".into()))?;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
                 let q = Query::new(query, limit);
-                let out = match parse_layer(arg("layer"))? {
-                    LayerSel::Journal => {
-                        let agent = arg("agent").ok_or_else(|| {
+                let layer = match parse_layer(arg("layer"))? {
+                    LayerSel::Journal => crate::gungnir::Layer::Journal {
+                        agent: arg("agent").ok_or_else(|| {
                             Error::Invalid("agent required for journal recall".into())
-                        })?;
+                        })?,
+                    },
+                    LayerSel::Codex => crate::gungnir::Layer::Codex,
+                };
+                let out = if self.semantic_enabled(args)? {
+                    #[cfg(feature = "embed")]
+                    {
                         self.g
-                            .search_layer(crate::gungnir::Layer::Journal { agent }, &q)?
+                            .search_layer_semantic(layer, &q, &self.embedder()?)?
                     }
-                    LayerSel::Codex => self.g.search_layer(crate::gungnir::Layer::Codex, &q)?,
+                    #[cfg(not(feature = "embed"))]
+                    unreachable!("semantic_enabled errors without the embed feature")
+                } else {
+                    self.g.search_layer(layer, &q)?
                 };
                 let mut text = if out.hits.is_empty() {
                     "no matches".to_string()
@@ -261,7 +272,17 @@ impl Server {
                 let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let task = arg("task").ok_or_else(|| Error::Invalid("task required".into()))?;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
-                let b = self.g.brief(agent, task, limit)?;
+                let b = if self.semantic_enabled(args)? {
+                    #[cfg(feature = "embed")]
+                    {
+                        self.g
+                            .brief_semantic(agent, task, limit, &self.embedder()?)?
+                    }
+                    #[cfg(not(feature = "embed"))]
+                    unreachable!("semantic_enabled errors without the embed feature")
+                } else {
+                    self.g.brief(agent, task, limit)?
+                };
                 let mut text = b.markdown;
                 for s in &b.skipped {
                     text.push_str(&format!(
@@ -378,6 +399,33 @@ impl Server {
             }
             other => Err(Error::Invalid(format!("unknown tool '{other}'"))),
         }
+    }
+
+    /// `semantic: true` on a tool call requests hybrid search. Without the
+    /// `embed` build the honest answer is an error, not a silent keyword
+    /// search dressed as semantic.
+    fn semantic_enabled(&self, args: &Value) -> Result<bool> {
+        let on = args
+            .get("semantic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        #[cfg(not(feature = "embed"))]
+        if on {
+            return Err(Error::Invalid(
+                "semantic recall requires a build with `--features embed`".into(),
+            ));
+        }
+        Ok(on)
+    }
+
+    #[cfg(feature = "embed")]
+    fn embedder(
+        &self,
+    ) -> Result<crate::embedding::CachedEmbedder<crate::embedding::local::Fastembed>> {
+        Ok(crate::embedding::CachedEmbedder::new(
+            crate::embedding::local::Fastembed::new(self.g.root())?,
+            self.g.root(),
+        ))
     }
 
     /// Reconstruct the session handle; works across server restarts because

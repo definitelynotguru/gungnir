@@ -152,6 +152,7 @@ fn gungnir_bench() {
         knowledge_updates(&c),
         temporal(&c),
         abstention(&c),
+        paraphrase(),
     ];
 
     let total: usize = scores.iter().map(|s| s.total).sum();
@@ -348,6 +349,322 @@ fn abstention(c: &Corpus) -> Score {
     s.check(
         "abstention line when nothing matched",
         b.markdown.contains("No knowledge matched this task"),
+    );
+
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Paraphrase recall: same corpus, three retrieval methods.
+//
+// legacy  — the pre-P1 scorer (boolean token presence, no stemming, no IDF),
+//           reimplemented here so the regression is measured, not asserted.
+// bm25    — shipped keyword path (BM25-lite + stemmer).
+// hybrid  — BM25-lite fused with a deterministic SynonymEmbedder through
+//           `search_layer_semantic`.
+//
+// The embedder is a test double, not a real model: it maps words onto
+// synonym-cluster basis vectors, so its cosine is a stand-in for semantic
+// similarity, not a measurement of any shipped model's quality. What it
+// DOES measure is the machinery end to end — temporal filter, fusion,
+// coverage, abstention — which is what this change ships.
+// ---------------------------------------------------------------------------
+
+/// Words grouped by meaning. Any word in a cluster lights that basis
+/// dimension; two texts sharing a cluster get positive cosine even with
+/// zero shared tokens.
+const CLUSTERS: &[&[&str]] = &[
+    &["postgres", "database", "db", "sql"],
+    &["connection", "connections", "pool", "pooling", "pgbouncer"],
+    &[
+        "exhaustion",
+        "exhausted",
+        "saturation",
+        "leak",
+        "leaks",
+        "limit",
+        "limits",
+    ],
+    &[
+        "migrate",
+        "migrating",
+        "migration",
+        "moved",
+        "move",
+        "switch",
+    ],
+    &["session", "sessions", "storage"],
+    &[
+        "deploy",
+        "deployment",
+        "release",
+        "releases",
+        "rollout",
+        "ship",
+        "shipping",
+    ],
+    &["flag", "flags", "gated", "toggle", "feature"],
+    &["auth", "oauth", "login", "authentication", "sso"],
+    &["index", "indexes", "idx", "ordering"],
+    &["slow", "latency", "bottleneck", "performance"],
+    &["checkout", "payment", "cart"],
+    &[
+        "cache",
+        "redis",
+        "memcached",
+        "caching",
+        "eviction",
+        "memory",
+    ],
+    &["budget", "finance", "reviews"],
+];
+
+struct SynonymEmbedder;
+
+impl gungnir::embedding::Embedder for SynonymEmbedder {
+    fn model(&self) -> &str {
+        "synonym-test-double"
+    }
+    fn embed(&self, texts: &[String]) -> gungnir::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                let lower = t.to_lowercase();
+                let words: Vec<&str> = lower
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| w.len() > 1)
+                    .collect();
+                CLUSTERS
+                    .iter()
+                    .map(|cluster| {
+                        if words
+                            .iter()
+                            .any(|w| cluster.iter().any(|cw| w == cw || w.starts_with(cw)))
+                        {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+}
+
+/// The scorer recall.rs shipped before this change: unique query tokens,
+/// boolean presence (summary ×2, body ×1), normalized by token count.
+fn legacy_hit(entry: &gungnir::Entry, query_tokens: &[&str]) -> bool {
+    let summary = entry.summary.to_lowercase();
+    let body = entry.body.to_lowercase();
+    let contains =
+        |text: &str, qt: &str| text.split(|c: char| !c.is_alphanumeric()).any(|t| t == qt);
+    let mut raw = 0.0;
+    for qt in query_tokens {
+        if contains(&summary, qt) {
+            raw += 2.0;
+        } else if contains(&body, qt) {
+            raw += 1.0;
+        }
+    }
+    raw / query_tokens.len() as f64 > 0.0
+}
+
+/// A paraphrase query plus the summary substring identifying its target.
+struct ParaCase {
+    query: &'static str,
+    /// What the writer called it — the vocabulary gap is the point.
+    target: &'static str,
+    /// legacy scorer expectation, computed by hand from vocab overlap.
+    legacy_would_miss: bool,
+}
+
+fn paraphrase() -> Score {
+    let mut s = Score::new("paraphrase recall");
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+
+    let entries = [
+        (
+            "pgbouncer tunes pooling for postgres",
+            "pool sized to 50 clients",
+        ),
+        (
+            "migrating sessions from mysql to postgres",
+            "cutover ran clean",
+        ),
+        (
+            "feature flag rollout via launchdarkly",
+            "gradual releases only",
+        ),
+        ("oauth login moved to sso", "single sign on enforced"),
+        (
+            "redis eviction policy for session cache",
+            "lru capped at 2gb",
+        ),
+        (
+            "index on orders table removed seq scan",
+            "query time 800ms to 12ms",
+        ),
+        ("budget reviews moved to q1", "finance calendar updated"),
+        // Noise entries whose vocabulary touches no query cluster.
+        (
+            "meeting room hera seats eight",
+            "bookings through the calendar",
+        ),
+        ("parking pass renewal", "forms on the intranet"),
+    ];
+    for (i, (summary, body)) in entries.iter().enumerate() {
+        let mut e = Entry::new("ops", EntryKind::Decision, *summary);
+        e.body = (*body).into();
+        codex.create(&e).unwrap();
+        // Verify every other entry so coverage has both buckets present.
+        if i % 2 == 0 {
+            g.verify(e.id, "ops-lead", None).unwrap();
+        }
+    }
+
+    let cases = [
+        // Vocabulary-disjoint: only the vector channel can find these.
+        ParaCase {
+            query: "database connection limits",
+            target: "pgbouncer",
+            legacy_would_miss: true,
+        },
+        ParaCase {
+            query: "deploying toggled functionality",
+            target: "launchdarkly",
+            legacy_would_miss: true,
+        },
+        ParaCase {
+            query: "authentication flow",
+            target: "oauth login",
+            legacy_would_miss: true,
+        },
+        // Inflection gap: shared roots under different word forms — the
+        // stemmer bridges these, boolean tokens cannot.
+        ParaCase {
+            query: "session storage migration",
+            target: "migrating sessions",
+            legacy_would_miss: true,
+        },
+        ParaCase {
+            query: "ordering indexes",
+            target: "index on orders",
+            legacy_would_miss: true,
+        },
+        // Shared vocabulary: everyone finds these.
+        ParaCase {
+            query: "session cache evictions",
+            target: "redis eviction",
+            legacy_would_miss: false,
+        },
+        ParaCase {
+            query: "budget reviews",
+            target: "budget reviews",
+            legacy_would_miss: false,
+        },
+    ];
+
+    let embedder = gungnir::embedding::CachedEmbedder::new(SynonymEmbedder, dir.path());
+    let store = g.codex().unwrap();
+    let all = store.entries().unwrap();
+
+    let mut legacy_hits = 0;
+    let mut bm25_hits = 0;
+    let mut hybrid_hits = 0;
+    let mut false_abstentions = 0;
+
+    println!(
+        "\nparaphrase suite ({} queries, {} entries)",
+        cases.len(),
+        all.len()
+    );
+    for case in &cases {
+        // legacy
+        let qtokens: Vec<&str> = case
+            .query
+            .split_whitespace()
+            .filter(|t| t.len() > 1)
+            .collect();
+        let legacy_found = all
+            .iter()
+            .any(|e| legacy_hit(e, &qtokens) && e.summary.contains(case.target));
+        if legacy_found {
+            legacy_hits += 1;
+        }
+
+        // bm25 (shipped keyword path)
+        let q = Query::new(case.query, 10);
+        let kw = g.search_layer(gungnir::Layer::Codex, &q).unwrap();
+        let kw_found = kw
+            .hits
+            .iter()
+            .any(|h| h.entry.summary.contains(case.target));
+        if kw_found {
+            bm25_hits += 1;
+        }
+
+        // hybrid
+        let hy = g
+            .search_layer_semantic(gungnir::Layer::Codex, &q, &embedder)
+            .unwrap();
+        let hy_found = hy
+            .hits
+            .iter()
+            .any(|h| h.entry.summary.contains(case.target));
+        if hy_found {
+            hybrid_hits += 1;
+        }
+
+        // False abstention: knowledge exists under different words, so the
+        // coverage line must not claim none.
+        if hy_found && hy.coverage.total_visible() == 0 {
+            false_abstentions += 1;
+        }
+
+        println!(
+            "  {:<32} legacy={} bm25={} hybrid={} cov={}",
+            case.query,
+            legacy_found as u8,
+            kw_found as u8,
+            hy_found as u8,
+            hy.coverage.total_visible()
+        );
+        // The fixture's premise must hold: vocabulary the legacy scorer
+        // cannot bridge really is absent for it, otherwise the suite
+        // measures nothing.
+        s.check(
+            &format!("legacy gap exists for '{}'", case.query),
+            legacy_found == !case.legacy_would_miss,
+        );
+        s.check(&format!("hybrid finds '{}'", case.query), hy_found);
+    }
+
+    println!(
+        "\nrecall@1-of-target over {} paraphrase queries: legacy={} bm25={} hybrid={}",
+        cases.len(),
+        legacy_hits,
+        bm25_hits,
+        hybrid_hits
+    );
+
+    s.check(
+        "bm25-lite beats the legacy boolean scorer",
+        bm25_hits > legacy_hits,
+    );
+    s.check(
+        "hybrid beats bm25-lite on paraphrases",
+        hybrid_hits > bm25_hits,
+    );
+    s.check(
+        "hybrid finds every paraphrase target",
+        hybrid_hits == cases.len(),
+    );
+    s.check(
+        "no false abstention when knowledge exists under other words",
+        false_abstentions == 0,
     );
 
     s

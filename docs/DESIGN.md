@@ -79,20 +79,48 @@ rules govern both, and adding a rule means touching one file.
 
 ## Recall
 
-Default mode is keyword scoring. Query tokens (stopwords stripped) match
-against summary and body; summary hits weigh double. Filtering happens before
-scoring. Results sort by verification bucket first, score second:
-verified outranks unverified at equal relevance, contradicted sinks,
-rolled-back entries disappear entirely.
+Two retrieval modes share one contract: the same temporal candidate pool
+(`as_of` filters by entry timestamp and evaluates verification from the log,
+`current_only` resolves revises chains to heads), the same coverage
+accounting, and the same ordering rule.
 
-Hybrid mode fuses keyword ranks with embedding cosine ranks through reciprocal
-rank fusion (k = 60). The fusion function is pure and unit-tested against a
-fake embedder; no network code ships in the default build.
+**Keyword mode (default, zero dependencies)** is BM25-lite: query and entry
+text tokenize through a small English stemmer ("migrating" meets
+"migration"), then score as `idf × tf` over summary (weight 2) and body with
+length normalization. Entries are already loaded for the candidate pool, so
+document frequency is free — no index, no persistence.
+
+**Hybrid mode (opt-in)** fuses the keyword ranking with embedding cosine
+ranks through reciprocal rank fusion (k = 60). A candidate counts as
+topic-matched when it has signal in either channel: a keyword hit, or
+cosine ≥ 0.45, a floor that keeps near-random similarity from manufacturing
+coverage. Hybrid runs when the caller passes `--semantic` (CLI) or
+`semantic: true` (MCP) and an embedder is available; the `embed` cargo
+feature ships one — bge-small-en-v1.5 quantized via fastembed/ONNX, ~100MB
+of weights downloaded on first use into `.cache/fastembed`. Without the
+feature, semantic requests error rather than silently degrading to keyword.
+
+**Scoring formula, both modes.** Final order is a verification bucket
+(verified > unverified > contradicted) sorted lexicographically first, then
+the score `relevance × trust × recency`:
+
+- `relevance`: BM25-lite for keyword, RRF score ×1000 for hybrid.
+- `trust`: 1.0 verified, 0.75 unverified, 0.35 contradicted. Because the
+  bucket sorts first, a contradicted entry can never outrank a verified one
+  on the same topic regardless of relevance.
+- `recency`: exponential decay in entry age at the query instant,
+  half-life 90 days, floored at 0.25 so old-but-true facts keep a floor.
 
 The embedding cache is content-addressed: `sha256(model + "\n" +
 normalized_text)`. Editing a file invalidates its vector naturally. Switching
 models partitions the cache by directory. Nothing keys on mtime, because
 mtimes lie under git operations, sync tools, and restores.
+
+Hybrid recall is O(N) cosine over the candidate pool per query — fine to
+roughly 10k entries. Past that the "no binary index" non-goal below needs
+revisiting: an ANN index or a vector store becomes worth its corruption
+modes. Until then a linear scan keeps the files canonical and the code one
+page long.
 
 ## Rollback
 

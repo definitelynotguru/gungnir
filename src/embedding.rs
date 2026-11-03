@@ -1,8 +1,15 @@
 //! Embedding-based recall: pluggable embedder trait, content-addressed disk
 //! cache, and reciprocal rank fusion for hybrid keyword + vector search.
 //!
-//! No HTTP client ships by default; implement [`Embedder`] against your
-//! provider of choice and wrap it in [`CachedEmbedder`].
+//! Hybrid mode is opt-in per query (CLI `--semantic`, MCP `semantic: true`)
+//! and needs a concrete [`Embedder`]. The `embed` cargo feature ships one:
+//! bge-small-en-v1.5 through fastembed (ONNX), downloaded on first use into
+//! `<root>/.cache`. Without the feature the same surface can take any
+//! user-implemented embedder; with no embedder at all, recall falls back to
+//! the BM25-lite keyword path — same temporal filters, same coverage signal.
+//!
+//! The cache is derived state only: `.cache` is safe to delete, never read
+//! on the write path, and markdown stays the source of truth.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,8 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::entry::Entry;
-use crate::recall::{self, Hit, Query};
+use crate::recall::{self, CorpusStats, Query, SearchOutcome};
 use crate::{Error, Result, Store};
 
 /// Turns text into vectors. Implement this against your embedding provider.
@@ -25,7 +31,7 @@ pub trait Embedder: Send + Sync {
 /// Cache key is `sha256(model + "\n" + normalized_text)` — content-addressed,
 /// so editing a file invalidates its vector naturally and switching models
 /// partitions the cache by directory. Vectors live under
-/// `<store-root>/.cache/embeddings/<model>/<key>.json`.
+/// `<root>/.cache/embeddings/<model>/<key>.json`.
 pub struct CachedEmbedder<E: Embedder> {
     inner: E,
     cache_dir: PathBuf,
@@ -37,9 +43,10 @@ struct CachedVector {
 }
 
 impl<E: Embedder> CachedEmbedder<E> {
-    pub fn new(inner: E, store_root: impl AsRef<Path>) -> Self {
+    /// `root` is the gungnir memory root; vectors land under `.cache/` there.
+    pub fn new(inner: E, root: impl AsRef<Path>) -> Self {
         let model_dir = sanitize_model(inner.model());
-        let cache_dir = store_root
+        let cache_dir = root
             .as_ref()
             .join(crate::layout::CACHE)
             .join("embeddings")
@@ -132,62 +139,138 @@ pub fn rrf_fuse(rankings: &[Vec<usize>], pool_size: usize, k: f64) -> Vec<(usize
     fused
 }
 
-/// Hybrid search: keyword ranking fused with embedding ranking via RRF.
-/// Entries with no vector (empty body and summary) fall back to keyword-only.
-pub fn hybrid_search(store: &Store, query: &Query, embedder: &dyn Embedder) -> Result<Vec<Hit>> {
-    let entries = store.entries()?;
-    let visible: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| e.verification != crate::entry::VerificationState::RolledBack)
-        .collect();
+/// Cosine floor for a vector-only match. Keyword matches need no floor:
+/// a token hit is already evidence. This floor keeps corpus-wide noise —
+/// every real embedder returns some positive similarity for almost
+/// everything — from manufacturing "coverage" the abstention signal would
+/// then have to stand behind.
+const VECTOR_MATCH_FLOOR: f32 = 0.45;
 
-    // Keyword ranking over the visible pool.
+/// Hybrid search: BM25-lite ranking fused with embedding cosine ranking via
+/// RRF, over the same temporal candidate pool and coverage accounting as
+/// [`recall::search_with_coverage`]. `as_of` and `current_only` apply
+/// identically — there is exactly one temporal filter in the codebase.
+///
+/// Relevance for the trust×recency formula is the RRF fusion score scaled
+/// by 1000 so its magnitude sits near BM25 scores; the ordering comes from
+/// the same bucket-first sort either path uses.
+///
+/// Complexity is O(N) cosine over the pool — fine to ~10k entries, the
+/// ceiling documented in docs/DESIGN.md.
+pub fn hybrid_search(
+    store: &Store,
+    query: &Query,
+    embedder: &dyn Embedder,
+) -> Result<SearchOutcome> {
+    let (pool, revised, skipped) = recall::temporal_pool(store, query)?;
+    let pool_len = pool.len();
+    let stats = CorpusStats::new(pool.iter().map(|c| &c.entry));
+
+    // Keyword channel.
     let qtokens = {
         let mut t = recall::tokenize(&query.text);
         t.sort();
         t.dedup();
         t
     };
-    let kw_scores: Vec<f64> = visible.iter().map(|e| recall::score(e, &qtokens)).collect();
-    let mut kw_rank: Vec<usize> = (0..visible.len()).collect();
+    let kw_scores: Vec<f64> = pool
+        .iter()
+        .map(|c| recall::score(&c.entry, &qtokens, &stats))
+        .collect();
+    let mut kw_rank: Vec<usize> = (0..pool.len()).collect();
     kw_rank.sort_by(|a, b| kw_scores[*b].total_cmp(&kw_scores[*a]));
 
-    // Vector ranking.
-    let texts: Vec<String> = visible
+    // Vector channel.
+    let texts: Vec<String> = pool
         .iter()
-        .map(|e| format!("{}\n{}", e.summary, e.body))
+        .map(|c| format!("{}\n{}", c.entry.summary, c.entry.body))
         .collect();
     let vectors = embedder.embed(&texts)?;
     let query_vecs = embedder.embed(std::slice::from_ref(&query.text))?;
     let qv = &query_vecs[0];
     let vec_scores: Vec<f32> = vectors.iter().map(|v| cosine(qv, v)).collect();
-    let mut vec_rank: Vec<usize> = (0..visible.len()).collect();
+    let mut vec_rank: Vec<usize> = (0..pool.len()).collect();
     vec_rank.sort_by(|a, b| vec_scores[*b].total_cmp(&vec_scores[*a]));
 
-    let fused = rrf_fuse(&[kw_rank, vec_rank], visible.len(), 60.0);
+    let fused = rrf_fuse(&[kw_rank, vec_rank], pool.len(), 60.0);
 
-    let mut hits: Vec<Hit> = fused
-        .into_iter()
-        .filter(|(i, _)| kw_scores[*i] > 0.0 || vec_scores[*i] > 0.01)
-        .take(query.limit)
-        .map(|(i, score)| Hit {
-            entry: visible[i].clone(),
-            score,
-        })
+    // Topic match = signal in either channel. Coverage and hits both draw
+    // from this set, so a vector-only paraphrase hit still lifts the
+    // abstention signal.
+    let mut relevance = vec![0.0f64; pool.len()];
+    for (i, rrf) in &fused {
+        relevance[*i] = rrf * 1000.0;
+    }
+    let matched: Vec<(crate::entry::Entry, recall::StateAt, f64)> = (0..pool.len())
+        .filter(|&i| kw_scores[i] > 0.0 || vec_scores[i] > VECTOR_MATCH_FLOOR)
+        .map(|i| (pool[i].entry.clone(), pool[i].state, relevance[i]))
         .collect();
 
-    hits.sort_by(|a, b| {
-        recall::bucket(&b.entry)
-            .cmp(&recall::bucket(&a.entry))
-            .then(b.score.total_cmp(&a.score))
-    });
-    Ok(hits)
+    Ok(recall::finish(matched, &revised, query, pool_len, skipped))
+}
+
+/// The shipped embedder: bge-small-en-v1.5 through fastembed's ONNX runtime.
+/// First use downloads ~100MB of model weights into `<root>/.cache/fastembed`
+/// — the only network call gungnir ever makes, reachable only when the
+/// `embed` feature is compiled in *and* a semantic query runs.
+#[cfg(feature = "embed")]
+pub mod local {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Lazy holder: model weights load (and possibly download) on the first
+    /// `embed` call, not at construction, so an MCP server that merely
+    /// *might* answer a semantic query never pays the startup cost.
+    pub struct Fastembed {
+        cache_dir: PathBuf,
+        inner: Mutex<Option<fastembed::TextEmbedding>>,
+        model_name: String,
+    }
+
+    impl Fastembed {
+        /// `root` is the gungnir memory root so weights share `.cache` with
+        /// the vector cache.
+        pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+            Ok(Self {
+                cache_dir: root.as_ref().join(crate::layout::CACHE).join("fastembed"),
+                inner: Mutex::new(None),
+                model_name: "bge-small-en-v1.5-q".into(),
+            })
+        }
+    }
+
+    impl Embedder for Fastembed {
+        fn model(&self) -> &str {
+            &self.model_name
+        }
+
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let mut slot = self
+                .inner
+                .lock()
+                .map_err(|_| Error::Invalid("embedder poisoned".into()))?;
+            if slot.is_none() {
+                let options =
+                    fastembed::TextInitOptions::new(fastembed::EmbeddingModel::BGESmallENV15Q)
+                        .with_cache_dir(self.cache_dir.clone())
+                        .with_show_download_progress(false);
+                *slot = Some(
+                    fastembed::TextEmbedding::try_new(options)
+                        .map_err(|e| Error::Invalid(format!("embedder init failed: {e}")))?,
+                );
+            }
+            slot.as_mut()
+                .unwrap()
+                .embed(texts, None)
+                .map_err(|e| Error::Invalid(format!("embed failed: {e}")))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::EntryKind;
+    use crate::entry::{Entry, EntryKind, VerificationState};
     use std::sync::Mutex;
 
     /// Deterministic fake: vector = presence bits of known tokens.
@@ -277,9 +360,140 @@ mod tests {
             calls: Mutex::new(0),
         };
         let embedder = CachedEmbedder::new(fake, dir.path());
-        let hits = hybrid_search(&store, &Query::new("postgres checkout", 10), &embedder).unwrap();
+        let out = hybrid_search(&store, &Query::new("postgres checkout", 10), &embedder).unwrap();
 
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].entry.summary, "postgres connection reuse");
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.summary, "postgres connection reuse");
+    }
+
+    #[test]
+    fn hybrid_returns_coverage_like_keyword_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut verified = Entry::new("a", EntryKind::Decision, "postgres pooling limits");
+        verified.verify("ops", None);
+        let unverified = Entry::new("a", EntryKind::Observation, "postgres timeout notes");
+        store.create(&verified).unwrap();
+        store.create(&unverified).unwrap();
+
+        let embedder = CachedEmbedder::new(
+            Fake {
+                calls: Mutex::new(0),
+            },
+            dir.path(),
+        );
+        let out = hybrid_search(&store, &Query::new("postgres", 10), &embedder).unwrap();
+        assert_eq!(out.coverage.verified, 1);
+        assert_eq!(out.coverage.unverified, 1);
+        assert_eq!(out.hits.len(), 2);
+    }
+
+    #[test]
+    fn hybrid_honors_as_of_and_current_only() {
+        // Regression: hybrid_search used to read only query.text/limit, so a
+        // hybrid `as_of` or `current` query silently returned future and
+        // superseded entries.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let mut v1 = Entry::new("a", EntryKind::Decision, "checkout uses postgres");
+        v1.timestamp = chrono::Utc::now() - chrono::Duration::days(10);
+        store.create(&v1).unwrap();
+        let mut v2 = Entry::new("a", EntryKind::Decision, "checkout uses redis");
+        v2.revises = Some(v1.id);
+        store.create(&v2).unwrap();
+        let mut future = Entry::new("a", EntryKind::Decision, "checkout uses sqlite");
+        future.timestamp = chrono::Utc::now() + chrono::Duration::days(10);
+        store.create(&future).unwrap();
+
+        let embedder = CachedEmbedder::new(
+            Fake {
+                calls: Mutex::new(0),
+            },
+            dir.path(),
+        );
+
+        // as_of before v2 and future exist: only v1 may appear.
+        let out = hybrid_search(
+            &store,
+            &Query::new("checkout", 10).as_of(chrono::Utc::now() - chrono::Duration::days(5)),
+            &embedder,
+        )
+        .unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.summary, "checkout uses postgres");
+
+        // current_only: the tail is hidden; the future entry has no
+        // revises link so it stays a head. The assert that matters is v1.
+        let out = hybrid_search(&store, &Query::new("checkout", 10).current(), &embedder).unwrap();
+        let summaries: Vec<&str> = out.hits.iter().map(|h| h.entry.summary.as_str()).collect();
+        assert!(summaries.contains(&"checkout uses redis"));
+        assert!(!summaries.contains(&"checkout uses postgres"));
+        assert_eq!(out.coverage.hidden_superseded, 1);
+    }
+
+    #[test]
+    fn hybrid_vector_only_match_lifts_abstention() {
+        // The paraphrase case: no keyword overlap, real vector signal.
+        // Coverage must report the knowledge instead of claiming none.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut e = Entry::new("a", EntryKind::Decision, "postgres index choice");
+        e.verify("ops", None);
+        store.create(&e).unwrap();
+
+        let embedder = CachedEmbedder::new(
+            Fake {
+                calls: Mutex::new(0),
+            },
+            dir.path(),
+        );
+        // "postgres" vector-similar entry, zero keyword overlap in "postgres".
+        let out = hybrid_search(&store, &Query::new("postgres", 10), &embedder).unwrap();
+        assert_eq!(out.coverage.verified, 1);
+        assert_eq!(out.hits.len(), 1);
+    }
+
+    #[test]
+    fn hybrid_contradicted_never_outranks_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut verified = Entry::new("a", EntryKind::Decision, "postgres index choice");
+        verified.verify("ops", None);
+        store.create(&verified).unwrap();
+        let counter = Entry::new("a", EntryKind::Observation, "counter evidence");
+        store.create(&counter).unwrap();
+        let mut contradicted = Entry::new("a", EntryKind::Decision, "postgres index alternative");
+        contradicted.contradict(counter.id, "ops", None);
+        store.create(&contradicted).unwrap();
+
+        let embedder = CachedEmbedder::new(
+            Fake {
+                calls: Mutex::new(0),
+            },
+            dir.path(),
+        );
+        let out = hybrid_search(&store, &Query::new("postgres index", 10), &embedder).unwrap();
+        assert_eq!(out.hits[0].entry.verification, VerificationState::Verified);
+    }
+
+    #[test]
+    fn state_at_is_evaluated_per_query_in_hybrid() {
+        // Spot-check the shared temporal machinery sees the same states.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut e = Entry::new("a", EntryKind::Decision, "postgres config");
+        e.mark_rolled_back("ops");
+        store.create(&e).unwrap();
+
+        let embedder = CachedEmbedder::new(
+            Fake {
+                calls: Mutex::new(0),
+            },
+            dir.path(),
+        );
+        let out = hybrid_search(&store, &Query::new("postgres", 10), &embedder).unwrap();
+        assert!(out.hits.is_empty());
+        assert_eq!(out.coverage.hidden_rolled_back, 1);
     }
 }
