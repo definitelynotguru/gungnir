@@ -210,6 +210,14 @@ impl Gungnir {
         text: String,
         outcome: Option<bool>,
     ) -> Result<EntryId> {
+        // An archived session is done: the retry path clears scratch, so a
+        // write accepted now would be deleted unarchived on the next end.
+        if self.find_archive(&session.agent, &session.id)?.is_some() {
+            return Err(Error::Invalid(format!(
+                "session {} already ended; its notes are archived and new ones cannot be added",
+                session.id
+            )));
+        }
         self.persist_session(session)?;
         let mut entry = Entry::new(&session.agent, kind, summarize(&text));
         entry.session_id = Some(session.id.clone());
@@ -328,15 +336,18 @@ impl Gungnir {
         promotions: Vec<Promotion>,
     ) -> Result<Vec<EntryId>> {
         let codex = self.codex()?;
-        let mut by_summary: HashMap<String, EntryId> = codex
+        // Dedupe on (kind, summary): two different findings can share a
+        // summary, and a retry re-listing a promotion under a different
+        // kind must land it rather than alias the landed one.
+        let mut by_key: HashMap<(EntryKind, String), EntryId> = codex
             .entries()?
             .into_iter()
             .filter(|e| e.session_id.as_deref() == Some(session_id))
-            .map(|e| (e.summary, e.id))
+            .map(|e| ((e.kind, e.summary), e.id))
             .collect();
         let mut promoted_ids = Vec::new();
         for p in promotions {
-            if let Some(&existing) = by_summary.get(&p.summary) {
+            if let Some(&existing) = by_key.get(&(p.kind, p.summary.clone())) {
                 promoted_ids.push(existing);
                 continue;
             }
@@ -345,7 +356,7 @@ impl Gungnir {
             c.body = p.body;
             c.evidence.push(Evidence::Ref { id: archive });
             codex.create_with(&c, &|id| self.exists_anywhere(id))?;
-            by_summary.insert(c.summary.clone(), c.id);
+            by_key.insert((c.kind, c.summary.clone()), c.id);
             promoted_ids.push(c.id);
         }
         Ok(promoted_ids)

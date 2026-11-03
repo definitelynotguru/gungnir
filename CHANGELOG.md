@@ -30,6 +30,20 @@ All notable changes to Gungnir are documented here. The format follows
   `scratch/<id>/.session.yaml`, so `end_session` archives the real task
   text even when the ending process only knows the session id.
 
+### Changed (breaking)
+
+- **`Gungnir::start_session` returns `Result<Session>`** instead of
+  `Session` — persisting `.session.yaml` can fail.
+- **`Gungnir::contradict` and `Entry::contradict` take a `note:
+  Option<String>`** that lands in the verification log.
+- **`rollback::{apply, rollback}` take a `validate::Exists` resolver** so
+  evidence refs are checked across layers.
+- **The `STATUS_*` string constants are gone**; `VerificationRecord.status`
+  is now the typed `RecordStatus` enum.
+- **`add_observation`/`add_attempt` reject an already-ended session.**
+  Previously the write succeeded and the next `end_session` deleted the
+  notes unarchived. (MCP step-level behavior changes accordingly.)
+
 ### Fixed
 
 - **`end_session` is idempotent.** Re-ending an archived session reports

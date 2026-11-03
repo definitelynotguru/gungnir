@@ -251,7 +251,11 @@ fn typed_log_status_roundtrips_and_typos_fail_loudly() {
     let scan = codex.scan().unwrap();
     assert!(scan.entries.is_empty());
     assert_eq!(scan.skipped.len(), 1);
-    assert!(scan.skipped[0].error.contains("frontmatter") || !scan.skipped[0].error.is_empty());
+    assert!(
+        scan.skipped[0].error.contains("frontmatter"),
+        "{}",
+        scan.skipped[0].error
+    );
 }
 
 #[test]
@@ -460,14 +464,11 @@ fn end_session_retry_after_crash_converges() {
     // Simulate a crash between the journal write and scratch removal:
     // archive exists, scratch dir still there with entries.
     let report = g.end_session(&s, "done", vec![]).unwrap();
-    // Recreate scratch as the crash would have left it.
-    let s2 = Session {
-        id: s.id.clone(),
-        agent: "builder".into(),
-        task: "task".into(),
-        started_at: s.started_at,
-    };
-    g.add_observation(&s2, "leftover note").unwrap();
+    // Recreate scratch as the crash would have left it. Written directly —
+    // add_observation now (correctly) rejects writes to an ended session.
+    let mut leftover = Entry::new("builder", EntryKind::Observation, "leftover note");
+    leftover.session_id = Some(s.id.clone());
+    g.scratch(&s.id).unwrap().create(&leftover).unwrap();
 
     let retry = g.end_session(&s, "done", vec![]).unwrap();
     assert!(retry.already_ended);
@@ -552,14 +553,11 @@ fn end_session_retry_finishes_pending_promotions() {
 
     // A crash between archive write and scratch removal leaves scratch
     // behind; the caller retries with the full promotion list plus one
-    // that never landed.
-    let rebuilt = Session {
-        id: s.id.clone(),
-        agent: "builder".into(),
-        task: "task".into(),
-        started_at: s.started_at,
-    };
-    g.add_observation(&rebuilt, "leftover note").unwrap();
+    // that never landed. Written directly — add_observation now rejects
+    // writes to an ended session.
+    let mut leftover = Entry::new("builder", EntryKind::Observation, "leftover note");
+    leftover.session_id = Some(s.id.clone());
+    g.scratch(&s.id).unwrap().create(&leftover).unwrap();
 
     let retry = g
         .end_session(
@@ -734,4 +732,65 @@ fn scan_reports_a_wrongly_sharded_file() {
         scan.skipped[0].error
     );
     assert!(codex.get(e.id).unwrap().is_none());
+}
+
+// -- review round 2 ----------------------------------------------------------
+
+#[test]
+fn writes_to_an_ended_session_are_rejected() {
+    let (_dir, g) = gng();
+    let s = g.start_session("builder", "task").unwrap();
+    g.add_observation(&s, "note").unwrap();
+    let report = g.end_session(&s, "done", vec![]).unwrap();
+
+    // A stale handle's writes must not be accepted: the retry path clears
+    // scratch, so anything written now would be deleted unarchived.
+    let rebuilt = Session {
+        id: s.id.clone(),
+        agent: "builder".into(),
+        task: "task".into(),
+        started_at: s.started_at,
+    };
+    assert!(matches!(
+        g.add_observation(&rebuilt, "post-session note"),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        g.add_attempt(&rebuilt, "late attempt", true),
+        Err(Error::Invalid(_))
+    ));
+
+    // The retry still converges and clears nothing it should keep.
+    let retry = g.end_session(&s, "done", vec![]).unwrap();
+    assert!(retry.already_ended);
+    assert_eq!(retry.journal_id, report.journal_id);
+}
+
+#[test]
+fn promotions_sharing_a_summary_land_when_kinds_differ() {
+    let (_dir, g) = gng();
+    let s = g.start_session("builder", "task").unwrap();
+    g.add_observation(&s, "note").unwrap();
+
+    let report = g
+        .end_session(
+            &s,
+            "done",
+            vec![
+                gungnir::Promotion {
+                    kind: EntryKind::Decision,
+                    summary: "use the index".into(),
+                    body: String::new(),
+                },
+                gungnir::Promotion {
+                    kind: EntryKind::Observation,
+                    summary: "use the index".into(),
+                    body: String::new(),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(report.promoted.len(), 2);
+    assert_ne!(report.promoted[0], report.promoted[1]);
+    assert_eq!(g.codex().unwrap().entries().unwrap().len(), 2);
 }
