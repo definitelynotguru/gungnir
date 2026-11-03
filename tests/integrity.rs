@@ -1004,3 +1004,53 @@ fn stats_counts_a_started_session_without_notes() {
     let st = g.stats(Some("builder")).unwrap();
     assert_eq!(st.scratch_sessions, 1);
 }
+
+#[test]
+fn partial_end_closes_session_to_writes() {
+    let (_dir, g) = gng();
+    let s = g.start_session("builder", "task").unwrap();
+    g.add_observation(&s, "note one").unwrap();
+
+    // Force a partial end: a review promotion without review_of fails
+    // validation after the archive is written.
+    let err = g
+        .end_session(
+            &s,
+            "done",
+            vec![gungnir::Promotion {
+                kind: EntryKind::Review,
+                summary: "broken review".into(),
+                body: "no target".into(),
+                review_of: None,
+            }],
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)));
+
+    // The session is ended the moment the archive exists: scratch is
+    // gone, so new notes hit the journal check and are rejected instead
+    // of being deleted unarchived by a retry.
+    assert!(
+        g.add_observation(&s, "lost note").is_err(),
+        "add after partial end must not be accepted into doomed scratch"
+    );
+
+    // A retry converges: finishes the promotions and reports
+    // already_ended.
+    let target = Entry::new("builder", EntryKind::Observation, "the thing reviewed");
+    g.journal("builder").unwrap().create(&target).unwrap();
+    let report = g
+        .end_session(
+            &s,
+            "done",
+            vec![gungnir::Promotion {
+                kind: EntryKind::Review,
+                summary: "reviewed the thing".into(),
+                body: "looks right".into(),
+                review_of: Some(target.id),
+            }],
+        )
+        .unwrap();
+    assert!(report.already_ended);
+    assert_eq!(report.promoted.len(), 1);
+}
