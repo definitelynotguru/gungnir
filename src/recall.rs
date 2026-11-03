@@ -78,6 +78,10 @@ impl Query {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Hit {
     pub entry: Entry,
+    /// Verification state evaluated at the query's `as_of` — the state the
+    /// hit was *returned under*. `entry.verification` still carries now, so
+    /// machine readers and briefing labels must use this, not the entry.
+    pub state: StateAt,
     pub score: f64,
 }
 
@@ -226,7 +230,8 @@ pub fn bucket(entry: &Entry) -> u8 {
 /// The log is the historical record; the frontmatter field only holds now.
 /// Public because audit snapshots expose it as the state of an entry at a
 /// point in time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StateAt {
     Verified,
     Unverified,
@@ -389,7 +394,11 @@ pub(crate) fn finish(
         .into_iter()
         .filter(|(_, st, _)| !query.require_verified || *st == StateAt::Verified)
         .take(query.limit)
-        .map(|(entry, _, score)| Hit { entry, score })
+        .map(|(entry, state, score)| Hit {
+            entry,
+            state,
+            score,
+        })
         .collect();
 
     SearchOutcome {

@@ -643,3 +643,174 @@ fn deleted_scratch_link_does_not_brick_updates() {
     let stored = g.codex().unwrap().require(cid).unwrap();
     assert_eq!(stored.verification, VerificationState::Verified);
 }
+
+#[test]
+fn log_lists_the_full_revision_chain() {
+    // A -> B -> C: `log A` must surface every generation, not just its
+    // direct child.
+    let (_d, store) = root();
+    let a = add(
+        &store,
+        &[
+            "--agent",
+            "builder",
+            "--kind",
+            "decision",
+            "--summary",
+            "mysql pool",
+        ],
+    );
+    let b = ok(
+        &store,
+        &[
+            "supersede",
+            &a,
+            "--agent",
+            "builder",
+            "--summary",
+            "postgres pool",
+        ],
+    )
+    .trim()
+    .to_string();
+    let c = ok(
+        &store,
+        &[
+            "supersede",
+            &b,
+            "--agent",
+            "builder",
+            "--summary",
+            "pgbouncer pool",
+        ],
+    )
+    .trim()
+    .to_string();
+
+    let out = ok(&store, &["log", &a]);
+    assert!(out.contains(&b), "log omits middle revision: {out}");
+    assert!(out.contains(&c), "log omits chain head: {out}");
+}
+
+#[test]
+fn blame_reports_current_state_after_rollback() {
+    // Rollback restores A: `blame A` must not name the rollback record as
+    // A's replacement, and `blame B` must show B is no longer the head.
+    let (_d, store) = root();
+    let a = add(
+        &store,
+        &[
+            "--agent",
+            "builder",
+            "--kind",
+            "decision",
+            "--summary",
+            "mysql pool",
+        ],
+    );
+    ok(&store, &["verify", &a, "--verifier", "team"]);
+    let b = ok(
+        &store,
+        &[
+            "supersede",
+            &a,
+            "--agent",
+            "builder",
+            "--summary",
+            "postgres pool",
+        ],
+    )
+    .trim()
+    .to_string();
+    let rb = ok(&store, &["rollback", &b, "--agent", "builder"])
+        .trim()
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let out = ok(&store, &["blame", &a]);
+    assert!(
+        out.contains("still current"),
+        "blame names the rollback record a replacement: {out}"
+    );
+    assert!(!out.contains(&format!("replaced by: {rb}")), "{out}");
+
+    let out = ok(&store, &["blame", &b]);
+    assert!(out.contains("still current"), "{out}");
+
+    // And the log shows the restore as part of the lineage, not hidden.
+    let out = ok(&store, &["log", &a]);
+    assert!(out.contains(&rb), "{out}");
+}
+
+#[test]
+fn recall_limit_zero_does_not_abstain() {
+    // Abstention is a coverage verdict, not a hit-truncation artifact:
+    // --limit 0 with verified matches must not exit 2.
+    let (_d, store) = root();
+    let (e1, _, _) = seed(&store);
+    let out = run(
+        &store,
+        &[
+            "recall",
+            "checkout",
+            "--require-verified",
+            "--limit",
+            "0",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(doc["abstained"], false);
+    assert_eq!(doc["coverage"]["verified"], 1);
+    assert!(doc["hits"].as_array().unwrap().is_empty());
+    let _ = e1;
+}
+
+#[test]
+fn supersede_inherits_body_entity_mentions() {
+    // A revision stays about the same entities: body-derived [[name]]
+    // mentions materialize into the revision's frontmatter so the index
+    // follows the chain head even when the new body drops the link.
+    let (_d, store) = root();
+    let a = add(
+        &store,
+        &[
+            "--agent",
+            "builder",
+            "--kind",
+            "decision",
+            "--summary",
+            "mysql pool",
+            "--body",
+            "backs onto [[orders_archive]]",
+        ],
+    );
+    let b = ok(
+        &store,
+        &[
+            "supersede",
+            &a,
+            "--agent",
+            "builder",
+            "--summary",
+            "postgres pool",
+        ],
+    )
+    .trim()
+    .to_string();
+
+    let out = ok(&store, &["entities", "orders_archive"]);
+    assert!(
+        out.contains(&b),
+        "body-derived entity lost on revision: {out}"
+    );
+}

@@ -105,14 +105,15 @@ impl Store {
     }
 
     /// Update with a custom reference resolver; see [`Store::create_with`].
-    /// Reference existence is not re-checked: a link validated at create
+    /// Existing references are grandfathered — a link valid at write time
     /// must not brick later writes when its target's partition is deleted
-    /// (ended scratch sessions, gitignored journals).
+    /// (ended scratch sessions, gitignored journals) — but references the
+    /// update *introduces* must still resolve, else callers could write
+    /// fresh dangling links past validation.
     pub fn update_with(&self, entry: &Entry, exists: validate::Exists<'_>) -> Result<()> {
-        if !self.exists(entry.id)? {
-            return Err(Error::NotFound(entry.id));
-        }
+        let prev = self.require(entry.id)?;
         validate::validate_entry(entry, exists, false)?;
+        validate::validate_new_refs(entry, &prev, exists)?;
         let _guard = self.lock()?;
         self.persist_locked(entry)
     }

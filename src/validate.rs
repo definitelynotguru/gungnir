@@ -110,6 +110,53 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>, enforce_refs: bool) -> 
     Ok(())
 }
 
+/// Existence checks for the references an update *introduces*: any id in
+/// `new` that was not already on `old`. Stored references are grandfathered
+/// — a link valid at write time must not brick updates when its target's
+/// partition is later deleted (scratch teardown, gitignored journals) —
+/// but a caller may not smuggle a fresh dangling reference into a write.
+pub fn validate_new_refs(new: &Entry, old: &Entry, exists: Exists<'_>) -> Result<()> {
+    let old_ids: std::collections::HashSet<EntryId> = reference_ids(old);
+    if let VerificationState::Contradicted { by } = new.verification {
+        let was = matches!(old.verification, VerificationState::Contradicted { by: b } if b == by);
+        if !was && !exists(by)? {
+            return Err(crate::Error::Invalid(format!(
+                "contradicted_by points at missing entry {by}"
+            )));
+        }
+    }
+    for id in reference_ids(new) {
+        if !old_ids.contains(&id) && !exists(id)? {
+            return Err(crate::Error::Invalid(format!(
+                "update adds reference {id} pointing at missing entry"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Every id an entry's reference fields point at: revises, review_of,
+/// evidence refs, and `[[id]]` body wikilinks. (`contradicted_by` sits on
+/// the verification state and is checked beside its own error.)
+fn reference_ids(entry: &Entry) -> std::collections::HashSet<EntryId> {
+    let mut out: std::collections::HashSet<EntryId> = entry
+        .evidence
+        .iter()
+        .filter_map(|ev| match ev {
+            Evidence::Ref { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    out.extend(entry.wikilink_ids());
+    if let Some(prev) = entry.revises {
+        out.insert(prev);
+    }
+    if let Some(target) = entry.review_of {
+        out.insert(target);
+    }
+    out
+}
+
 /// Every entity name an entry claims: frontmatter plus non-id `[[name]]`
 /// body mentions, so both paths meet the same rule.
 fn entity_names(entry: &Entry) -> Vec<String> {

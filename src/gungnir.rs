@@ -538,7 +538,8 @@ impl Gungnir {
             ),
             None => text,
         };
-        self.scratch(&session.id)?.create(&entry)?;
+        self.scratch(&session.id)?
+            .create_with(&entry, &|id| self.exists_anywhere(id))?;
         Ok(entry.id)
     }
 
@@ -619,6 +620,8 @@ impl Gungnir {
             )));
         }
 
+        let scratch_ids: std::collections::HashSet<EntryId> =
+            scan.entries.iter().map(|e| e.id).collect();
         let mut transcript = String::new();
         for e in &scan.entries {
             // Prefer the structured field; fall back to the legacy
@@ -633,7 +636,15 @@ impl Gungnir {
                         .map(|w| format!(" [{w}]"))
                 })
                 .unwrap_or_default();
-            transcript.push_str(&format!("- {}: {}{}\n", e.kind, e.summary, outcome));
+            // `[[scratch-id]]` links demote to plain text: the scratch dir
+            // is deleted below, so copying the link into a durable archive
+            // would leave a permanently dangling reference.
+            transcript.push_str(&format!(
+                "- {}: {}{}\n",
+                e.kind,
+                demote_scratch_links(&e.summary, &scratch_ids),
+                outcome
+            ));
         }
 
         // The persisted task wins over whatever a rebuilt handle claims;
@@ -657,9 +668,13 @@ impl Gungnir {
 
         let mut journal_entry = Entry::new(&session.agent, EntryKind::Session, summary);
         journal_entry.session_id = Some(session.id.clone());
-        journal_entry.body = format!("# Task\n{task}\n\n# Transcript\n{transcript}");
+        journal_entry.body = format!(
+            "# Task\n{}\n\n# Transcript\n{}",
+            demote_scratch_links(&task, &scratch_ids),
+            transcript
+        );
         let journal_store = self.journal(&session.agent)?;
-        journal_store.create(&journal_entry)?;
+        journal_store.create_with(&journal_entry, &|id| self.exists_anywhere(id))?;
 
         // Scratch goes before promotions: once the archive exists the
         // session is ended, and a crash or validation failure in
@@ -1176,7 +1191,7 @@ impl Gungnir {
         // scratch entries; refusing to revise those entries would brick the
         // correction workflow on them.
         let mut evidence = Vec::new();
-        for ev in prev.evidence {
+        for ev in prev.evidence.clone() {
             let keep = match &ev {
                 Evidence::Ref { id } => self.exists_anywhere(*id)?,
                 Evidence::File { .. } => true,
@@ -1186,7 +1201,10 @@ impl Gungnir {
             }
         }
         next.evidence = evidence;
-        next.entities = prev.entities.clone();
+        // Body-derived mentions are materialized into frontmatter: the new
+        // body need not repeat the old link, and a revision stays about the
+        // same topics unless the body says otherwise.
+        next.entities = prev.entity_mentions();
         next.body = body.into();
         store.create_with(&next, &|id| self.exists_anywhere(id))?;
         let (conflicts, warnings) =
@@ -1537,6 +1555,17 @@ pub fn superseded_ids(store: &Store) -> Result<HashSet<EntryId>> {
         .collect())
 }
 
+/// Rewrite `[[id]]` links that point into `scratch_ids` as their bare id:
+/// a scratch target stops existing at session end, and a link that can only
+/// dangle reads better as plain text in the durable journal archive.
+fn demote_scratch_links(text: &str, scratch_ids: &std::collections::HashSet<EntryId>) -> String {
+    let mut out = text.to_string();
+    for id in scratch_ids {
+        out = out.replace(&format!("[[{id}]]"), &id.to_string());
+    }
+    out
+}
+
 fn summarize(text: &str) -> String {
     let first_line = text.lines().next().unwrap_or("").trim();
     let mut s: String = first_line.chars().take(MAX_SUMMARY_LEN).collect();
@@ -1637,6 +1666,36 @@ mod tests {
                     .join(layout::sanitize_component(&s.id))
                     .exists()
         );
+    }
+
+    #[test]
+    fn session_notes_link_across_layers_and_archive_cleanly() {
+        // Scratch observations resolve wikilinks through the union
+        // resolver (a note may cite codex or another scratch note), and
+        // `end_session` must not fail on those links: scratch-internal
+        // links demote to plain ids in the durable archive while links to
+        // durable entries survive.
+        let (_d, g) = gng();
+        let codex_entry = Entry::new("builder", EntryKind::Decision, "canonical decision");
+        g.codex().unwrap().create(&codex_entry).unwrap();
+
+        let s = g.start_session("builder", "trace checkout");
+        let a = g.add_observation(&s, "first observation").unwrap();
+        g.add_observation(&s, format!("builds on [[{a}]]")).unwrap();
+        g.add_observation(&s, format!("grounds in [[{}]]", codex_entry.id))
+            .unwrap();
+
+        g.end_session(&s, "done", vec![]).unwrap();
+
+        // Scratch is cleared; the archive landed in the journal.
+        assert!(!g.root.join(SCRATCH).join(&s.id).exists());
+        let journal = g.journal("builder").unwrap();
+        let archived = journal.entries().unwrap();
+        assert_eq!(archived.len(), 1);
+        let body = &archived[0].body;
+        assert!(!body.contains(&format!("[[{a}]]")), "{body}");
+        assert!(body.contains(&a.to_string()), "{body}");
+        assert!(body.contains(&format!("[[{}]]", codex_entry.id)), "{body}");
     }
 
     #[test]

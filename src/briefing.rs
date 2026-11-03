@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::entry::{EntryKind, VerificationState};
 use crate::gungnir::PeerCoverage;
 use crate::id::EntryId;
-use crate::recall::{Coverage, Hit};
+use crate::recall::{self, Coverage, Hit};
 use crate::store::Skipped;
 
 #[derive(Clone, Debug, Default)]
@@ -44,9 +44,9 @@ pub struct BriefingInput {
 
 fn label(hit: &Hit, superseded: &HashSet<EntryId>, task_tokens: &[String]) -> String {
     let mut tags = Vec::new();
-    match hit.entry.verification {
-        VerificationState::Verified => tags.push("verified"),
-        VerificationState::Contradicted { .. } => tags.push("CONTRADICTED"),
+    match hit.state {
+        recall::StateAt::Verified => tags.push("verified"),
+        recall::StateAt::Contradicted => tags.push("CONTRADICTED"),
         _ => {}
     }
     if superseded.contains(&hit.entry.id) {
@@ -209,6 +209,7 @@ pub fn compile(input: BriefingInput) -> Briefing {
 mod tests {
     use super::*;
     use crate::entry::Entry;
+    use crate::recall::StateAt;
 
     fn input() -> BriefingInput {
         BriefingInput {
@@ -250,6 +251,7 @@ mod tests {
         let mut i = input();
         i.codex_hits = vec![Hit {
             entry: e,
+            state: StateAt::Contradicted,
             score: 1.0,
         }];
         i.codex_coverage.contradicted = 1;
@@ -266,6 +268,7 @@ mod tests {
         let mut i = input();
         i.codex_hits = vec![Hit {
             entry: e,
+            state: StateAt::Unverified,
             score: 1.0,
         }];
         i.codex_superseded = set;
@@ -279,6 +282,7 @@ mod tests {
         let mut i = input();
         i.codex_hits = vec![Hit {
             entry: e,
+            state: StateAt::Unverified,
             score: 1.0,
         }];
         i.codex_coverage.unverified = 1;
@@ -293,10 +297,12 @@ mod tests {
         let mut i = input();
         i.codex_hits = vec![Hit {
             entry: e.clone(),
+            state: StateAt::Unverified,
             score: 1.0,
         }];
         i.journal_hits = vec![Hit {
             entry: e,
+            state: StateAt::Unverified,
             score: 1.0,
         }];
         i.codex_coverage.unverified = 1;
@@ -318,6 +324,7 @@ mod tests {
         let mut i = input();
         i.codex_hits = vec![Hit {
             entry: e,
+            state: StateAt::Unverified,
             score: 1.0,
         }];
         i.codex_coverage.unverified = 1;
@@ -336,6 +343,7 @@ mod tests {
         i.task = "cache tuning".into();
         i.journal_hits = vec![Hit {
             entry: e,
+            state: StateAt::Unverified,
             score: 1.0,
         }];
         let b = compile(i);
@@ -357,6 +365,7 @@ mod tests {
         i.task = "used connections".into();
         i.codex_hits = vec![Hit {
             entry: e,
+            state: StateAt::Unverified,
             score: 1.0,
         }];
         let b = compile(i);
@@ -371,6 +380,7 @@ mod tests {
         i.task = "query latency".into();
         i.codex_hits = vec![Hit {
             entry: e,
+            state: StateAt::Unverified,
             score: 1.0,
         }];
         let b = compile(i);
