@@ -95,6 +95,12 @@ Key behaviors:
   the topic, how many failed) so a second agent stops repeating a
   documented failure. Counts only: no peer summary or body ever leaves its
   journal. Topic existence does leak; see docs/PROVENANCE.md.
+- **Conflicts surface, not hide.** A write that disagrees with a live
+  verified fact still lands, and records a conflict candidate in
+  `.conflicts/`. `gungnir conflicts` lists them;
+  `gungnir conflicts resolve <id> --supersede|--contradict|--dismiss`
+  closes the loop through the same logged verbs. Briefings warn while a
+  candidate on the topic stays open.
 - **Recall you can reason about.** Keyword scoring over summary (2x) and body,
   ordered by verification bucket: verified > unverified > contradicted;
   rolled-back entries hidden. `--current` resolves supersession chains to
@@ -153,8 +159,8 @@ Protocol:
 
 Tools: `start_session`, `add_observation`, `add_attempt`, `end_session`,
 `recall`, `brief`, `verify`, `contradict`, `promote`, `supersede`,
-`rollback`, `list`, `get`. Agents drive the full correction lifecycle over
-the wire.
+`rollback`, `conflicts`, `resolve_conflict`, `list`, `get`. Agents drive
+the full correction lifecycle over the wire.
 
 ## Design notes
 

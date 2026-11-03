@@ -332,7 +332,8 @@ fn as_of_replays_a_supersede_and_rollback_sequence() {
 
     let v2_id = g
         .supersede(v1.id, "a", "sessions use postgres", "migration")
-        .unwrap();
+        .unwrap()
+        .id;
     let mut v2 = codex.require(v2_id).unwrap();
     v2.timestamp = h(50);
     codex.update_with(&v2, &|id| codex.exists(id)).unwrap();
@@ -387,7 +388,8 @@ fn rollback_restores_ancestor_without_superseding_it() {
     codex.create(&v1).unwrap();
     let v2 = g
         .supersede(v1.id, "a", "sessions use postgres", "migration done")
-        .unwrap();
+        .unwrap()
+        .id;
     g.rollback(v2, "a").unwrap();
 
     // Current view falls back to v1, the last live revision, and hides

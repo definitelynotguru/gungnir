@@ -187,7 +187,8 @@ fn supersede_carries_parent_evidence_forward() {
 
     let next = g
         .supersede(parent.id, "a", "use cockroach", "scale")
-        .unwrap();
+        .unwrap()
+        .id;
     let stored = codex.require(next).unwrap();
     assert_eq!(stored.evidence, parent.evidence);
 }
@@ -224,7 +225,7 @@ fn promote_rejects_non_journal_sources() {
             "",
         )
         .unwrap();
-    let stored = g.codex().unwrap().require(promoted).unwrap();
+    let stored = g.codex().unwrap().require(promoted.id).unwrap();
     assert_eq!(
         stored.evidence,
         vec![Evidence::Ref {
@@ -369,7 +370,7 @@ fn coverage_line_survives_hidden_only_matches() {
     let v2 = g
         .supersede(v1.id, "a", "sessions use cockroach", "later")
         .unwrap();
-    g.rollback(v2, "a").unwrap();
+    g.rollback(v2.id, "a").unwrap();
 
     // mysql only matches the verified ancestor which is visible; query for
     // the rolled-back generation's unique token instead.
@@ -526,7 +527,7 @@ fn promote_via_mcp_review_kind_links_source() {
             "",
         )
         .unwrap();
-    let review = g.codex().unwrap().require(rid).unwrap();
+    let review = g.codex().unwrap().require(rid.id).unwrap();
     assert_eq!(review.review_of, Some(report.journal_id));
 }
 
@@ -670,7 +671,8 @@ fn supersede_drops_dangling_evidence_refs() {
 
     let new_id = g
         .supersede(stale.id, "a", "old claim corrected", "fixed")
-        .unwrap();
+        .unwrap()
+        .id;
     let next = codex.require(new_id).unwrap();
     // The resolvable ref carries forward; the dangling one does not block
     // the correction.
@@ -990,7 +992,7 @@ fn review_promotion_and_revision_keep_review_of() {
         )
         .unwrap();
     assert_eq!(
-        g.codex().unwrap().require(next).unwrap().review_of,
+        g.codex().unwrap().require(next.id).unwrap().review_of,
         Some(target.id)
     );
 }

@@ -16,6 +16,8 @@ pub const CODEX: &str = "codex";
 pub const JOURNAL: &str = "journal";
 pub const SCRATCH: &str = "scratch";
 pub const CACHE: &str = ".cache";
+/// Conflict-candidate queue: one markdown record per detected conflict.
+pub const CONFLICTS: &str = ".conflicts";
 
 /// Root resolution: explicit argument beats `GUNGNIR_ROOT` beats `~/.gungnir`.
 pub fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {

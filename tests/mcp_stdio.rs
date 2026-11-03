@@ -64,6 +64,9 @@ fn mcp_subprocess_handshake_and_workflow() {
         .collect();
     assert!(names.contains(&"start_session"));
     assert!(names.contains(&"end_session"));
+    assert!(names.contains(&"contradict"));
+    assert!(names.contains(&"conflicts"));
+    assert!(names.contains(&"resolve_conflict"));
 
     // Start a session; the result text carries the briefing and session id.
     let started = p.rpc(&msg(
@@ -210,4 +213,98 @@ fn mcp_subprocess_handshake_and_workflow() {
     let listed = p.rpc(&msg(13, "tools/call", serde_json::json!({"name": "list"})));
     let list_text = listed["result"]["content"][0]["text"].as_str().unwrap();
     assert!(list_text.contains("orders_archive_idx"), "{list_text}");
+}
+
+#[test]
+fn mcp_conflict_tools_close_the_loop() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Seed through the library: a verified fact, a disagreeing write (which
+    // raises a candidate), and an unrelated pair for the bare contradict
+    // tool. The wire test then only exercises the new tools.
+    let (dns_old, dns_new) = {
+        use gungnir::{Entry, EntryKind, Gungnir, Layer};
+        let g = Gungnir::open(dir.path()).unwrap();
+        let mut old = Entry::new("a", EntryKind::Decision, "sessions use mysql");
+        old.verify("review", None);
+        g.add(old, Layer::Codex).unwrap();
+        g.add(
+            Entry::new("scout", EntryKind::Decision, "sessions use postgres"),
+            Layer::Codex,
+        )
+        .unwrap();
+
+        // No topic overlap, so this pair raises no candidate — contradict
+        // doesn't require a shared frame.
+        let mut dns = Entry::new("a", EntryKind::Decision, "dns via cloudflare");
+        dns.verify("review", None);
+        let dns_old = dns.id;
+        g.add(dns, Layer::Codex).unwrap();
+        let dns_new = g
+            .add(
+                Entry::new(
+                    "a",
+                    EntryKind::Decision,
+                    "agent picked a different resolver library",
+                ),
+                Layer::Codex,
+            )
+            .unwrap()
+            .id;
+        (dns_old.to_string(), dns_new.to_string())
+    };
+
+    let mut p = Proc::spawn(dir.path());
+
+    // The bare contradict verb is reachable over the wire.
+    let hit = p.rpc(&msg(
+        0,
+        "tools/call",
+        serde_json::json!({
+            "name": "contradict",
+            "arguments": {"id": dns_old, "by": dns_new, "verifier": "ops"}
+        }),
+    ));
+    assert_eq!(hit["result"]["isError"], false, "{hit}");
+    assert!(hit["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("contradicted by"));
+
+    // The queue lists the open candidate the disagreeing write raised.
+    let list = p.rpc(&msg(
+        1,
+        "tools/call",
+        serde_json::json!({"name": "conflicts"}),
+    ));
+    let text = list["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("open"), "{text}");
+    let cid = text.split_whitespace().next().unwrap().to_string();
+
+    // Resolution by contradiction closes it.
+    let resolved = p.rpc(&msg(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "resolve_conflict",
+            "arguments": {"id": cid, "verb": "contradict", "agent": "ops"}
+        }),
+    ));
+    assert_eq!(resolved["result"]["isError"], false, "{resolved}");
+
+    let list = p.rpc(&msg(
+        3,
+        "tools/call",
+        serde_json::json!({"name": "conflicts"}),
+    ));
+    let text = list["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("no open"), "{text}");
+
+    let list = p.rpc(&msg(
+        4,
+        "tools/call",
+        serde_json::json!({"name": "conflicts", "arguments": {"all": true}}),
+    ));
+    let text = list["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("resolved-contradicted"), "{text}");
 }

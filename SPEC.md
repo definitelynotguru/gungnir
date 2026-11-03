@@ -147,6 +147,33 @@ No file is ever deleted.
 No verified ancestor ⇒ error, store untouched. Rolled-back entries stay on
 disk; recall hides them by default.
 
+## Conflict candidates
+
+Writes that assert claims (`add`, `supersede`, `promote`, `end_session`
+promotions) are checked against live verified facts after they land. A
+plausible conflict records a candidate in `<root>/.conflicts/<id>.md` —
+one markdown file per candidate, YAML frontmatter plus a rendered body —
+and the write still succeeds. Candidates are advisory, never a gate.
+
+A candidate records: new entry id, conflicting entry id, layer, summary
+snapshots, the detection signal(s), a detection timestamp, and a status
+(`open` → `resolved_superseded` | `resolved_contradicted` | `dismissed`,
+with `resolved_by` / `resolved_at`).
+
+Detection is deterministic: BM25-lite topic match under the `current`
+temporal view, then lexical signals over stemmed summary tokens —
+`shared_frame`, `negation_asymmetry`, `numeric_mismatch`. With the `embed`
+build, `--semantic` adds `semantic_overlap` (cosine ≥ 0.70). Only live
+verified, claim-shaped entries are candidates; the new entry, its
+supersession parent, and its evidence refs are exempt.
+
+Resolution reuses the trust verbs: `--supersede` links the new entry as
+revision of the conflicting one, `--contradict` marks the verified entry
+contradicted by the new claim, `--dismiss` closes the record. Briefings
+warn on open candidates touching the topic the way they warn on
+contradicted facts. `gungnir conflicts` lists the queue; `gungnir
+contradict <id> --by <id>` exposes the underlying verb directly.
+
 ## Concurrency & durability
 
 - Writes: temp file in the same directory + `rename` (atomic on POSIX & Windows).
@@ -161,11 +188,11 @@ disk; recall hides them by default.
 - **CLI** (`gungnir` bin): `init`, `add`, `get`, `ls`, `recall`, `verify`
   (`--evidence` records file hashes at verify time; `--revalidate` re-hashes
   and flags drift, `--all` sweeps the store), `contradict`, `supersede`,
-  `rollback`, `promote`, `brief`, `session`, `stats` (`--topic` reports
-  cross-journal coverage counts), `mcp`.
+  `rollback`, `promote`, `brief`, `conflicts`, `session`, `stats`
+  (`--topic` reports cross-journal coverage counts), `mcp`.
 - **MCP server**: tools `start_session`, `end_session`, `add_observation`,
   `add_attempt`, `recall`, `brief`, `verify`, `contradict`, `promote`,
-  `supersede`, `rollback`, `list`, `get`.
+  `supersede`, `rollback`, `conflicts`, `resolve_conflict`, `list`, `get`.
 
 ## Deliberate departures from the reference design
 
