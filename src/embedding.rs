@@ -482,10 +482,53 @@ mod tests {
             },
             dir.path(),
         );
-        // "postgres" vector-similar entry, zero keyword overlap in "postgres".
-        let out = hybrid_search(&store, &Query::new("postgres", 10), &embedder).unwrap();
+        // Only the vector channel can hit: "postgresql" shares no stem with
+        // the entry's tokens, so the keyword path must find nothing.
+        assert!(
+            recall::search_with_coverage(&store, &Query::new("postgresql", 10))
+                .unwrap()
+                .hits
+                .is_empty(),
+            "premise: keyword path misses"
+        );
+        let out = hybrid_search(&store, &Query::new("postgresql", 10), &embedder).unwrap();
         assert_eq!(out.coverage.verified, 1);
         assert_eq!(out.hits.len(), 1);
+    }
+
+    /// Vector similarity below the match floor contributes nothing: the
+    /// entry is neither a hit nor coverage.
+    struct BelowFloor;
+    impl Embedder for BelowFloor {
+        fn model(&self) -> &str {
+            "below-floor-1"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    if t.to_lowercase().contains("postgres") {
+                        // cosine with the query's [1, 0] ≈ 0.30 < 0.45
+                        vec![0.30f32, 0.9539]
+                    } else {
+                        vec![1.0f32, 0.0]
+                    }
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn vector_match_below_the_floor_is_not_a_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut e = Entry::new("a", EntryKind::Decision, "postgres index choice");
+        e.verify("ops", None);
+        store.create(&e).unwrap();
+
+        let out = hybrid_search(&store, &Query::new("unrelated wording", 10), &BelowFloor).unwrap();
+        assert!(out.hits.is_empty());
+        assert_eq!(out.coverage.total_visible(), 0);
     }
 
     #[test]
