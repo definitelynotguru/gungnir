@@ -877,6 +877,8 @@ impl Gungnir {
             journal_skipped: journal_out.skipped,
             peers: self.peer_coverage_inner(Some(agent), &q.text, embedder)?,
             open_conflicts,
+            require_verified: q.require_verified,
+            hit_limit: q.limit,
         }))
     }
 
