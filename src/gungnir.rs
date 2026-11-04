@@ -595,17 +595,21 @@ impl Gungnir {
             // A crashed end can leave pending promotions and scratch behind;
             // finish the promotions (skipping the ones that landed) and
             // converge by clearing scratch.
-            let (promoted, _fresh) =
+            let (promoted, fresh) =
                 self.finish_promotions(archive, &session.id, &session.agent, promotions)?;
             if scratch_exists {
                 std::fs::remove_dir_all(&dir)?;
             }
+            // Entries this retry created still get scanned; deduped ones
+            // were scanned by the end that first landed them.
+            let codex = self.codex()?;
+            let (conflicts, warnings) = self.scan_and_record(&codex, &fresh, embedder);
             return Ok(EndReport {
                 journal_id: archive,
                 promoted,
                 already_ended: true,
-                conflicts: vec![],
-                warnings: vec![],
+                conflicts,
+                warnings,
             });
         }
 
@@ -726,20 +730,23 @@ impl Gungnir {
         promotions: Vec<Promotion>,
     ) -> Result<(Vec<EntryId>, Vec<Entry>)> {
         let codex = self.codex()?;
-        // Dedupe on (kind, summary, body): two different findings can
-        // share a summary, and a retry re-listing a promotion must land
-        // it rather than alias the landed one — but only when the body
-        // also matches, so distinct findings keep their own text.
-        let mut by_key: HashMap<(EntryKind, String, String), EntryId> = codex
+        // Dedupe on (kind, summary, body, review_of): two different
+        // findings can share a summary, and a retry re-listing a promotion
+        // must land it rather than alias the landed one — but only when
+        // the body also matches, so distinct findings keep their own text.
+        // review_of belongs in the key: two reviews with identical prose
+        // of different targets are different promotions.
+        let mut by_key: HashMap<(EntryKind, String, String, Option<EntryId>), EntryId> = codex
             .entries()?
             .into_iter()
             .filter(|e| e.session_id.as_deref() == Some(session_id))
-            .map(|e| ((e.kind, e.summary, e.body), e.id))
+            .map(|e| ((e.kind, e.summary, e.body, e.review_of), e.id))
             .collect();
         let mut promoted_ids = Vec::new();
         let mut fresh = Vec::new();
         for p in promotions {
-            if let Some(&existing) = by_key.get(&(p.kind, p.summary.clone(), p.body.clone())) {
+            let key = (p.kind, p.summary.clone(), p.body.clone(), p.review_of);
+            if let Some(&existing) = by_key.get(&key) {
                 promoted_ids.push(existing);
                 continue;
             }
@@ -749,7 +756,7 @@ impl Gungnir {
             c.review_of = p.review_of;
             c.evidence.push(Evidence::Ref { id: archive });
             codex.create_with(&c, &|id| self.exists_anywhere(id))?;
-            by_key.insert((c.kind, c.summary.clone(), c.body.clone()), c.id);
+            by_key.insert(key, c.id);
             promoted_ids.push(c.id);
             fresh.push(c);
         }
