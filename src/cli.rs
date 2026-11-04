@@ -401,7 +401,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 #[cfg(feature = "embed")]
                 {
                     let emb = embedder_for(&g)?;
-                    g.add_semantic(e, layer, &emb)?
+                    g.add_semantic(e, layer, emb.as_ref())?
                 }
                 #[cfg(not(feature = "embed"))]
                 {
@@ -603,7 +603,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 #[cfg(feature = "embed")]
                 {
                     let emb = embedder_for(&g)?;
-                    g.supersede_semantic(id, &agent, summary, body, &emb)?
+                    g.supersede_semantic(id, &agent, summary, body, emb.as_ref())?
                 }
                 #[cfg(not(feature = "embed"))]
                 {
@@ -634,7 +634,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 #[cfg(feature = "embed")]
                 {
                     let emb = embedder_for(&g)?;
-                    g.promote_semantic(from, &agent, kind, summary, body, &emb)?
+                    g.promote_semantic(from, &agent, kind, summary, body, emb.as_ref())?
                 }
                 #[cfg(not(feature = "embed"))]
                 {
