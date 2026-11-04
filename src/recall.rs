@@ -261,7 +261,7 @@ fn trust_weight(state: StateAt) -> f64 {
 
 /// Exponential recency decay, half-life 90 days, floored so a
 /// still-true old fact keeps a floor of rank instead of decaying to zero.
-fn recency_weight(entry: &Entry, now: DateTime<Utc>) -> f64 {
+pub(crate) fn recency_weight(entry: &Entry, now: DateTime<Utc>) -> f64 {
     const HALF_LIFE_SECS: f64 = 90.0 * 86_400.0;
     const FLOOR: f64 = 0.25;
     let age = (now - entry.timestamp).num_seconds().max(0) as f64;
