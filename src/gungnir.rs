@@ -1808,7 +1808,9 @@ mod tests {
         // Free text holds `[[` spans that are prose, not entity claims —
         // archiving must not reject the write.
         let (_d, g) = gng();
-        let s = g.start_session("builder", "explain the matrix [[1,2],[3,4]] syntax").unwrap();
+        let s = g
+            .start_session("builder", "explain the matrix [[1,2],[3,4]] syntax")
+            .unwrap();
         g.add_observation(&s, "note [[foo,bar] inline").unwrap();
         g.end_session(&s, "done", vec![]).unwrap();
 
@@ -1828,7 +1830,9 @@ mod tests {
         // the link demotes to its bare id instead of bricking every retry.
         let (_d, g) = gng();
         let foreign = EntryId::generate().to_string();
-        let s = g.start_session("builder", format!("port fix from [[ {foreign} ]]"));
+        let s = g
+            .start_session("builder", format!("port fix from [[ {foreign} ]]"))
+            .unwrap();
         g.add_observation(&s, "first observation").unwrap();
         g.end_session(&s, "done", vec![]).unwrap();
 

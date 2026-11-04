@@ -432,7 +432,7 @@ fn mcp_brief_require_verified_hides_unverified_hits() {
     assert_eq!(r["result"]["isError"], false, "{r}");
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("No verified knowledge covers this task"),
+        text.contains("Entries matched this task but none are verified"),
         "{text}"
     );
     assert!(!text.contains(&e.id.to_string()), "{text}");

@@ -43,6 +43,9 @@ enum Cmd {
         body: String,
         #[arg(long)]
         project: Option<String>,
+        /// The entry this review evaluates (required for --kind review)
+        #[arg(long)]
+        review_of: Option<EntryId>,
         /// Entity names this entry is about (comma-separated or repeated).
         #[arg(long, value_delimiter = ',')]
         entities: Vec<String>,
@@ -132,6 +135,19 @@ enum Cmd {
         note: Option<String>,
     },
 
+    /// Mark an entry contradicted by another entry.
+    Contradict {
+        id: EntryId,
+        /// The entry that contradicts `id`
+        #[arg(long)]
+        by: EntryId,
+        #[arg(long, default_value = "human")]
+        verifier: String,
+        /// Free-text reason recorded in the verification log
+        #[arg(long)]
+        note: Option<String>,
+    },
+
     /// Write a revision of an entry (supersession chain).
     Supersede {
         id: EntryId,
@@ -196,7 +212,6 @@ enum Cmd {
         #[arg(long, default_value_t = 8)]
         limit: usize,
     },
-
 
     /// Audit log: one entry's history, or a chronological scan of events.
     ///
@@ -362,15 +377,30 @@ fn gng(root: &Option<PathBuf>) -> Result<Gungnir> {
     Gungnir::open(layout::resolve_root(root.clone()))
 }
 
-/// Rebuild a session handle from its persisted identity. The task text is
-/// not recoverable here; it only feeds briefing headers, which `brief`
-/// rebuilds from its own argument.
-fn session_handle(id: String, agent: String) -> crate::Session {
-    crate::Session {
+/// Rebuild a session handle from its persisted identity. `session start`
+/// writes `scratch/<id>/.session.yaml`, so a rebuilt handle recovers the
+/// real task text instead of archiving an empty `# Task`.
+fn session_handle(g: &Gungnir, id: String, agent: String) -> Result<crate::Session> {
+    if let Some(s) = g.load_session(&id)? {
+        return Ok(s);
+    }
+    Ok(crate::Session {
         id,
         agent,
         task: String::new(),
         started_at: chrono::Utc::now(),
+    })
+}
+
+/// Warn on stderr about files a read skipped, keeping stdout clean for
+/// pipelines.
+fn warn_skipped(skipped: &[crate::store::Skipped]) {
+    for s in skipped {
+        eprintln!(
+            "warning: skipped unreadable entry {}: {}",
+            s.path.display(),
+            s.error
+        );
     }
 }
 
@@ -435,7 +465,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
     let g = gng(&cli.root)?;
     let mut code = 0;
     match cli.cmd {
-        C::Init => println!("initialized {}", g.root().display()),
+        C::Init => {
+            g.init()?;
+            println!("initialized {}", g.root().display())
+        }
 
         C::Add {
             agent,
@@ -443,6 +476,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             summary,
             body,
             project,
+            review_of,
             entities,
             into,
             semantic,
@@ -450,6 +484,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let mut e = crate::Entry::new(&agent, kind, summary);
             e.body = body;
             e.project_id = project;
+            e.review_of = review_of;
             e.entities = entities;
             let layer = match layer_of(&into)? {
                 crate::layout::CODEX => crate::gungnir::Layer::Codex,
@@ -495,18 +530,19 @@ fn dispatch(cli: Cli) -> Result<i32> {
         }
 
         C::Ls { layer, agent } => {
-            let entries = match layer_of(&layer)? {
-                crate::layout::CODEX => g.codex()?.entries()?,
+            let scan = match layer_of(&layer)? {
+                crate::layout::CODEX => g.codex()?.scan()?,
                 _ => {
                     let a = agent
                         .as_deref()
                         .ok_or_else(|| Error::Invalid("ls journal requires --agent".into()))?;
-                    g.journal(a)?.entries()?
+                    g.journal(a)?.scan()?
                 }
             };
-            for e in entries {
+            for e in &scan.entries {
                 println!("{}  {}\t{}\t{}", e.id, e.kind, e.summary, e.agent);
             }
+            warn_skipped(&scan.skipped);
         }
 
         C::Recall {
@@ -561,18 +597,26 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 for h in &out.hits {
                     println!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary);
                 }
-                if out.hits.is_empty() && out.coverage.total_matched() == 0 {
-                    println!("(no knowledge covers this topic)");
-                } else {
-                    println!(
-                        "coverage: {} verified, {} unverified, {} contradicted ({} superseded, {} rolled back hidden)",
-                        out.coverage.verified,
-                        out.coverage.unverified,
-                        out.coverage.contradicted,
-                        out.coverage.hidden_superseded,
-                        out.coverage.hidden_rolled_back
-                    );
+                if out.hits.is_empty() {
+                    let hidden = out.coverage.hidden_superseded + out.coverage.hidden_rolled_back;
+                    if out.coverage.total == 0 {
+                        println!("(no knowledge on file)");
+                    } else if out.coverage.contradicted > 0 {
+                        println!("(only contradicted knowledge matched this topic)");
+                    } else if out.coverage.total_visible() == 0 && hidden > 0 {
+                        println!("(no live knowledge covers this topic; {hidden} superseded or rolled back hidden)");
+                    } else {
+                        println!("(no knowledge matched this topic)");
+                    }
                 }
+                println!(
+                    "coverage: {} verified, {} unverified, {} contradicted ({} superseded, {} rolled back hidden)",
+                    out.coverage.verified,
+                    out.coverage.unverified,
+                    out.coverage.contradicted,
+                    out.coverage.hidden_superseded,
+                    out.coverage.hidden_rolled_back
+                );
                 if abstained {
                     println!(
                         "no verified knowledge covers this topic ({} matched, 0 verified)",
@@ -583,6 +627,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if abstained {
                 code = EXIT_ABSTAINED;
             }
+            warn_skipped(&out.skipped);
         }
 
         C::Verify {
@@ -798,6 +843,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if require_verified && b.codex_coverage.verified + b.journal_coverage.verified == 0 {
                 code = EXIT_ABSTAINED;
             }
+            warn_skipped(&b.skipped);
         }
 
         C::Log {
@@ -918,6 +964,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     );
                 }
             }
+            warn_skipped(&r.skipped);
         }
 
         C::Mcp => {
@@ -937,7 +984,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 agent,
                 text,
             } => {
-                let s = session_handle(session_id, agent);
+                let s = session_handle(&g, session_id, agent)?;
                 let id = g.add_observation(&s, text)?;
                 println!("{id}");
             }
@@ -947,7 +994,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 text,
                 succeeded,
             } => {
-                let s = session_handle(session_id, agent);
+                let s = session_handle(&g, session_id, agent)?;
                 let id = g.add_attempt(&s, text, succeeded)?;
                 println!("{id}");
             }
@@ -956,7 +1003,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 agent,
                 summary,
             } => {
-                let s = session_handle(session_id, agent);
+                let s = session_handle(&g, session_id, agent)?;
                 let report = g.end_session(&s, summary, vec![])?;
                 note_conflicts(&report.conflicts, &report.warnings);
                 if report.already_ended {

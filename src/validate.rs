@@ -26,10 +26,10 @@ pub type Exists<'a> = &'a dyn Fn(EntryId) -> Result<bool>;
 /// (unverifiable, unfixable) for a link it made when the target existed.
 /// Shape rules (review_of presence, caps, entity syntax) always apply.
 pub fn validate_entry(entry: &Entry, exists: Exists<'_>, enforce_refs: bool) -> Result<()> {
-    if entry.summary.len() > MAX_SUMMARY_LEN {
+    if entry.summary.chars().count() > MAX_SUMMARY_LEN {
         return Err(crate::Error::Invalid(format!(
             "summary is {} chars; cap is {MAX_SUMMARY_LEN}",
-            entry.summary.len()
+            entry.summary.chars().count()
         )));
     }
 
@@ -77,10 +77,10 @@ pub fn validate_entry(entry: &Entry, exists: Exists<'_>, enforce_refs: bool) -> 
 
     for ev in &entry.evidence {
         if let Evidence::File { excerpt, .. } = ev {
-            if excerpt.len() > MAX_EXCERPT_LEN {
+            if excerpt.chars().count() > MAX_EXCERPT_LEN {
                 return Err(crate::Error::Invalid(format!(
                     "evidence excerpt is {} chars; cap is {MAX_EXCERPT_LEN}",
-                    excerpt.len()
+                    excerpt.chars().count()
                 )));
             }
         }
@@ -201,10 +201,10 @@ fn declared_names(entry: &Entry) -> &[String] {
 /// rollback) and other fields' edits without a rewrite of its history.
 /// Reference existence lives in [`validate_new_refs`].
 pub fn validate_update(new: &Entry, old: &Entry) -> Result<()> {
-    if new.summary != old.summary && new.summary.len() > MAX_SUMMARY_LEN {
+    if new.summary != old.summary && new.summary.chars().count() > MAX_SUMMARY_LEN {
         return Err(crate::Error::Invalid(format!(
             "summary is {} chars; cap is {MAX_SUMMARY_LEN}",
-            new.summary.len()
+            new.summary.chars().count()
         )));
     }
     if new.summary != old.summary && has_control(&new.summary) {
@@ -254,10 +254,10 @@ pub fn validate_update(new: &Entry, old: &Entry) -> Result<()> {
             continue;
         }
         if let Evidence::File { excerpt, .. } = ev {
-            if excerpt.len() > MAX_EXCERPT_LEN {
+            if excerpt.chars().count() > MAX_EXCERPT_LEN {
                 return Err(crate::Error::Invalid(format!(
                     "evidence excerpt is {} chars; cap is {MAX_EXCERPT_LEN}",
-                    excerpt.len()
+                    excerpt.chars().count()
                 )));
             }
         }
