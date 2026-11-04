@@ -269,7 +269,7 @@ fn mcp_conflict_tools_close_the_loop() {
     assert!(hit["result"]["content"][0]["text"]
         .as_str()
         .unwrap()
-        .contains("contradicted by"));
+        .contains("contradicted"));
 
     // The queue lists the open candidate the disagreeing write raised.
     let list = p.rpc(&msg(

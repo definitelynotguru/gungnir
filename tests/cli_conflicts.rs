@@ -101,5 +101,5 @@ fn conflict_loop_over_the_cli() {
     .trim()
     .to_string();
     let out = run(root, &["contradict", &third_id, "--by", &new_id]);
-    assert!(stdout(&out).contains("contradicted by"));
+    assert!(stdout(&out).contains(&format!("contradicted {third_id} by {new_id}")));
 }
