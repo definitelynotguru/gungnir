@@ -631,16 +631,15 @@ fn deleted_scratch_link_does_not_brick_updates() {
     let s = g.start_session("builder", "temp task").unwrap();
     let scratch_id = g.add_observation(&s, "temporary observation").unwrap();
 
-    // promote writes into codex with the union resolver; a body wikilink
-    // to the scratch id is valid while the session lives.
-    let cid = g
-        .promote(
-            scratch_id,
-            "builder",
-            EntryKind::Decision,
-            "fact citing scratch work",
-            format!("derived from [[{scratch_id}]]"),
-        )
+    // A codex entry writes with the union resolver; a body wikilink to the
+    // scratch id is valid while the session lives.
+    let mut e = Entry::new("builder", EntryKind::Decision, "fact citing scratch work");
+    e.body = format!("derived from [[{scratch_id}]]");
+    let cid = e.id;
+    let codex = g.codex().unwrap();
+    let scratch_store = g.scratch(&s.id).unwrap();
+    codex
+        .create_with(&e, &|id| Ok(codex.exists(id)? || scratch_store.exists(id)?))
         .unwrap();
 
     // Session ends, scratch is deleted — the link now dangles.
