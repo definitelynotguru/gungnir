@@ -590,7 +590,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
                         println!("(no knowledge on file)");
                     } else if out.coverage.contradicted > 0 {
                         println!("(only contradicted knowledge matched this topic)");
-                    } else if require_verified && out.coverage.total_matched() > 0 {
+                    } else if require_verified
+                        && out.coverage.verified == 0
+                        && out.coverage.unverified > 0
+                    {
                         println!("(only unverified knowledge matched this topic)");
                     } else if out.coverage.total_visible() == 0 && hidden > 0 {
                         println!("(no live knowledge covers this topic; {hidden} superseded or rolled back hidden)");
