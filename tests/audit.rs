@@ -430,7 +430,52 @@ fn require_verified_names_unverified_only_matches() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("matching entries are unverified"),
+        stdout.contains("matching entries were filtered: unverified"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn require_verified_names_contradicted_only_matches() {
+    let (_d, store) = root();
+    let claim = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "claim about zorblax",
+        ],
+    );
+    let counter = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "counter evidence",
+        ],
+    );
+    ok(&store, &["contradict", &claim, "--by", &counter]);
+
+    // A contradicted-only match must not be labeled unverified.
+    let out = run(&store, &["recall", "zorblax", "--require-verified"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("contradicted"), "{stdout}");
+    assert!(!stdout.contains("only unverified"), "{stdout}");
+
+    let out = run(
+        &store,
+        &["brief", "--agent", "a", "zorblax", "--require-verified"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("matching entries were filtered: contradicted"),
         "{stdout}"
     );
 }
