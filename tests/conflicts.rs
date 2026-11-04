@@ -4,7 +4,8 @@
 //! loop is open.
 
 use gungnir::{
-    ConflictStatus, ConflictVerb, Entry, EntryKind, Gungnir, Layer, Query, VerificationState,
+    ConflictStatus, ConflictVerb, Entry, EntryId, EntryKind, Gungnir, Layer, Query,
+    VerificationState,
 };
 
 fn gng() -> (tempfile::TempDir, Gungnir) {
@@ -705,4 +706,65 @@ fn re_resolving_a_crash_applied_contradiction_closes_the_candidate() {
         .unwrap();
     assert_eq!(rec.status, ConflictStatus::ResolvedContradicted);
     assert!(g.open_conflicts().unwrap().is_empty());
+}
+
+#[test]
+fn reviews_of_different_targets_do_not_alias_on_dedupe() {
+    let (_d, g) = gng();
+    let a = write_verified(&g, "sessions use mysql");
+    let b = write_verified(&g, "dns via cloudflare");
+    let s = g.start_session("builder", "review round").unwrap();
+
+    // Identical prose, different targets: two promotions, not one alias.
+    let promo = |target: EntryId| gungnir::Promotion {
+        kind: EntryKind::Review,
+        summary: "approved".into(),
+        body: "checks passed".into(),
+        review_of: Some(target),
+    };
+    let report = g
+        .end_session(&s, "done", vec![promo(a.id), promo(b.id)])
+        .unwrap();
+    assert_eq!(report.promoted.len(), 2);
+    assert_ne!(report.promoted[0], report.promoted[1]);
+
+    let codex = g.codex().unwrap();
+    assert_eq!(
+        codex.require(report.promoted[0]).unwrap().review_of,
+        Some(a.id)
+    );
+    assert_eq!(
+        codex.require(report.promoted[1]).unwrap().review_of,
+        Some(b.id)
+    );
+}
+
+#[test]
+fn retried_end_scans_the_promotions_it_finishes() {
+    let (_d, g) = gng();
+    write_verified(&g, "sessions use mysql");
+    let s = g.start_session("builder", "migrate sessions").unwrap();
+
+    // Crash mid-end: the journal archive landed, scratch still exists,
+    // and the promotion never did. The next end converges — and must
+    // still scan what it lands.
+    let mut archive = Entry::new("builder", EntryKind::Session, "migrated sessions");
+    archive.session_id = Some(s.id.clone());
+    g.journal("builder").unwrap().create(&archive).unwrap();
+
+    let report = g
+        .end_session(
+            &s,
+            "migrated sessions",
+            vec![gungnir::Promotion {
+                kind: EntryKind::Decision,
+                summary: "sessions use postgres".into(),
+                body: "benchmarked".into(),
+                review_of: None,
+            }],
+        )
+        .unwrap();
+    assert!(report.already_ended);
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(g.open_conflicts().unwrap().len(), 1);
 }
