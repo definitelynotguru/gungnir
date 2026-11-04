@@ -135,19 +135,6 @@ enum Cmd {
         note: Option<String>,
     },
 
-    /// Mark an entry contradicted by another entry.
-    Contradict {
-        id: EntryId,
-        /// The entry that contradicts `id`
-        #[arg(long)]
-        by: EntryId,
-        #[arg(long, default_value = "human")]
-        verifier: String,
-        /// Free-text reason recorded in the verification log
-        #[arg(long)]
-        note: Option<String>,
-    },
-
     /// Write a revision of an entry (supersession chain).
     Supersede {
         id: EntryId,
