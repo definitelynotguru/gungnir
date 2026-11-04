@@ -919,6 +919,16 @@ fn recall_limit_zero_does_not_abstain() {
         serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
     assert_eq!(doc["abstained"], false);
     assert_eq!(doc["coverage"]["verified"], 1);
+
+    // The same truncation in prose must not claim the matches were
+    // unverified when a verified one exists.
+    let out = run(
+        &store,
+        &["recall", "checkout", "--require-verified", "--limit", "0"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("only unverified"), "{stdout}");
+    assert!(stdout.contains("1 verified"), "{stdout}");
     assert!(doc["hits"].as_array().unwrap().is_empty());
     let _ = e1;
 }
