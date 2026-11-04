@@ -100,3 +100,13 @@ facts:
     summary: "meeting room hera seats eight"
     body: "bookings through the calendar"
     verify_as: office-manager
+
+  - label: checkout_rewrite_attempt
+    agent: builder
+    kind: decision
+    summary: "slow checkout rewrite stalls on buffer pinning"
+    body: "unverified workaround from the rewrite attempt"
+    # Deliberately unverified and dense in query tokens: 'verified
+    # promotion leads codex hits' stays falsifiable only while a
+    # topic-matched unverified fact can steal hit0 if the verified-first
+    # ordering regresses.

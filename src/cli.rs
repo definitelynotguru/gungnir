@@ -738,6 +738,55 @@ mod tests {
     }
 
     #[test]
+    fn revalidate_all_counts_drifted_and_unreadable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("adr.md");
+        std::fs::write(&doc, "decision: use postgres").unwrap();
+
+        let g = Gungnir::open(dir.path()).unwrap();
+        let drifted = crate::Entry::new("ops", EntryKind::Decision, "use postgres");
+        g.codex().unwrap().create(&drifted).unwrap();
+        g.verify_with_evidence(drifted.id, "team", None, std::slice::from_ref(&doc))
+            .unwrap();
+        let unreadable = crate::Entry::new("ops", EntryKind::Decision, "use sqlite");
+        g.codex().unwrap().create(&unreadable).unwrap();
+        let unreadable_path = g.codex().unwrap().path_for(unreadable.id);
+        drop(g);
+        std::fs::write(&unreadable_path, "not an entry file").unwrap();
+
+        let all = Cmd::Verify {
+            id: None,
+            verifier: None,
+            note: None,
+            evidence: Vec::new(),
+            revalidate: true,
+            all: true,
+        };
+
+        // One drifted file plus one corrupt entry file → Drift(2), never
+        // a swallowed error or a zero exit.
+        std::fs::write(&doc, "decision: use mysql").unwrap();
+        match dispatch(verify_cli(dir.path(), all)) {
+            Err(Error::Drift(2)) => {}
+            other => panic!("expected Error::Drift(2), got {other:?}"),
+        }
+
+        // --all without --revalidate is still rejected.
+        let all_no_revalidate = Cmd::Verify {
+            id: Some(drifted.id),
+            verifier: None,
+            note: None,
+            evidence: Vec::new(),
+            revalidate: false,
+            all: true,
+        };
+        match dispatch(verify_cli(dir.path(), all_no_revalidate)) {
+            Err(Error::Invalid(_)) => {}
+            other => panic!("expected Error::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn clap_accepts_current_and_as_of_together() {
         let cli = Cli::try_parse_from([
             "gungnir",

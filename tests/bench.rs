@@ -399,6 +399,7 @@ fn field<T>(expect: Option<T>, f: impl FnOnce(T) -> bool) -> bool {
 #[test]
 fn checks_yaml_rejects_unknown_fields() {
     let yaml = r#"
+version: 1
 abilities:
   - name: typo test
     checks:
@@ -406,9 +407,15 @@ abilities:
         run: {search: "budget", layer: codex}
         expect: {hits_exactlly: 1}
 "#;
+    // The file must parse far enough to hit `Expect`'s unknown-field
+    // check, or the assertion passes on the missing version instead.
+    let err = serde_yaml::from_str::<ChecksFile>(yaml)
+        .err()
+        .unwrap()
+        .to_string();
     assert!(
-        serde_yaml::from_str::<ChecksFile>(yaml).is_err(),
-        "unknown expect field must be rejected"
+        err.contains("hits_exactlly"),
+        "error must name the unknown field, got: {err}"
     );
 }
 
