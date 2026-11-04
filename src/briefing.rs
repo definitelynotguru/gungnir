@@ -101,6 +101,31 @@ fn coverage_line(name: &str, cov: &Coverage) -> String {
     )
 }
 
+/// The empty-hits line for one layer, named by what the coverage counters
+/// actually hold. Under `--require-verified` unverified/contradicted
+/// matches are filtered out of hits; without it, hits can only be empty
+/// when every match was hidden — either way "nothing matched" must not
+/// contradict the coverage line that prints below it.
+fn empty_hits_line(none: &str, cov: &Coverage) -> String {
+    if cov.total == 0 {
+        return none.to_string();
+    }
+    let mut states = Vec::new();
+    if cov.unverified > 0 {
+        states.push("unverified");
+    }
+    if cov.contradicted > 0 {
+        states.push("contradicted");
+    }
+    if cov.hidden_superseded + cov.hidden_rolled_back > 0 {
+        states.push("superseded or rolled back");
+    }
+    if states.is_empty() {
+        return "- nothing on file matched this topic\n".to_string();
+    }
+    format!("- matching entries were filtered: {}\n", states.join(", "))
+}
+
 /// Assemble the briefing. Coverage drives the abstention signal: when no
 /// verified fact matched the topic in either layer, say so outright — and
 /// say whether nothing matched or nothing verified.
@@ -110,14 +135,10 @@ pub fn compile(input: BriefingInput) -> Briefing {
 
     md.push_str("\n## Shared knowledge (Codex)\n");
     if input.codex_hits.is_empty() {
-        let c = input.codex_coverage;
-        if c.total == 0 {
-            md.push_str("- nothing on file\n");
-        } else if c.verified == 0 && c.total_matched() > 0 {
-            md.push_str("- matching entries are unverified\n");
-        } else {
-            md.push_str("- nothing on file matched this topic\n");
-        }
+        md.push_str(&empty_hits_line(
+            "- nothing on file\n",
+            &input.codex_coverage,
+        ));
     } else {
         for h in &input.codex_hits {
             md.push_str(&label(h, &input.codex_superseded, &task_tokens));
@@ -127,14 +148,10 @@ pub fn compile(input: BriefingInput) -> Briefing {
 
     md.push_str("\n## Your prior attempts (Journal)\n");
     if input.journal_hits.is_empty() {
-        let j = input.journal_coverage;
-        if j.total == 0 {
-            md.push_str("- no prior attempts on file\n");
-        } else if j.verified == 0 && j.total_matched() > 0 {
-            md.push_str("- matching attempts are unverified\n");
-        } else {
-            md.push_str("- no prior attempts matched this topic\n");
-        }
+        md.push_str(&empty_hits_line(
+            "- no prior attempts on file\n",
+            &input.journal_coverage,
+        ));
     } else {
         for h in &input.journal_hits {
             md.push_str(&label(h, &input.journal_superseded, &task_tokens));
