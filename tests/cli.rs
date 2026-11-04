@@ -24,7 +24,7 @@ fn gungnir(root: &std::path::Path, args: &[&str]) -> String {
 fn stats_json_exposes_peer_coverage_counts() {
     let dir = tempfile::tempdir().unwrap();
     let g = Gungnir::open(dir.path()).unwrap();
-    let scout = g.start_session("scout", "fix checkout latency");
+    let scout = g.start_session("scout", "fix checkout latency").unwrap();
     g.add_attempt(&scout, "added index for checkout latency", false)
         .unwrap();
     g.end_session(&scout, "index did not help", vec![]).unwrap();

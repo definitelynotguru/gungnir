@@ -134,12 +134,9 @@ impl Gungnir {
     /// lazily, so read commands never touch the filesystem.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        for sub in [CODEX, JOURNAL, SCRATCH] {
-            std::fs::create_dir_all(root.join(sub))?;
-        }
-        // Canonicalize once the directories exist so evidence paths can be
-        // recorded relative to the store (and still resolved from it later)
-        // no matter how the root was spelled.
+        // Canonicalize so evidence paths can be recorded relative to the
+        // store (and still resolved from it later) no matter how the root
+        // was spelled.
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         Ok(Self { root })
     }
@@ -1360,11 +1357,11 @@ mod tests {
     #[test]
     fn peer_coverage_counts_other_journals_without_leaking_content() {
         let (_d, g) = gng();
-        let scout = g.start_session("scout", "fix checkout latency");
+        let scout = g.start_session("scout", "fix checkout latency").unwrap();
         g.add_attempt(&scout, "added index for checkout latency", false)
             .unwrap();
         g.end_session(&scout, "index did not help", vec![]).unwrap();
-        let mine = g.start_session("builder", "fix checkout latency");
+        let mine = g.start_session("builder", "fix checkout latency").unwrap();
         g.add_attempt(&mine, "increased pool size", true).unwrap();
         g.end_session(&mine, "pool resize worked", vec![]).unwrap();
 
@@ -1433,7 +1430,7 @@ mod tests {
         let adr = d.path().join("spec.md");
         std::fs::write(&adr, "the spec").unwrap();
 
-        let s = g.start_session("builder", "write spec");
+        let s = g.start_session("builder", "write spec").unwrap();
         g.add_observation(&s, "spec drafted").unwrap();
         let report = g
             .end_session(
@@ -1443,6 +1440,7 @@ mod tests {
                     kind: EntryKind::Decision,
                     summary: "spec chosen".into(),
                     body: "".into(),
+                    review_of: None,
                 }],
             )
             .unwrap();
@@ -1463,19 +1461,15 @@ mod tests {
     #[test]
     fn peer_coverage_survives_a_corrupt_peer_journal() {
         let (_d, g) = gng();
-        let scout = g.start_session("scout", "fix checkout latency");
+        let scout = g.start_session("scout", "fix checkout latency").unwrap();
         g.add_attempt(&scout, "retried checkout", false).unwrap();
-        g.end_session(&scout, "checkout retry failed", vec![])
+        let report = g
+            .end_session(&scout, "checkout retry failed", vec![])
             .unwrap();
 
-        // Corrupt one file inside scout's journal partition.
-        let scout_dir = g.root().join(JOURNAL).join("scout");
-        let first = walkdir::WalkDir::new(&scout_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .find(|e| e.file_type().is_file() && e.file_name() != ".lock")
-            .unwrap();
-        std::fs::write(first.path(), "not an entry file").unwrap();
+        // Corrupt the session's archive entry inside scout's journal.
+        let archive = g.journal("scout").unwrap().path_for(report.journal_id);
+        std::fs::write(&archive, "not an entry file").unwrap();
 
         // Briefing must not die; it just counts what it can read.
         let pc = g
@@ -1492,7 +1486,7 @@ mod tests {
         // failures blamed on it: only a failed line that shares stemmed
         // tokens with the topic counts.
         let (_d, g) = gng();
-        let scout = g.start_session("scout", "fix checkout latency");
+        let scout = g.start_session("scout", "fix checkout latency").unwrap();
         g.add_attempt(&scout, "restart deploy runner", false)
             .unwrap();
         g.add_attempt(&scout, "patch checkout queue", true).unwrap();
@@ -1541,7 +1535,9 @@ mod tests {
     #[test]
     fn session_task_mentioning_failed_does_not_count_as_failure() {
         let (_d, g) = gng();
-        let scout = g.start_session("scout", "investigate [failed] checkout");
+        let scout = g
+            .start_session("scout", "investigate [failed] checkout")
+            .unwrap();
         g.add_observation(&scout, "checkout note").unwrap();
         g.end_session(&scout, "read the [failed] reports", vec![])
             .unwrap();
