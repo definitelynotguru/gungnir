@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crate::entry::{EntryKind, VerificationState};
+use crate::entry::EntryKind;
 use crate::gungnir::PeerCoverage;
 use crate::id::EntryId;
 use crate::recall::{self, Coverage, Hit};
