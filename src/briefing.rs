@@ -110,8 +110,11 @@ pub fn compile(input: BriefingInput) -> Briefing {
 
     md.push_str("\n## Shared knowledge (Codex)\n");
     if input.codex_hits.is_empty() {
-        if input.codex_coverage.total == 0 {
+        let c = input.codex_coverage;
+        if c.total == 0 {
             md.push_str("- nothing on file\n");
+        } else if c.verified == 0 && c.total_matched() > 0 {
+            md.push_str("- matching entries are unverified\n");
         } else {
             md.push_str("- nothing on file matched this topic\n");
         }
@@ -124,8 +127,11 @@ pub fn compile(input: BriefingInput) -> Briefing {
 
     md.push_str("\n## Your prior attempts (Journal)\n");
     if input.journal_hits.is_empty() {
-        if input.journal_coverage.total == 0 {
+        let j = input.journal_coverage;
+        if j.total == 0 {
             md.push_str("- no prior attempts on file\n");
+        } else if j.verified == 0 && j.total_matched() > 0 {
+            md.push_str("- matching attempts are unverified\n");
         } else {
             md.push_str("- no prior attempts matched this topic\n");
         }
