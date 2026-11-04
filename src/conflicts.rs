@@ -490,8 +490,10 @@ fn lexical_signals(new: &str, old: &str) -> Vec<ConflictSignal> {
     }
     // Negation is decided on raw tokens: the stemmer turns "noted" into
     // `not`, so stemmed sets would read acknowledgment words as negations.
-    let new_neg = NEGATIONS.iter().any(|n| raw_tokens(new).contains(*n));
-    let old_neg = NEGATIONS.iter().any(|n| raw_tokens(old).contains(*n));
+    let new_raw = raw_tokens(new);
+    let old_raw = raw_tokens(old);
+    let new_neg = NEGATIONS.iter().any(|n| new_raw.contains(*n));
+    let old_neg = NEGATIONS.iter().any(|n| old_raw.contains(*n));
     if new_neg != old_neg {
         signals.push(ConflictSignal::NegationAsymmetry);
     }
@@ -581,15 +583,27 @@ pub fn detect_many(
         let mut order: Vec<EntryId> = Vec::new();
         let mut summaries: HashMap<EntryId, String> = HashMap::new();
 
-        // Keyword channel: BM25-lite topic match over the same pool.
-        let q_tokens = recall::tokenize(&format!("{}\n{}", entry.summary, entry.body));
+        // Keyword channel: BM25-lite topic match over the same pool,
+        // ranked the way recall's `finish` ranks its current view —
+        // recency-weighted score, id tie-break — so the candidate cap
+        // keeps the conflicts recall would surface first instead of
+        // tied facts in oldest-first pool order.
+        let mut q_tokens = recall::tokenize(&format!("{}\n{}", entry.summary, entry.body));
+        q_tokens.sort();
+        q_tokens.dedup();
         let mut scored: Vec<(f64, &recall::Candidate)> = pool
             .iter()
             .filter(|c| eligible(c))
-            .map(|c| (recall::score(&c.entry, &q_tokens, &stats), c))
+            .map(|c| {
+                (
+                    recall::score(&c.entry, &q_tokens, &stats)
+                        * recall::recency_weight(&c.entry, now),
+                    c,
+                )
+            })
             .filter(|(s, _)| *s > 0.0)
             .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.entry.id.cmp(&b.1.entry.id)));
         for (_, cand) in scored {
             let signals = lexical_signals(&entry.summary, &cand.entry.summary);
             summaries.insert(cand.entry.id, cand.entry.summary.clone());
