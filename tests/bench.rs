@@ -786,7 +786,7 @@ fn peer_coverage_semantic_counts_paraphrased_peer_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let g = Gungnir::open(dir.path()).unwrap();
 
-    let scout = g.start_session("scout", "investigate db issues");
+    let scout = g.start_session("scout", "investigate db issues").unwrap();
     g.add_observation(&scout, "postgres pool exhausted during deploy")
         .unwrap();
     g.end_session(&scout, "pool exhaustion diagnosed", vec![])
