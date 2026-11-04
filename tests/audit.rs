@@ -395,6 +395,47 @@ fn require_verified_makes_abstention_explicit() {
 }
 
 #[test]
+fn require_verified_names_unverified_only_matches() {
+    let (_d, store) = root();
+    add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "checkout index design",
+        ],
+    );
+
+    // require-verified filters the hit but coverage still counts it: the
+    // verdict must not claim nothing matched.
+    let out = run(&store, &["recall", "checkout", "--require-verified"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("(only unverified knowledge matched this topic)"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("no knowledge matched this topic"),
+        "{stdout}"
+    );
+
+    // Briefing says the same in prose.
+    let out = run(
+        &store,
+        &["brief", "--agent", "a", "checkout", "--require-verified"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("matching entries are unverified"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn brief_require_verified_abstains_with_exit_2() {
     let (_d, store) = root();
     add(
