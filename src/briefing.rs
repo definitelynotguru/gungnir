@@ -40,6 +40,13 @@ pub struct BriefingInput {
     pub peers: PeerCoverage,
     /// Open conflict candidates touching this briefing's hits.
     pub open_conflicts: usize,
+    /// Whether the query restricted hits to verified entries. Determines
+    /// what an empty hit list means: a verification filter, a hit limit,
+    /// or hidden matches.
+    pub require_verified: bool,
+    /// The query's hit limit. A zero limit returns no hits even when
+    /// matches exist, so an empty list must not blame the filters.
+    pub hit_limit: usize,
 }
 
 fn label(hit: &Hit, superseded: &HashSet<EntryId>, task_tokens: &[String]) -> String {
@@ -106,22 +113,36 @@ fn coverage_line(name: &str, cov: &Coverage) -> String {
 /// matches are filtered out of hits; without it, hits can only be empty
 /// when every match was hidden — either way "nothing matched" must not
 /// contradict the coverage line that prints below it.
-fn empty_hits_line(none: &str, cov: &Coverage) -> String {
+fn empty_hits_line(none: &str, cov: &Coverage, require_verified: bool, hit_limit: usize) -> String {
     if cov.total == 0 {
         return none.to_string();
     }
-    let mut states = Vec::new();
-    if cov.unverified > 0 {
-        states.push("unverified");
+    // A zero limit drops every hit regardless of state, so it outranks the
+    // filter attribution: saying "filtered: unverified" here would blame a
+    // state that isn't why the section is empty.
+    if hit_limit == 0 {
+        return "- matches exist but the result limit is 0
+"
+        .to_string();
     }
-    if cov.contradicted > 0 {
-        states.push("contradicted");
+    // Under --require-verified the unverified/contradicted counters name
+    // what the verification filter hid; hidden counters always do. Outside
+    // it, empty hits with live matches in coverage can only be the limit —
+    // saying "filtered" would blame a state nobody applied.
+    let mut states = Vec::new();
+    if require_verified {
+        if cov.unverified > 0 {
+            states.push("unverified");
+        }
+        if cov.contradicted > 0 {
+            states.push("contradicted");
+        }
     }
     if cov.hidden_superseded + cov.hidden_rolled_back > 0 {
         states.push("superseded or rolled back");
     }
     if states.is_empty() {
-        return "- nothing on file matched this topic\n".to_string();
+        return "- no hits above the result limit\n".to_string();
     }
     format!("- matching entries were filtered: {}\n", states.join(", "))
 }
@@ -138,6 +159,8 @@ pub fn compile(input: BriefingInput) -> Briefing {
         md.push_str(&empty_hits_line(
             "- nothing on file\n",
             &input.codex_coverage,
+            input.require_verified,
+            input.hit_limit,
         ));
     } else {
         for h in &input.codex_hits {
@@ -151,6 +174,8 @@ pub fn compile(input: BriefingInput) -> Briefing {
         md.push_str(&empty_hits_line(
             "- no prior attempts on file\n",
             &input.journal_coverage,
+            input.require_verified,
+            input.hit_limit,
         ));
     } else {
         for h in &input.journal_hits {
@@ -247,6 +272,8 @@ mod tests {
             journal_skipped: vec![],
             peers: PeerCoverage::default(),
             open_conflicts: 0,
+            require_verified: false,
+            hit_limit: 8,
         }
     }
 

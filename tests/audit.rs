@@ -481,6 +481,54 @@ fn require_verified_names_contradicted_only_matches() {
 }
 
 #[test]
+fn brief_limit_zero_blames_the_limit_not_filters() {
+    let (_d, store) = root();
+    add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "checkout index design",
+        ],
+    );
+
+    // --limit 0 returns no hits even though an unverified entry matched:
+    // the empty section must name the limit, not a filter nobody applied.
+    let out = run(
+        &store,
+        &["brief", "--agent", "a", "checkout", "--limit", "0"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("matches exist but the result limit is 0"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("filtered: unverified"), "{stdout}");
+
+    // Under --require-verified the limit still outranks the filter label.
+    let out = run(
+        &store,
+        &[
+            "brief",
+            "--agent",
+            "a",
+            "checkout",
+            "--require-verified",
+            "--limit",
+            "0",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("matches exist but the result limit is 0"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn brief_require_verified_abstains_with_exit_2() {
     let (_d, store) = root();
     add(
