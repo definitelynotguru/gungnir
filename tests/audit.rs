@@ -936,6 +936,46 @@ fn recall_limit_zero_does_not_abstain() {
 }
 
 #[test]
+fn recall_limit_zero_unmatched_topic_blames_nothing() {
+    // coverage.total counts every entry in scope, matched or not, so
+    // --limit 0 on an unmatched topic must not claim the limit hid results.
+    let (_d, store) = root();
+    add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "checkout index design",
+        ],
+    );
+
+    let out = run(&store, &["recall", "quantum entanglement", "--limit", "0"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("(no knowledge matched this topic)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("the result limit is 0"), "{stdout}");
+
+    let out = run(
+        &store,
+        &[
+            "brief",
+            "--agent",
+            "a",
+            "quantum entanglement",
+            "--limit",
+            "0",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("the result limit is 0"), "{stdout}");
+}
+
+#[test]
 fn supersede_inherits_body_entity_mentions() {
     // A revision stays about the same entities: body-derived [[name]]
     // mentions materialize into the revision's frontmatter so the index

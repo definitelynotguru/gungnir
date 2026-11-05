@@ -114,21 +114,21 @@ fn coverage_line(name: &str, cov: &Coverage) -> String {
 /// when every match was hidden — either way "nothing matched" must not
 /// contradict the coverage line that prints below it.
 fn empty_hits_line(none: &str, cov: &Coverage, require_verified: bool, hit_limit: usize) -> String {
-    if cov.total == 0 {
-        return none.to_string();
-    }
-    // A zero limit drops every hit regardless of state, so it outranks the
-    // filter attribution: saying "filtered: unverified" here would blame a
-    // state that isn't why the section is empty.
-    if hit_limit == 0 {
+    // A zero limit drops every hit regardless of state, so when the topic
+    // matched something the limit is the reason the section is empty —
+    // naming a filter state would blame a state nobody applied. Guard on
+    // matched entries: `total` counts every entry in scope, so an
+    // unmatched topic would otherwise claim the limit hid results that
+    // never existed.
+    if cov.total_matched() > 0 && hit_limit == 0 {
         return "- matches exist but the result limit is 0
 "
         .to_string();
     }
     // Under --require-verified the unverified/contradicted counters name
-    // what the verification filter hid; hidden counters always do. Outside
-    // it, empty hits with live matches in coverage can only be the limit —
-    // saying "filtered" would blame a state nobody applied.
+    // what the verification filter hid; hidden counters always do. A topic
+    // that matched nothing falls through to `none` even when `total` is
+    // positive — unmatched in-scope entries are not matches.
     let mut states = Vec::new();
     if require_verified {
         if cov.unverified > 0 {
@@ -142,7 +142,7 @@ fn empty_hits_line(none: &str, cov: &Coverage, require_verified: bool, hit_limit
         states.push("superseded or rolled back");
     }
     if states.is_empty() {
-        return "- no hits above the result limit\n".to_string();
+        return none.to_string();
     }
     format!("- matching entries were filtered: {}\n", states.join(", "))
 }
