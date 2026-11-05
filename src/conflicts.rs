@@ -283,20 +283,29 @@ impl Conflicts {
 
     /// Persist a new candidate. Called from the write path after the entry
     /// has landed, so callers turn a failure into a warning — the entry
-    /// stands either way and candidates are advisory. Returns false when
-    /// an open record already covers the same (new, conflicting) pair:
-    /// that makes rescans — end_session retries in particular — idempotent
-    /// without a second queue entry for one disagreement.
-    pub fn record(&self, rec: &ConflictRecord) -> Result<bool> {
+    /// stands either way and candidates are advisory. Returns the existing
+    /// record when one already covers the same (new, conflicting) pair —
+    /// open or settled — which makes rescans (end_session retries in
+    /// particular) idempotent: one disagreement keeps one record, and a
+    /// settled pair stays settled instead of reopening. The dedupe scan is
+    /// lenient on malformed records: a corrupt file can never stand in for
+    /// the pair, so it is skipped here and stays visible on the strict
+    /// audit surfaces (`list`, `list_open`, `conflicts`).
+    pub fn record(&self, rec: &ConflictRecord) -> Result<Option<ConflictRecord>> {
         fs::create_dir_all(&self.dir)?;
         let _guard = self.lock()?;
-        for open in self.list_open()? {
-            if open.new_entry == rec.new_entry && open.conflicting_entry == rec.conflicting_entry {
-                return Ok(false);
+        for id in self.ids()? {
+            let Some(existing) = self.get(id).ok().flatten() else {
+                continue;
+            };
+            if existing.new_entry == rec.new_entry
+                && existing.conflicting_entry == rec.conflicting_entry
+            {
+                return Ok(Some(existing));
             }
         }
         self.persist_locked(rec)?;
-        Ok(true)
+        Ok(None)
     }
 
     /// Overwrite an existing record (resolution bookkeeping). Test-only:

@@ -319,20 +319,16 @@ impl Gungnir {
             };
             for rec in candidates {
                 match queue.record(&rec) {
-                    Ok(true) => records.push(rec),
-                    // An open record already covers this pair — surface
-                    // that one so the outcome reflects the live queue.
-                    Ok(false) => records.push(
-                        queue
-                            .open_lenient()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .find(|o| {
-                                o.new_entry == rec.new_entry
-                                    && o.conflicting_entry == rec.conflicting_entry
-                            })
-                            .unwrap_or(rec),
-                    ),
+                    Ok(None) => records.push(rec),
+                    // A record already covers this pair. Surface an open
+                    // one so the outcome reflects the live queue; a
+                    // settled one stays settled — the rescan must not
+                    // reopen a dismissed or resolved disagreement.
+                    Ok(Some(existing)) => {
+                        if existing.status == ConflictStatus::Open {
+                            records.push(existing);
+                        }
+                    }
                     Err(e) => warnings.push(format!(
                         "conflict candidate {} could not be recorded: {e}",
                         rec.id
