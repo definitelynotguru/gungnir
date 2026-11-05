@@ -768,3 +768,58 @@ fn retried_end_scans_the_promotions_it_finishes() {
     assert_eq!(report.conflicts.len(), 1);
     assert_eq!(g.open_conflicts().unwrap().len(), 1);
 }
+
+#[test]
+fn retried_end_rescans_promotions_the_crashed_end_landed() {
+    let (_d, g) = gng();
+    write_verified(&g, "sessions use mysql");
+    let s = g.start_session("builder", "migrate sessions").unwrap();
+
+    // Crash after the archive and the promotion landed but before the
+    // conflict scan ran — the entry dedupes out of "fresh" on retry, so
+    // only a rescan of all session promotions recovers its candidate.
+    let mut archive = Entry::new("builder", EntryKind::Session, "migrated sessions");
+    archive.session_id = Some(s.id.clone());
+    g.journal("builder").unwrap().create(&archive).unwrap();
+    let codex = g.codex().unwrap();
+    let mut landed = Entry::new("builder", EntryKind::Decision, "sessions use postgres");
+    landed.session_id = Some(s.id.clone());
+    landed.body = "benchmarked".into();
+    codex.create(&landed).unwrap();
+
+    let report = g
+        .end_session(
+            &s,
+            "migrated sessions",
+            vec![gungnir::Promotion {
+                kind: EntryKind::Decision,
+                summary: "sessions use postgres".into(),
+                body: "benchmarked".into(),
+                review_of: None,
+            }],
+        )
+        .unwrap();
+    assert!(report.already_ended);
+    // Deduped to the landed entry — and still scanned for conflicts.
+    assert_eq!(report.promoted, vec![landed.id]);
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(g.open_conflicts().unwrap().len(), 1);
+
+    // Idempotent: a second retry rescans the same pair but must not
+    // queue a second record.
+    let again = g
+        .end_session(
+            &s,
+            "migrated sessions",
+            vec![gungnir::Promotion {
+                kind: EntryKind::Decision,
+                summary: "sessions use postgres".into(),
+                body: "benchmarked".into(),
+                review_of: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(again.conflicts.len(), 1);
+    assert_eq!(g.open_conflicts().unwrap().len(), 1);
+    assert_eq!(g.all_conflicts().unwrap().len(), 1);
+}

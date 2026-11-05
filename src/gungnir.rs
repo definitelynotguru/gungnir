@@ -319,7 +319,20 @@ impl Gungnir {
             };
             for rec in candidates {
                 match queue.record(&rec) {
-                    Ok(()) => records.push(rec),
+                    Ok(true) => records.push(rec),
+                    // An open record already covers this pair — surface
+                    // that one so the outcome reflects the live queue.
+                    Ok(false) => records.push(
+                        queue
+                            .open_lenient()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|o| {
+                                o.new_entry == rec.new_entry
+                                    && o.conflicting_entry == rec.conflicting_entry
+                            })
+                            .unwrap_or(rec),
+                    ),
                     Err(e) => warnings.push(format!(
                         "conflict candidate {} could not be recorded: {e}",
                         rec.id
@@ -595,15 +608,21 @@ impl Gungnir {
             // A crashed end can leave pending promotions and scratch behind;
             // finish the promotions (skipping the ones that landed) and
             // converge by clearing scratch.
-            let (promoted, fresh) =
+            let promoted =
                 self.finish_promotions(archive, &session.id, &session.agent, promotions)?;
             if scratch_exists {
                 std::fs::remove_dir_all(&dir)?;
             }
-            // Entries this retry created still get scanned; deduped ones
-            // were scanned by the end that first landed them.
+            // Every promotion this session landed gets scanned: an earlier
+            // end may have failed between landing an entry and scanning it.
+            // record() suppresses pairs already on the open queue, so the
+            // rescan is idempotent.
             let codex = self.codex()?;
-            let (conflicts, warnings) = self.scan_and_record(&codex, &fresh, embedder);
+            let entries: Vec<Entry> = promoted
+                .iter()
+                .map(|id| codex.require(*id))
+                .collect::<Result<_>>()?;
+            let (conflicts, warnings) = self.scan_and_record(&codex, &entries, embedder);
             return Ok(EndReport {
                 journal_id: archive,
                 promoted,
@@ -698,13 +717,20 @@ impl Gungnir {
             std::fs::remove_dir_all(&dir)?;
         }
 
-        let (promoted, fresh) =
+        let promoted =
             self.finish_promotions(journal_entry.id, &session.id, &session.agent, promotions)?;
 
-        // Scan the freshly landed promotions: entries deduped on retry
-        // were already scanned by the end that created them.
+        // Scan every promotion this session landed, not just the ones this
+        // call created: a crash or validation failure between the archive
+        // write and here can leave earlier promotions landed-but-unscanned.
+        // record() suppresses pairs already on the open queue, so the
+        // rescan is idempotent across retries.
         let codex = self.codex()?;
-        let (conflicts, warnings) = self.scan_and_record(&codex, &fresh, embedder);
+        let entries: Vec<Entry> = promoted
+            .iter()
+            .map(|id| codex.require(*id))
+            .collect::<Result<_>>()?;
+        let (conflicts, warnings) = self.scan_and_record(&codex, &entries, embedder);
 
         Ok(EndReport {
             journal_id: journal_entry.id,
@@ -719,16 +745,16 @@ impl Gungnir {
     /// evidence. Retries dedupe on `session_id` + `summary`, so a crash or
     /// validation failure mid-loop leaves the next end_session able to
     /// finish the set without duplicating what landed.
-    /// Returns every promoted id plus the entries this call created —
-    /// deduped retries report the id but skip the conflict scan the
-    /// first end already ran on the landed entry.
+    /// Returns every promoted id, including ones a previous end already
+    /// landed — callers rescan all of them, since an earlier end can have
+    /// failed between landing an entry and scanning it.
     fn finish_promotions(
         &self,
         archive: EntryId,
         session_id: &str,
         agent: &str,
         promotions: Vec<Promotion>,
-    ) -> Result<(Vec<EntryId>, Vec<Entry>)> {
+    ) -> Result<Vec<EntryId>> {
         let codex = self.codex()?;
         // Dedupe on (kind, summary, body, review_of): two different
         // findings can share a summary, and a retry re-listing a promotion
@@ -743,7 +769,6 @@ impl Gungnir {
             .map(|e| ((e.kind, e.summary, e.body, e.review_of), e.id))
             .collect();
         let mut promoted_ids = Vec::new();
-        let mut fresh = Vec::new();
         for p in promotions {
             let key = (p.kind, p.summary.clone(), p.body.clone(), p.review_of);
             if let Some(&existing) = by_key.get(&key) {
@@ -758,9 +783,8 @@ impl Gungnir {
             codex.create_with(&c, &|id| self.exists_anywhere(id))?;
             by_key.insert(key, c.id);
             promoted_ids.push(c.id);
-            fresh.push(c);
         }
-        Ok((promoted_ids, fresh))
+        Ok(promoted_ids)
     }
 
     // -- reading -------------------------------------------------------------
