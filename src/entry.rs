@@ -151,6 +151,11 @@ pub struct Entry {
     pub evidence: Vec<Evidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_tool: Option<String>,
+    /// The extraction backend that proposed this entry ("heuristic", a
+    /// command name). Set only when `source_tool` is `extract`; audits show
+    /// it so machine origin names its machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extracted_by: Option<String>,
     /// Whether an `attempt` entry succeeded. Structured so session archives
     /// and stats don't re-parse a magic prefix out of the body. Older files
     /// carry the outcome as a `outcome: ...` body line instead.
@@ -185,6 +190,7 @@ impl Entry {
             verification_log: Vec::new(),
             evidence: Vec::new(),
             source_tool: None,
+            extracted_by: None,
             outcome: None,
             entities: Vec::new(),
             body: String::new(),

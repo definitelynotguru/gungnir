@@ -56,6 +56,37 @@ fn conflict_note(
     out
 }
 
+/// Extraction verdicts as tool text: written ids, every refusal with its
+/// reason (the abstention signal), the cap count, then advisory conflicts
+/// through the shared renderer.
+fn format_extract(outcome: &crate::ExtractOutcome) -> String {
+    if outcome.accepted.is_empty() && outcome.refused.is_empty() && outcome.skipped == 0 {
+        return "nothing to extract".into();
+    }
+    let mut out = String::new();
+    for (entry, _) in &outcome.accepted {
+        out.push_str(&format!(
+            "wrote {}  \"{}\"  (unverified, extracted)\n",
+            entry.id, entry.summary
+        ));
+    }
+    for r in &outcome.refused {
+        out.push_str(&format!("refused \"{}\" — {}\n", r.summary, r.reason));
+    }
+    if outcome.skipped > 0 {
+        out.push_str(&format!(
+            "skipped {} proposal(s) (volume cap or duplicate)\n",
+            outcome.skipped
+        ));
+    }
+    let conflicts: Vec<crate::conflicts::ConflictRecord> = outcome
+        .accepted
+        .iter()
+        .flat_map(|(_, c)| c.iter().cloned())
+        .collect();
+    conflict_note(out.trim_end().to_string(), &conflicts, &outcome.warnings)
+}
+
 /// Open sessions by id, so agents only pass a session handle between calls.
 pub struct Server {
     g: Gungnir,
@@ -219,6 +250,19 @@ impl Server {
                     "verb": {"type": "string", "enum": ["supersede", "contradict", "dismiss"]},
                     "agent": {"type": "string"}
                 }), &["id", "verb", "agent"])
+            },
+            {
+                "name": "extract",
+                "description": "Propose durable facts from a transcript into your journal through the extraction gate. Backend: $GUNGNIR_EXTRACTOR (command or `heuristic`); unset makes this a no-op, reported in the reply. Accepted proposals land unverified, evidence-backed, journal-only, denylisted for secrets, volume-capped, and conflict-scanned. Refusals are listed with reasons — that is the abstention signal for extraction. source: `from` (session id or entry id), `file` (transcript path), or `transcript` (literal text, unbacked — needs allow_unbacked).",
+                "inputSchema": schema(json!({
+                    "from": {"type": "string"},
+                    "file": {"type": "string"},
+                    "transcript": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "allow_unbacked": {"type": "boolean"},
+                    "cap": {"type": "integer"},
+                    "semantic": {"type": "boolean"}
+                }), &["agent"])
             },
             {
                 "name": "list",
@@ -514,6 +558,73 @@ impl Server {
                 let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
                 let rb = self.g.rollback(id, agent)?;
                 Ok(format!("rollback entry: {rb}"))
+            }
+            "extract" => {
+                let agent = arg("agent").ok_or_else(|| Error::Invalid("agent required".into()))?;
+                let source_count = ["from", "file", "transcript"]
+                    .iter()
+                    .filter(|k| arg(k).is_some())
+                    .count();
+                if source_count != 1 {
+                    return Err(Error::Invalid(
+                        "extract needs exactly one of from, file, transcript".into(),
+                    ));
+                }
+                let Some(extractor) = crate::extract::from_env()? else {
+                    return Ok(format!(
+                        "extraction unavailable: no backend configured — set {} to a command or `heuristic`",
+                        crate::extract::EXTRACTOR_ENV
+                    ));
+                };
+                let source = match (arg("from"), arg("file"), arg("transcript")) {
+                    // Session ids share the ULID shape — resolve against
+                    // the store rather than parsing alone.
+                    (Some(id), None, None) => match id.parse::<EntryId>() {
+                        Ok(id) if self.g.locate(id)?.is_some() => {
+                            crate::extract::ExtractSource::Entry { id }
+                        }
+                        _ => crate::extract::ExtractSource::Session { id: id.to_string() },
+                    },
+                    (None, Some(path), None) => crate::extract::ExtractSource::File {
+                        path: std::path::PathBuf::from(path),
+                    },
+                    (None, None, Some(text)) => crate::extract::ExtractSource::Text {
+                        text: text.to_string(),
+                    },
+                    _ => unreachable!("exactly one source enforced above"),
+                };
+                let units = self.g.extract_units(&source, agent)?;
+                let opts = crate::extract::ExtractOptions {
+                    allow_unbacked: args
+                        .get("allow_unbacked")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    cap: args
+                        .get("cap")
+                        .and_then(Value::as_u64)
+                        .map(|c| (c as usize).clamp(1, 1000))
+                        .unwrap_or(crate::extract::DEFAULT_CAP),
+                    dry_run: false,
+                };
+                let outcome = if self.semantic_enabled(args)? {
+                    #[cfg(feature = "embed")]
+                    {
+                        self.ensure_embedder()?;
+                        self.g.extract(
+                            &units,
+                            agent,
+                            extractor.as_ref(),
+                            &opts,
+                            self.embedder.as_deref(),
+                        )?
+                    }
+                    #[cfg(not(feature = "embed"))]
+                    unreachable!("semantic_enabled errors without the embed feature")
+                } else {
+                    self.g
+                        .extract(&units, agent, extractor.as_ref(), &opts, None)?
+                };
+                Ok(format_extract(&outcome))
             }
             "list" => {
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;

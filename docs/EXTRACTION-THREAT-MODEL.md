@@ -1,11 +1,13 @@
 # Auto-Extraction Threat Model
 
-Status: **design gate**. The `Extractor` feature described in the roadmap is
-intentionally unimplemented until every mitigation in this document has an
-owner in the implementation plan. This file is the reason the feature does
-not exist yet.
+Status: **implemented** (`src/extract.rs`, `gungnir extract`). All seven
+mitigations below shipped with the feature and are covered by
+`tests/extract.rs`. This file remains the contract the gate implements and
+the reason for its shape.
 
-Auto-extraction would let a configured LLM watch session transcripts and write
+Auto-extraction lets a configured LLM watch session transcripts and write
+
+Auto-extraction lets a configured LLM watch session transcripts and write
 facts into Gungnir automatically. It removes the discipline tax ("remember to
 call `add`") and it introduces three real attack surfaces into a system whose
 entire value proposition is trustworthy memory.
@@ -75,9 +77,11 @@ Every item below must ship with the feature, not after it.
 
 ## Acceptance criteria for implementing P1-4
 
-- [ ] All seven mitigations implemented and tested.
-- [ ] Injection test suite: transcripts containing instruction-style attacks
-      produce no entries whose content follows the injected instruction.
-- [ ] Secret test suite: known patterns are blocked with actionable errors.
-- [ ] Volume cap test.
-- [ ] Docs updated: INTEGRATIONS.md wiring guide, README positioning note.
+- [x] All seven mitigations implemented and tested.
+- [x] Injection test suite: transcripts containing instruction-style attacks
+      produce no entries whose content follows the injected instruction
+      (`injected_instruction_text_is_refused_not_recorded`).
+- [x] Secret test suite: known patterns are blocked with actionable errors
+      (`secrets_in_transcript_never_reach_the_store`).
+- [x] Volume cap test (`volume_cap_and_rerun_dedupe`).
+- [x] Docs updated: INTEGRATIONS.md wiring guide, README positioning note.

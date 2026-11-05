@@ -67,6 +67,45 @@ enum Cmd {
         layer: String,
         #[arg(long)]
         agent: Option<String>,
+        /// Only unverified entries (the review queue's membership).
+        #[arg(long)]
+        unreviewed: bool,
+    },
+
+    /// Propose durable facts from a transcript into the agent's journal,
+    /// behind the extraction gate. The backend is $GUNGNIR_EXTRACTOR (a
+    /// command honoring the contract in docs/INTEGRATIONS.md, or
+    /// `heuristic`); unset makes this a no-op. Every proposal is written
+    /// unverified with source_tool=extract, journal-only, evidence-backed
+    /// unless --allow-unbacked, secret-denylisted, volume-capped, and
+    /// conflict-scanned like any write.
+    Extract {
+        /// Session id or entry id to extract claims from.
+        #[arg(long)]
+        from: Option<String>,
+        /// Transcript file; each line is cited as hashed file evidence.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Literal transcript text (unbacked; needs --allow-unbacked).
+        #[arg(long)]
+        text: Option<String>,
+        /// The agent whose journal receives accepted proposals.
+        #[arg(long)]
+        agent: String,
+        /// Permit proposals citing nothing durable. They still land
+        /// `unverified`; no flag makes them trusted.
+        #[arg(long)]
+        allow_unbacked: bool,
+        /// Gate verdicts only; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Max writes this run (default 20; hard ceiling 1000).
+        #[arg(long)]
+        cap: Option<usize>,
+        /// Fuse embedding similarity into conflict detection (requires the
+        /// `embed` feature).
+        #[arg(long)]
+        semantic: bool,
     },
 
     /// Keyword recall within a layer.
@@ -433,6 +472,45 @@ fn embedder_for(_g: &Gungnir) -> Result<()> {
     ))
 }
 
+/// Extraction verdicts on stdout: what landed (or would), what the gate
+/// refused and why, and what the cap dropped. Conflicts and warnings are
+/// advisory — stderr, never exit codes, same as every other write.
+fn print_extract(outcome: &crate::ExtractOutcome) {
+    if outcome.accepted.is_empty() && outcome.refused.is_empty() && outcome.skipped == 0 {
+        println!("nothing to extract");
+        return;
+    }
+    let verb = if outcome.dry_run {
+        "would write"
+    } else {
+        "wrote"
+    };
+    for (entry, conflicts) in &outcome.accepted {
+        println!(
+            "{} {}  \"{}\"  (unverified, extracted)",
+            verb, entry.id, entry.summary
+        );
+        for c in conflicts {
+            eprintln!(
+                "conflict candidate {}: \"{}\" vs verified \"{}\" ({}) — `gungnir conflicts` to resolve",
+                c.id, c.new_summary, c.conflicting_summary, c.layer
+            );
+        }
+    }
+    for r in &outcome.refused {
+        println!("refused  \"{}\" — {}", r.summary, r.reason);
+    }
+    if outcome.skipped > 0 {
+        println!(
+            "skipped  {} proposal(s) (volume cap or duplicate)",
+            outcome.skipped
+        );
+    }
+    for w in &outcome.warnings {
+        eprintln!("warning: {w}");
+    }
+}
+
 /// Advisory only: the write already landed, so candidates and detection
 /// warnings go to stderr and never change exit codes or the id on stdout.
 fn note_conflicts(conflicts: &[crate::conflicts::ConflictRecord], warnings: &[String]) {
@@ -516,7 +594,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
         }
 
-        C::Ls { layer, agent } => {
+        C::Ls {
+            layer,
+            agent,
+            unreviewed,
+        } => {
             let scan = match layer_of(&layer)? {
                 crate::layout::CODEX => g.codex()?.scan()?,
                 _ => {
@@ -527,9 +609,88 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 }
             };
             for e in &scan.entries {
-                println!("{}  {}\t{}\t{}", e.id, e.kind, e.summary, e.agent);
+                if unreviewed && e.verification != crate::entry::VerificationState::Unverified {
+                    continue;
+                }
+                let extracted = if e.source_tool.is_some() {
+                    "  [extracted]"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}  {}\t{}\t{}{}",
+                    e.id, e.kind, e.summary, e.agent, extracted
+                );
             }
             warn_skipped(&scan.skipped);
+        }
+
+        C::Extract {
+            from,
+            file,
+            text,
+            agent,
+            allow_unbacked,
+            dry_run,
+            cap,
+            semantic,
+        } => {
+            let source_count = from.is_some() as u8 + file.is_some() as u8 + text.is_some() as u8;
+            if source_count != 1 {
+                return Err(Error::Invalid(
+                    "extract needs exactly one of --from, --file, --text".into(),
+                ));
+            }
+            let Some(extractor) = crate::extract::from_env()? else {
+                println!(
+                    "extraction unavailable: no backend configured — set ${} to a command or `heuristic`",
+                    crate::extract::EXTRACTOR_ENV
+                );
+                return Ok(0);
+            };
+            let source = match (from, file, text) {
+                // Session ids are ULIDs too, so shape alone can't tell
+                // them from entry ids — resolve against the store.
+                (Some(id), None, None) => match id.parse::<EntryId>() {
+                    Ok(id) if g.locate(id)?.is_some() => {
+                        crate::extract::ExtractSource::Entry { id }
+                    }
+                    _ => crate::extract::ExtractSource::Session { id },
+                },
+                (None, Some(path), None) => crate::extract::ExtractSource::File { path },
+                (None, None, Some(text)) => crate::extract::ExtractSource::Text { text },
+                _ => unreachable!("exactly one source enforced above"),
+            };
+            let units = g.extract_units(&source, &agent)?;
+            let cap = cap
+                .map(|c| c.clamp(1, 1000))
+                .unwrap_or(crate::extract::DEFAULT_CAP);
+            let opts = crate::extract::ExtractOptions {
+                allow_unbacked,
+                dry_run,
+                cap,
+            };
+            let outcome = if semantic {
+                #[cfg(feature = "embed")]
+                {
+                    let emb = embedder_for(&g)?;
+                    g.extract(
+                        &units,
+                        &agent,
+                        extractor.as_ref(),
+                        &opts,
+                        Some(emb.as_ref()),
+                    )?
+                }
+                #[cfg(not(feature = "embed"))]
+                {
+                    embedder_for(&g)?;
+                    unreachable!("--semantic errors without the embed feature")
+                }
+            } else {
+                g.extract(&units, &agent, extractor.as_ref(), &opts, None)?
+            };
+            print_extract(&outcome);
         }
 
         C::Recall {
