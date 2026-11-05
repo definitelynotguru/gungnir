@@ -283,11 +283,20 @@ impl Conflicts {
 
     /// Persist a new candidate. Called from the write path after the entry
     /// has landed, so callers turn a failure into a warning — the entry
-    /// stands either way and candidates are advisory.
-    pub fn record(&self, rec: &ConflictRecord) -> Result<()> {
+    /// stands either way and candidates are advisory. Returns false when
+    /// an open record already covers the same (new, conflicting) pair:
+    /// that makes rescans — end_session retries in particular — idempotent
+    /// without a second queue entry for one disagreement.
+    pub fn record(&self, rec: &ConflictRecord) -> Result<bool> {
         fs::create_dir_all(&self.dir)?;
         let _guard = self.lock()?;
-        self.persist_locked(rec)
+        for open in self.list_open()? {
+            if open.new_entry == rec.new_entry && open.conflicting_entry == rec.conflicting_entry {
+                return Ok(false);
+            }
+        }
+        self.persist_locked(rec)?;
+        Ok(true)
     }
 
     /// Overwrite an existing record (resolution bookkeeping). Test-only:
