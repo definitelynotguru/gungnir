@@ -588,7 +588,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     let hidden = out.coverage.hidden_superseded + out.coverage.hidden_rolled_back;
                     if out.coverage.total == 0 {
                         println!("(no knowledge on file)");
-                    } else if q.limit == 0 {
+                    } else if q.limit == 0 && out.coverage.total_matched() > 0 {
                         println!(
                             "({} matched but the result limit is 0)",
                             out.coverage.total_matched()
