@@ -154,6 +154,57 @@ Vectors cache under `<root>/.cache/embeddings/<model>/` keyed by
 `sha256(model + normalized text)`. Deleting `.cache` is always safe; it
 rebuilds on demand.
 
+## Auto-extraction (optional)
+
+`gungnir extract` asks a backend to propose durable facts from a session
+archive, a file, or literal text — then runs every proposal through the
+gate defined in `docs/EXTRACTION-THREAT-MODEL.md`. Without a backend the
+command is a clean no-op, not a failure.
+
+```bash
+export GUNGNIR_EXTRACTOR="my-extractor-command"   # or the literal: heuristic
+
+gungnir extract --from <session-id> --agent builder
+gungnir extract --file notes.md --agent builder
+gungnir extract --text "multi-line transcript" --agent builder
+gungnir extract --from <sid> --agent builder --dry-run   # verdicts, no writes
+```
+
+Accepted proposals land journal-only, `unverified`, marked
+`source_tool: extract` / `extracted_by: <backend>` — the same fields a
+manual `add` would produce, never verified, never codex. They feed
+conflict detection like any claim write, and `ls --unreviewed`, `review`,
+and `blame` flag their machine origin. `--allow-unbacked` relaxes the
+evidence-citation gate to an explicit unverified write; `--cap` bounds
+writes per run (default 20).
+
+**Command backend contract.** `GUNGNIR_EXTRACTOR` is executed through the
+shell. It receives one JSON object on stdin:
+
+```json
+{"instruction": "<hardened prompt>", "transcript": [{"i": 0, "text": "..."}]}
+```
+
+and must answer on stdout with a JSON array of proposals:
+
+```json
+[{"summary": "≤200 chars", "body": "...", "kind": "observation"|"decision",
+  "cites": [0, 2], "entities": ["orders_archive"]}]
+```
+
+`cites` indexes into the transcript units; a proposal citing nothing (or
+only unbacked units) is refused unless the caller passes
+`--allow-unbacked`. Unknown fields or a malformed reply fail the whole
+reply — no partial writes. `claude -p`, `ollama run`, a small shell
+script: anything honoring stdin/stdout plugs in. The literal `heuristic`
+selects the shipped deterministic backend (each claim line proposes
+itself), useful for exercising the gate without a model.
+
+**Secret denylist.** Proposal text and cited transcript are scanned for
+known secret patterns before write. Extend the built-in list with
+`GUNGNIR_EXTRACT_DENYLIST="pat1;pat2"` — `;`-separated, case-insensitive,
+additive only; the built-ins can never be emptied.
+
 ## Versioning your memory with git
 
 The whole root is plain markdown. Recommended `.gitignore` inside the memory

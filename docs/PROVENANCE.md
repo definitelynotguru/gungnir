@@ -84,6 +84,14 @@ What lands in the Codex is a deliberate act (`promote`), linked back to its
 Journal source by an evidence ref. The shared truth carries its lineage with
 it.
 
+Machine origin is structural, not cosmetic. Entries written by
+`gungnir extract` carry `source_tool: extract` and `extracted_by:
+<backend>` in frontmatter, so `ls --unreviewed`, `review`, `log`, `blame`,
+and `show` all flag where the claim came from; no surface presents an
+extracted fact as human-entered knowledge. They are born `unverified`,
+journal-only, and can only move forward through `verify()` — the same
+transition human-written findings take.
+
 ## Revalidation
 
 File evidence records `sha256` at citation time. Paths inside the store

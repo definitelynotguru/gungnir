@@ -15,6 +15,7 @@ pub mod conflicts;
 pub mod embedding;
 pub mod entry;
 pub mod error;
+pub mod extract;
 pub mod gungnir;
 pub mod id;
 pub mod layout;
@@ -30,9 +31,10 @@ pub use entry::{
     Entry, EntryKind, Evidence, RecordStatus, Status, VerificationRecord, VerificationState,
 };
 pub use error::{Error, Result};
+pub use extract::{ExtractOptions, ExtractSource, Extractor, Refusal, TranscriptUnit};
 pub use gungnir::{
-    EvidenceCheck, Gungnir, Layer, PeerCoverage, Promotion, RevalidateReport, Session, StatsReport,
-    WriteOutcome,
+    EvidenceCheck, ExtractOutcome, Gungnir, Layer, PeerCoverage, Promotion, RevalidateReport,
+    Session, StatsReport, WriteOutcome,
 };
 pub use id::EntryId;
 pub use recall::{Coverage, Hit, Query, SearchOutcome, StateAt};

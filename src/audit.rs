@@ -182,6 +182,16 @@ pub fn format_report(r: &EntryReport, since: Option<DateTime<Utc>>) -> String {
         r.entry.kind,
         one_line(&r.entry.summary)
     ));
+    if let Some(tool) = &r.entry.source_tool {
+        match &r.entry.extracted_by {
+            Some(backend) => out.push_str(&format!(
+                "\n  origin: {} via {}",
+                one_line(tool),
+                one_line(backend)
+            )),
+            None => out.push_str(&format!("\n  origin: {}", one_line(tool))),
+        }
+    }
     if let Some(prev) = r.entry.revises {
         out.push_str(&format!("\n  revises {prev}"));
     }
@@ -305,6 +315,9 @@ pub struct AuditEvent {
     pub id: EntryId,
     pub summary: String,
     pub note: Option<String>,
+    /// Machine origin on creation events (`source_tool`), so a `created`
+    /// line says who — or what — wrote the belief.
+    pub source_tool: Option<String>,
 }
 
 /// Chronological scan across partitions. `since` filters by event time;
@@ -337,6 +350,7 @@ pub fn scan_events(
             id: l.entry.id,
             summary: one_line(&l.entry.summary),
             note: None,
+            source_tool: l.entry.source_tool.clone(),
         });
         for rec in &l.entry.verification_log {
             let kind = match rec.status {
@@ -353,6 +367,7 @@ pub fn scan_events(
                 id: l.entry.id,
                 summary: one_line(&l.entry.summary),
                 note: rec.note.as_deref().map(one_line),
+                source_tool: None,
             });
         }
     }
@@ -384,6 +399,9 @@ pub fn format_events(events: &[AuditEvent]) -> String {
             ev.id,
             ev.summary,
         ));
+        if let Some(tool) = &ev.source_tool {
+            out.push_str(&format!("  (via {})", one_line(tool)));
+        }
         if let Some(note) = &ev.note {
             out.push_str(&format!("  ({note})"));
         }
@@ -640,6 +658,14 @@ pub fn format_blame(r: &EntryReport) -> String {
         r.partition,
         fmt_state(e)
     );
+
+    if let Some(tool) = &e.source_tool {
+        out.push_str(&format!("origin: {}", one_line(tool)));
+        if let Some(backend) = &e.extracted_by {
+            out.push_str(&format!(" via {}", one_line(backend)));
+        }
+        out.push('\n');
+    }
 
     out.push_str("vouched by:");
     if e.verification_log.is_empty() {

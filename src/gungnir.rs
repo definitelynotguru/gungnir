@@ -62,6 +62,27 @@ pub struct EndReport {
     pub warnings: Vec<String>,
 }
 
+/// What a gated extraction run produced. `accepted` pairs each written
+/// entry with the conflict candidates it raised — the same scan every
+/// claim write runs. `refused` carries the gate verdicts (unbacked, secret,
+/// injected, malformed); `skipped` counts cap/dedupe overflows.
+#[derive(Clone, Debug)]
+pub struct ExtractOutcome {
+    /// The backend that proposed, recorded as `extracted_by`.
+    pub backend: String,
+    /// Entries that passed the gate plus their conflict candidates. Under
+    /// `dry_run` these were evaluated but not persisted.
+    pub accepted: Vec<(Entry, Vec<ConflictRecord>)>,
+    /// Proposals the gate blocked, each with its reason.
+    pub refused: Vec<crate::extract::Refusal>,
+    /// Proposals the volume cap or dedupe skipped.
+    pub skipped: usize,
+    /// Advisory-path failures after accepted writes landed.
+    pub warnings: Vec<String>,
+    /// The run evaluated only; nothing was persisted.
+    pub dry_run: bool,
+}
+
 /// What a claim write produced: the entry id plus any conflict candidates
 /// it raised against live verified facts. Candidates are advisory — the
 /// write already landed; the queue just waits for a resolution verb.
@@ -359,7 +380,7 @@ impl Gungnir {
         self.add_inner(entry, layer, Some(embedder))
     }
 
-    fn add_inner(
+    pub(crate) fn add_inner(
         &self,
         entry: Entry,
         layer: Layer<'_>,
@@ -403,7 +424,7 @@ impl Gungnir {
         Ok(s)
     }
 
-    fn session_dir(&self, session_id: &str) -> PathBuf {
+    pub(crate) fn session_dir(&self, session_id: &str) -> PathBuf {
         self.root
             .join(SCRATCH)
             .join(layout::sanitize_component(session_id))
@@ -469,7 +490,7 @@ impl Gungnir {
     }
 
     /// The journal archive a session was ended into, if it was.
-    fn find_archive(&self, agent: &str, session_id: &str) -> Result<Option<EntryId>> {
+    pub(crate) fn find_archive(&self, agent: &str, session_id: &str) -> Result<Option<EntryId>> {
         let scan = self.journal(agent)?.scan()?;
         // An unreadable journal file might be the archive itself: fail
         // closed rather than read "no archive" and accept writes or a
@@ -1059,24 +1080,15 @@ impl Gungnir {
         let mut entry = store.require(id)?;
         for path in evidence_paths {
             let raw = std::fs::read(path)?;
-            let digest = format!("{:x}", sha2::Sha256::digest(&raw));
+            let (recorded, digest) = self.file_evidence_digest(path)?;
             let text = String::from_utf8_lossy(&raw);
             let text = text.trim_start();
             let mut end = validate::MAX_EXCERPT_LEN.min(text.len());
             while !text.is_char_boundary(end) {
                 end -= 1;
             }
-            // Canonicalize first so a relative citation still resolves; then
-            // prefer a root-relative path so a committed codex stays
-            // portable across machines and clones. Files outside the store
-            // keep their absolute path.
-            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-            let recorded = canonical
-                .strip_prefix(&self.root)
-                .map(|p| p.to_path_buf())
-                .unwrap_or(canonical);
             entry.evidence.push(Evidence::File {
-                path: recorded.display().to_string(),
+                path: recorded,
                 excerpt: text[..end].to_string(),
                 sha256: digest,
             });

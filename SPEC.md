@@ -58,7 +58,8 @@ YAML frontmatter + markdown body. Fields:
 | `contradicted_by` | id?                 | required when verification = contradicted |
 | `verification_log`| list of records     | `{verifier, timestamp, status, note}`; `status` is one of the four states, other values fail to parse |
 | `evidence`        | list                | `{kind: file, path, excerpt ≤ 500, sha256}` or `{kind: ref, id}` (refs must exist) |
-| `source_tool`     | string?             |                                         |
+| `source_tool`     | string?             | `extract` marks machine-originated writes |
+| `extracted_by`    | string?             | the extraction backend that proposed the entry |
 | `outcome`         | bool?               | whether an `attempt` entry succeeded    |
 | `entities`        | list of strings     | entity names, 1..64 chars each          |
 
@@ -219,10 +220,34 @@ here writes.
 - `gungnir entities [name] [--layer <l>]` — the entity index: names with
   counts, or the entries under one name.
 
+## Extraction
+
+`gungnir extract` proposes durable facts from a transcript through a
+configured backend — gated exactly as `docs/EXTRACTION-THREAT-MODEL.md`
+specifies. Source is `--from <session-id-or-entry>`, `--file <path>`, or
+`--text <string>` (exactly one); `--agent` is required.
+
+- Backend: `GUNGNIR_EXTRACTOR` names a command honoring the JSON
+  stdin/stdout contract in `docs/INTEGRATIONS.md`, or the literal
+  `heuristic` for the shipped deterministic backend. Unset is a clean
+  no-op, not an error.
+- Gate, in order: strict schema, evidence citation (every `cites` index
+  must resolve to a unit carrying ≥1 evidence link; `--allow-unbacked`
+  relaxes this to an explicit unverified write), secret denylist (built-in,
+  never empty, extended by `GUNGNIR_EXTRACT_DENYLIST`), instruction-shape
+  refusal, per-run volume cap (`--cap`, default 20) plus dedupe against the
+  journal.
+- Accepted proposals land through the ordinary write path — journal-only,
+  `unverified`, `source_tool: extract`, `extracted_by: <backend>` — and run
+  conflict detection like any claim write. Nothing the extractor produces
+  is ever born verified or written to the codex.
+- `ls --unreviewed` and `review` flag extracted entries (`[extracted]`);
+  `log`/`blame`/`show` render `origin: extract via <backend>`.
+
 ## Surfaces
 
 - **Library** (`gungnir` crate): everything above.
-- **CLI** (`gungnir` bin): `init`, `add`, `get`, `ls`, `recall`, `verify`
+- **CLI** (`gungnir` bin): `init`, `add`, `get`, `ls`, `extract`, `recall`, `verify`
   (`--evidence` records file hashes at verify time; `--revalidate` re-hashes
   and flags drift, `--all` sweeps the store), `contradict`, `supersede`,
   `rollback`, `promote`, `brief`, `conflicts`, `log`, `diff`, `blame`,
@@ -230,8 +255,9 @@ here writes.
   (`--topic` reports cross-journal coverage counts), `mcp`. Exit codes: 0
   success, 1 error, 2 explicit abstention under `--require-verified`.
 - **MCP server**: tools `start_session`, `end_session`, `add_observation`,
-  `add_attempt`, `recall`, `brief`, `verify`, `contradict`, `promote`,
-  `supersede`, `rollback`, `conflicts`, `resolve_conflict`, `list`, `get`.
+  `add_attempt`, `extract`, `recall`, `brief`, `verify`, `contradict`,
+  `promote`, `supersede`, `rollback`, `conflicts`, `resolve_conflict`,
+  `list`, `get`.
 
 ## Deliberate departures from the reference design
 

@@ -141,6 +141,13 @@ Key behaviors:
   `resolve_conflict` take `agent` and only reach candidates visible to
   that agent — shared-codex endpoints plus the agent's own journal — so
   another agent's private claim text never crosses the boundary.
+- **Gated auto-extraction.** `gungnir extract` lets a configured backend
+  (`GUNGNIR_EXTRACTOR`: a command honoring a JSON stdin/stdout contract, or
+  the shipped `heuristic`) propose durable facts from a session archive or
+  text — through the same write path as manual `add`, behind the mitigations
+  in docs/EXTRACTION-THREAT-MODEL.md: evidence citation, secret denylist,
+  instruction-refusal, volume caps, journal-only `unverified` writes marked
+  `extracted_by`. No backend configured is a clean no-op.
 - **Recall you can reason about.** Keyword scoring over summary (2x) and body,
   ordered by verification bucket: verified > unverified > contradicted;
   rolled-back entries hidden. `--current` resolves supersession chains to

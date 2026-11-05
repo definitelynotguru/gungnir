@@ -8,6 +8,21 @@ All notable changes to Gungnir are documented here. The format follows
 
 ### Added
 
+- **Gated auto-extraction** (`gungnir extract`, MCP `extract`, Rust
+  `Gungnir::extract`): a configured backend — `GUNGNIR_EXTRACTOR` naming a
+  command honoring a JSON stdin/stdout contract, or the shipped
+  `heuristic` — proposes durable facts from a session archive, a file, or
+  literal text. Every proposal passes the gate in
+  `docs/EXTRACTION-THREAT-MODEL.md`: strict schema parse, evidence
+  citation (`cites` must reach units carrying evidence; `--allow-unbacked`
+  relaxes to an explicit unverified write), a never-empty secret denylist
+  (`GUNGNIR_EXTRACT_DENYLIST` extends it), instruction-shape refusal, and a
+  per-run volume cap (`--cap`, default 20) plus journal dedupe. Accepted
+  writes land through the ordinary path — journal-only, `unverified`,
+  `source_tool: extract`, `extracted_by: <backend>` — and feed conflict
+  detection like any claim. No backend configured is a clean no-op.
+  `ls --unreviewed`/`review` flag extracted entries and audit surfaces
+  render `origin: extract via <backend>`.
 - **`contradict` on every surface.** New CLI subcommand
   `gungnir contradict <id> --by <id> [--verifier] [--note]` and matching MCP
   tool. `VerificationState::Contradicted` was previously unreachable outside
