@@ -588,6 +588,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     let hidden = out.coverage.hidden_superseded + out.coverage.hidden_rolled_back;
                     if out.coverage.total == 0 {
                         println!("(no knowledge on file)");
+                    } else if q.limit == 0 {
+                        println!(
+                            "({} matched but the result limit is 0)",
+                            out.coverage.total_matched()
+                        );
                     } else if out.coverage.contradicted > 0 {
                         println!("(only contradicted knowledge matched this topic)");
                     } else if require_verified

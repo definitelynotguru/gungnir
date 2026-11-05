@@ -928,6 +928,8 @@ fn recall_limit_zero_does_not_abstain() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("only unverified"), "{stdout}");
+    assert!(!stdout.contains("no knowledge matched"), "{stdout}");
+    assert!(stdout.contains("the result limit is 0"), "{stdout}");
     assert!(stdout.contains("1 verified"), "{stdout}");
     assert!(doc["hits"].as_array().unwrap().is_empty());
     let _ = e1;
