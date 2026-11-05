@@ -716,15 +716,16 @@ mod tests {
     use crate::entry::EntryKind;
 
     fn unit(text: &str, backed: bool) -> TranscriptUnit {
+        let evidence = if backed {
+            vec![Evidence::Ref {
+                id: EntryId::generate(),
+            }]
+        } else {
+            Vec::new()
+        };
         TranscriptUnit {
             text: text.into(),
-            evidence: backed
-                .then(|| {
-                    vec![Evidence::Ref {
-                        id: EntryId::generate(),
-                    }]
-                })
-                .unwrap_or_default(),
+            evidence,
         }
     }
 

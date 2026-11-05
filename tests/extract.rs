@@ -455,9 +455,9 @@ fn mcp_extract_reports_verdicts_and_refusals() {
         .stdout(std::process::Stdio::piped());
     let mut child = cmd.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    write!(
+    writeln!(
         stdin,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"extract\",\"arguments\":{{\"from\":\"{session_id}\",\"agent\":\"builder\"}}}}}}\n"
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"extract\",\"arguments\":{{\"from\":\"{session_id}\",\"agent\":\"builder\"}}}}}}"
     )
     .unwrap();
     drop(stdin);
@@ -479,9 +479,9 @@ fn mcp_extract_reports_verdicts_and_refusals() {
         .stdout(std::process::Stdio::piped());
     let mut child = cmd.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    write!(
+    writeln!(
         stdin,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"extract\",\"arguments\":{{\"from\":\"{session_id}\",\"agent\":\"builder\"}}}}}}\n"
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"extract\",\"arguments\":{{\"from\":\"{session_id}\",\"agent\":\"builder\"}}}}}}"
     )
     .unwrap();
     drop(stdin);
