@@ -398,30 +398,31 @@ fn command_backend_contract_round_trips() {
     )
     .unwrap();
 
-    #[cfg(unix)]
-    {
-        let cmd = format!("cat {}", proposals_path.display());
-        let (stdout, stderr, code) = gungnir_at(
-            dir.path(),
-            Some(&cmd),
-            &["extract", "--from", &session_id, "--agent", "builder"],
-        );
-        assert_eq!(code, 0, "{stderr}");
-        assert!(stdout.contains("wrote"), "{stdout}");
-        let g = Gungnir::open(dir.path()).unwrap();
-        let entries = g.journal("builder").unwrap().entries().unwrap();
-        let extracted: Vec<_> = entries
-            .iter()
-            .filter(|e| e.source_tool.as_deref() == Some("extract"))
-            .collect();
-        assert_eq!(extracted.len(), 1);
-        assert_eq!(extracted[0].kind, EntryKind::Decision);
-        assert_eq!(extracted[0].extracted_by.as_deref(), Some(cmd.as_str()));
-        assert!(extracted[0].evidence.iter().any(|ev| matches!(
-            ev,
-            Evidence::Ref { id } if *id == archive_id
-        )));
-    }
+    let cmd = format!(
+        "{} {}",
+        if cfg!(windows) { "type" } else { "cat" },
+        proposals_path.display()
+    );
+    let (stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        Some(&cmd),
+        &["extract", "--from", &session_id, "--agent", "builder"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("wrote"), "{stdout}");
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entries = g.journal("builder").unwrap().entries().unwrap();
+    let extracted: Vec<_> = entries
+        .iter()
+        .filter(|e| e.source_tool.as_deref() == Some("extract"))
+        .collect();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].kind, EntryKind::Decision);
+    assert_eq!(extracted[0].extracted_by.as_deref(), Some(cmd.as_str()));
+    assert!(extracted[0].evidence.iter().any(|ev| matches!(
+        ev,
+        Evidence::Ref { id } if *id == archive_id
+    )));
 }
 
 #[test]
