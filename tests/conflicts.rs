@@ -822,4 +822,26 @@ fn retried_end_rescans_promotions_the_crashed_end_landed() {
     assert_eq!(again.conflicts.len(), 1);
     assert_eq!(g.open_conflicts().unwrap().len(), 1);
     assert_eq!(g.all_conflicts().unwrap().len(), 1);
+
+    // Settled stays settled: dismissing the candidate and retrying again
+    // must not reopen the pair — detection still fires on rescan, so the
+    // queue dedupes on every record for the pair, not only open ones.
+    let cid = report.conflicts[0].id;
+    g.resolve_conflict(cid, ConflictVerb::Dismiss, "ops")
+        .unwrap();
+    let third = g
+        .end_session(
+            &s,
+            "migrated sessions",
+            vec![gungnir::Promotion {
+                kind: EntryKind::Decision,
+                summary: "sessions use postgres".into(),
+                body: "benchmarked".into(),
+                review_of: None,
+            }],
+        )
+        .unwrap();
+    assert!(third.conflicts.is_empty());
+    assert!(g.open_conflicts().unwrap().is_empty());
+    assert_eq!(g.all_conflicts().unwrap().len(), 1);
 }
