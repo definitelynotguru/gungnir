@@ -113,7 +113,13 @@ fn coverage_line(name: &str, cov: &Coverage) -> String {
 /// matches are filtered out of hits; without it, hits can only be empty
 /// when every match was hidden — either way "nothing matched" must not
 /// contradict the coverage line that prints below it.
-fn empty_hits_line(none: &str, cov: &Coverage, require_verified: bool, hit_limit: usize) -> String {
+fn empty_hits_line(
+    none: &str,
+    unmatched: &str,
+    cov: &Coverage,
+    require_verified: bool,
+    hit_limit: usize,
+) -> String {
     // A zero limit drops every hit regardless of state, so when the topic
     // matched something the limit is the reason the section is empty —
     // naming a filter state would blame a state nobody applied. Guard on
@@ -126,9 +132,7 @@ fn empty_hits_line(none: &str, cov: &Coverage, require_verified: bool, hit_limit
         .to_string();
     }
     // Under --require-verified the unverified/contradicted counters name
-    // what the verification filter hid; hidden counters always do. A topic
-    // that matched nothing falls through to `none` even when `total` is
-    // positive — unmatched in-scope entries are not matches.
+    // what the verification filter hid; hidden counters always do.
     let mut states = Vec::new();
     if require_verified {
         if cov.unverified > 0 {
@@ -141,10 +145,17 @@ fn empty_hits_line(none: &str, cov: &Coverage, require_verified: bool, hit_limit
     if cov.hidden_superseded + cov.hidden_rolled_back > 0 {
         states.push("superseded or rolled back");
     }
-    if states.is_empty() {
-        return none.to_string();
+    if !states.is_empty() {
+        return format!("- matching entries were filtered: {}\n", states.join(", "));
     }
-    format!("- matching entries were filtered: {}\n", states.join(", "))
+    // Nothing filtered the hits: an empty layer gets `none`, and a layer
+    // holding only unrelated entries gets `unmatched` — `total` counts
+    // entries whether or not they matched the topic.
+    if cov.total == 0 {
+        none.to_string()
+    } else {
+        unmatched.to_string()
+    }
 }
 
 /// Assemble the briefing. Coverage drives the abstention signal: when no
@@ -158,6 +169,7 @@ pub fn compile(input: BriefingInput) -> Briefing {
     if input.codex_hits.is_empty() {
         md.push_str(&empty_hits_line(
             "- nothing on file\n",
+            "- nothing on file matched this task\n",
             &input.codex_coverage,
             input.require_verified,
             input.hit_limit,
@@ -173,6 +185,7 @@ pub fn compile(input: BriefingInput) -> Briefing {
     if input.journal_hits.is_empty() {
         md.push_str(&empty_hits_line(
             "- no prior attempts on file\n",
+            "- no prior attempts matched this task\n",
             &input.journal_coverage,
             input.require_verified,
             input.hit_limit,

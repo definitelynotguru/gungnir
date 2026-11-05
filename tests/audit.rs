@@ -973,6 +973,12 @@ fn recall_limit_zero_unmatched_topic_blames_nothing() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("the result limit is 0"), "{stdout}");
+    // The layer holds an entry, just none for this task: say so rather
+    // than claiming the layer is empty.
+    assert!(
+        stdout.contains("nothing on file matched this task"),
+        "{stdout}"
+    );
 }
 
 #[test]
