@@ -11,13 +11,19 @@ struct Proc {
 
 impl Proc {
     fn spawn(root: &std::path::Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_gungnir"))
-            .arg("mcp")
+        Self::spawn_env(root, &[])
+    }
+
+    fn spawn_env(root: &std::path::Path, envs: &[(&str, &str)]) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnir"));
+        cmd.arg("mcp")
             .env("GUNGNIR_ROOT", root)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn gungnir mcp");
+            .stdout(Stdio::piped());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("spawn gungnir mcp");
         Self { child }
     }
 
@@ -436,4 +442,78 @@ fn mcp_brief_require_verified_hides_unverified_hits() {
         "{text}"
     );
     assert!(!text.contains(&e.id.to_string()), "{text}");
+}
+
+/// semantic:true over the real binary must error on a default build —
+/// keyword results in its place would be a silent degrade.
+#[cfg(not(feature = "embed"))]
+#[test]
+fn mcp_semantic_true_errors_without_the_embed_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+
+    for (id, arguments) in [
+        (
+            2u64,
+            serde_json::json!({"query": "postgres", "semantic": true}),
+        ),
+        (
+            3,
+            serde_json::json!({"agent": "ops", "task": "cache eviction", "semantic": true}),
+        ),
+    ] {
+        let name = if id == 2 { "recall" } else { "brief" };
+        let r = p.rpc(&msg(
+            id,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+        ));
+        assert_eq!(r["result"]["isError"], true, "{name}: {r}");
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("embed"), "{name}: {text}");
+    }
+}
+
+/// semantic:true over the real binary must reach hybrid search. The
+/// uniform embedder scores every pair cosine 1.0, so the target is
+/// reachable through the vector channel alone — no shared keyword token —
+/// and a keyword answer can only mean the flag degraded silently.
+#[cfg(feature = "test-embedder")]
+#[test]
+fn mcp_semantic_true_reaches_hybrid_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = gungnir::Gungnir::open(dir.path()).unwrap();
+    let mut e = gungnir::Entry::new(
+        "ops",
+        gungnir::EntryKind::Decision,
+        "postgres pooling limits",
+    );
+    e.verify("ops", None);
+    g.codex().unwrap().create(&e).unwrap();
+    drop(g);
+
+    let mut p = Proc::spawn_env(dir.path(), &[("GUNGNIR_TEST_EMBEDDER", "1")]);
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+
+    for (id, arguments) in [
+        (
+            2u64,
+            serde_json::json!({"query": "query cache eviction", "semantic": true}),
+        ),
+        (
+            3,
+            serde_json::json!({"agent": "ops", "task": "query cache eviction", "semantic": true}),
+        ),
+    ] {
+        let name = if id == 2 { "recall" } else { "brief" };
+        let r = p.rpc(&msg(
+            id,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+        ));
+        assert_eq!(r["result"]["isError"], false, "{name}: {r}");
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("postgres pooling limits"), "{name}: {text}");
+    }
 }

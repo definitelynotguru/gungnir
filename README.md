@@ -63,6 +63,35 @@ Point-in-time questions work too:
 gungnir recall "deploys" --as-of 2026-08-01T00:00:00Z
 ```
 
+## Semantic recall (opt-in)
+
+The default build is BM25-lite keyword scoring with stemming and makes
+zero network calls. Embedding similarity is an opt-in cargo feature named
+`embed` — it is never part of `default`, and nothing in a default install
+pulls model weights:
+
+```bash
+cargo install --path . --features embed   # or: cargo build --features embed
+```
+
+That builds in a local bge-small-en-v1.5 embedder (quantized, ~100MB via
+fastembed/ONNX). Nothing downloads at build time or server start: weights
+fetch lazily on the first semantic query into `<root>/.cache/fastembed` —
+the only network call gungnir ever makes — and derived vectors cache under
+`<root>/.cache/embeddings/` keyed by content hash.
+
+```bash
+gungnir recall "cache eviction" --semantic
+gungnir brief --agent builder "cache eviction" --semantic
+# MCP: "semantic": true on the recall / brief / extract tools
+```
+
+Ask for semantic on a build without the feature and gungnir errors
+("semantic recall requires a build with `--features embed`") instead of
+silently answering with keyword results. To hybrid search against your own
+embedder instead of the shipped model, implement the `Embedder` trait —
+see [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
+
 ## Auditing what it believes
 
 Gungnir is `git log`/`diff`/`blame` for belief — the same versioning story
@@ -155,11 +184,8 @@ Key behaviors:
   history from the verification log, no schema change required. Every search
   reports coverage, and briefings say plainly when no verified knowledge
   covers a task. Hybrid vector+keyword fusion via reciprocal rank fusion is
-  available per query: `--semantic` on `recall`/`brief` (or
-  `"semantic": true` on the MCP tools) when built with
-  `cargo build --features embed`, which ships a local bge-small-en-v1.5
-  model (~100MB, downloaded once into `.cache`). Without the feature,
-  scoring is BM25-lite with stemming — still zero network.
+  available per query through the opt-in `embed` build — see
+  [Semantic recall (opt-in)](#semantic-recall-opt-in).
 
 ## Library
 

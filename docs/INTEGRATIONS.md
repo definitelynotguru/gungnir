@@ -120,11 +120,14 @@ cargo run --example quickstart
 The default build does BM25-lite keyword recall and makes zero network
 calls. Two ways to get hybrid vector + keyword search:
 
-**Shipped local model.** Build with `cargo build --features embed` and pass
-`--semantic` to `recall`/`brief` (or `"semantic": true` on the MCP tools).
-The first semantic query downloads bge-small-en-v1.5 (~100MB) into
+**Shipped local model.** `embed` is opt-in — never a default feature — so
+build or install with `cargo build --features embed` /
+`cargo install --path . --features embed`, then pass `--semantic` to
+`recall`/`brief` (or `"semantic": true` on the MCP tools). The first
+semantic query downloads bge-small-en-v1.5 (~100MB) into
 `<root>/.cache/fastembed` — the only network call gungnir makes, and only
-with the feature compiled in.
+with the feature compiled in. On a build without the feature, semantic
+requests error rather than silently degrading to keyword.
 
 **Your own embedder.** Implement the `Embedder` trait against your provider
 and wrap it in the content-addressed cache:
