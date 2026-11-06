@@ -346,7 +346,7 @@ impl Server {
             },
             {
                 "name": "extract",
-                "description": "Propose durable facts from a transcript into your journal through the extraction gate. Backend: $GUNGNIR_EXTRACTOR (command or `heuristic`); unset makes this a no-op, reported in the reply. Accepted proposals land unverified, evidence-backed, journal-only, denylisted for secrets, volume-capped, and conflict-scanned. Refusals are listed with reasons — that is the abstention signal for extraction. source: `from` (session id or entry id), `file` (transcript path), or `transcript` (literal text, unbacked — needs allow_unbacked).",
+                "description": "Propose durable facts from a transcript into your journal through the extraction gate. Backend: $GUNGNIR_EXTRACTOR (command or `heuristic`); unset makes this a no-op, reported in the reply. Accepted proposals land unverified, evidence-backed, journal-only, denylisted for secrets, volume-capped, and conflict-scanned. Refusals are listed with reasons — that is the abstention signal for extraction. source: `from` (session id or entry id), `file` (transcript path), or `transcript` (literal text, unbacked — needs allow_unbacked); `dry_run` reports verdicts without writing.",
                 "inputSchema": schema(json!({
                     "from": {"type": "string"},
                     "file": {"type": "string"},
