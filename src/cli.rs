@@ -673,6 +673,21 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     "extract needs exactly one of --from, --file, --text".into(),
                 ));
             }
+            // The flag contract is independent of the backend: --semantic
+            // errors on a no-embed build even when extraction would no-op.
+            let emb: Option<Box<dyn crate::embedding::Embedder>> = if semantic {
+                #[cfg(feature = "embed")]
+                {
+                    Some(embedder_for(&g)?)
+                }
+                #[cfg(not(feature = "embed"))]
+                {
+                    embedder_for(&g)?;
+                    unreachable!("--semantic errors without the embed feature")
+                }
+            } else {
+                None
+            };
             let Some(extractor) = crate::extract::from_env()? else {
                 println!(
                     "extraction unavailable: no backend configured — set ${} to a command or `heuristic`",
@@ -702,26 +717,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 dry_run,
                 cap,
             };
-            let outcome = if semantic {
-                #[cfg(feature = "embed")]
-                {
-                    let emb = embedder_for(&g)?;
-                    g.extract(
-                        &units,
-                        &agent,
-                        extractor.as_ref(),
-                        &opts,
-                        Some(emb.as_ref()),
-                    )?
-                }
-                #[cfg(not(feature = "embed"))]
-                {
-                    embedder_for(&g)?;
-                    unreachable!("--semantic errors without the embed feature")
-                }
-            } else {
-                g.extract(&units, &agent, extractor.as_ref(), &opts, None)?
-            };
+            let outcome = g.extract(&units, &agent, extractor.as_ref(), &opts, emb.as_deref())?;
             print_extract(&outcome);
         }
 

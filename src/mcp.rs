@@ -591,6 +591,18 @@ impl Server {
                         "extract needs exactly one of from, file, transcript".into(),
                     ));
                 }
+                // The flag contract is independent of the backend:
+                // semantic:true errors on a no-embed build even when
+                // extraction would no-op. The embedder init happens here
+                // too — lazy, no model load until a claim is embedded.
+                #[cfg(feature = "embed")]
+                let semantic = self.semantic_enabled(args)?;
+                #[cfg(feature = "embed")]
+                if semantic {
+                    self.ensure_embedder()?;
+                }
+                #[cfg(not(feature = "embed"))]
+                self.semantic_enabled(args)?;
                 let Some(extractor) = crate::extract::from_env()? else {
                     return Ok(format!(
                         "extraction unavailable: no backend configured — set {} to a command or `heuristic`",
@@ -630,24 +642,20 @@ impl Server {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                 };
-                let outcome = if self.semantic_enabled(args)? {
+                let outcome = self.g.extract(
+                    &units,
+                    agent,
+                    extractor.as_ref(),
+                    &opts,
                     #[cfg(feature = "embed")]
-                    {
-                        self.ensure_embedder()?;
-                        self.g.extract(
-                            &units,
-                            agent,
-                            extractor.as_ref(),
-                            &opts,
-                            self.embedder.as_deref(),
-                        )?
-                    }
+                    if semantic {
+                        self.embedder.as_deref()
+                    } else {
+                        None
+                    },
                     #[cfg(not(feature = "embed"))]
-                    unreachable!("semantic_enabled errors without the embed feature")
-                } else {
-                    self.g
-                        .extract(&units, agent, extractor.as_ref(), &opts, None)?
-                };
+                    None,
+                )?;
                 Ok(format_extract(&outcome))
             }
             "list" => {
