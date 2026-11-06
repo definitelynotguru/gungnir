@@ -953,9 +953,9 @@ fn unreviewed_reports_skipped_unreadable_files() {
 
 #[test]
 fn unreviewed_handles_separator_truncated_agent_dir() {
-    // Long agent names sanitize to a 64-char dir that can end in '-' after
-    // the cut; the partition filter and the store must read the same name
-    // instead of dropping the whole journal silently.
+    // Long agent names sanitize to a hashed 64-char dir; the partition
+    // filter and the store must read the same name instead of dropping
+    // the whole journal silently.
     let dir = tempfile::tempdir().unwrap();
     let agent = format!("a{}x", "b".repeat(63));
     assert!(agent.chars().count() > 64);
@@ -978,4 +978,58 @@ fn unreviewed_handles_separator_truncated_agent_dir() {
     );
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("unverified note"), "{stdout}");
+}
+
+#[test]
+fn journal_reads_legacy_truncated_dir() {
+    // Journals written before hashed truncation live under a bare 64-char
+    // cut that can end in '-'. Lookups must fall back to that name so old
+    // journals stay readable instead of a fresh empty one shadowing them.
+    let dir = tempfile::tempdir().unwrap();
+    let agent = format!("{}-x", "b".repeat(63));
+    let legacy = gungnir::layout::sanitize_component_legacy(&agent);
+    assert!(legacy.ends_with('-'), "test needs a separator remnant");
+    assert_ne!(gungnir::layout::sanitize_component(&agent), legacy);
+
+    gungnir::Store::open(dir.path().join("journal").join(&legacy))
+        .unwrap()
+        .create(&Entry::new(&agent, EntryKind::Observation, "legacy note"))
+        .unwrap();
+
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entries = g.journal(&agent).unwrap().entries().unwrap();
+    assert!(
+        entries.iter().any(|e| e.summary == "legacy note"),
+        "legacy-dir journal must be readable"
+    );
+    // And new writes land in the same legacy dir, not a shadowing new one.
+    g.journal(&agent)
+        .unwrap()
+        .create(&Entry::new(&agent, EntryKind::Observation, "new note"))
+        .unwrap();
+    assert!(
+        dir.path()
+            .join("journal")
+            .join(gungnir::layout::sanitize_component(&agent))
+            .read_dir()
+            .map(|mut r| r.next().is_none())
+            .unwrap_or(true),
+        "writes must not create a shadowing new-name dir"
+    );
+    drop(g);
+
+    let (stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        None,
+        &[
+            "ls",
+            "--layer",
+            "journal",
+            "--agent",
+            &agent,
+            "--unreviewed",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("legacy note"), "{stdout}");
 }

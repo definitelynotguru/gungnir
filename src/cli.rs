@@ -631,10 +631,16 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     let a = agent
                         .as_deref()
                         .ok_or_else(|| Error::Invalid("ls journal requires --agent".into()))?;
-                    (
-                        format!("{l}/{}", crate::layout::sanitize_component(a)),
-                        g.journal(a)?.scan()?.skipped,
-                    )
+                    // The partition name is the resolved dir's name —
+                    // hashed component, or the legacy truncated dir when
+                    // that's where this agent's journal lives.
+                    let store = g.journal(a)?;
+                    let dir_name = store
+                        .root()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| crate::layout::sanitize_component(a));
+                    (format!("{l}/{dir_name}"), store.scan()?.skipped)
                 };
                 let mut all = g.all_entries()?;
                 all.retain(|e| e.partition == partition);

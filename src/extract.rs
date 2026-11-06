@@ -168,10 +168,11 @@ pub enum ExtractSource {
 /// same way to every implementation.
 ///
 /// `cap` bounds the reply. `known` lists `(summary, body)` pairs already
-/// written to the journal: a compliant backend skips them so reruns offer
-/// fresh candidates instead of re-proposing the same first `cap` forever.
-/// The gate dedupes regardless, so a backend may ignore `known` — the
-/// guarantee it buys is resumability, not correctness.
+/// written to the acting agent's journal — the same set the gate dedupes
+/// against, so a compliant backend skips them and reruns offer fresh
+/// candidates instead of re-proposing the same first `cap` forever. It
+/// never carries another agent's journal. A backend may ignore `known`;
+/// the guarantee it buys is resumability, not correctness.
 pub trait Extractor: Send + Sync {
     /// Provenance marker recorded in `extracted_by`.
     fn backend(&self) -> &str;
@@ -667,11 +668,11 @@ impl Gungnir {
                 }
                 // The journal privacy boundary holds here too: a peer's
                 // journal is not transcript input for your extraction.
-                // Compare against the sanitized name — journal dirs are
-                // always sanitized, so a spaced agent name must not fail
-                // open or closed on the raw string.
+                // Compare against the resolved journal dir — hashed
+                // components with a legacy fallback — so spaced or long
+                // agent names don't fail open or closed on the raw string.
                 if store.root().starts_with(&journal_root)
-                    && store.root() != journal_root.join(crate::layout::sanitize_component(agent))
+                    && store.root() != self.journal_dir(agent)
                 {
                     return Err(Error::Invalid(
                         "extraction reads the caller's journal and the codex, not a peer's journal"
@@ -734,16 +735,23 @@ impl Gungnir {
         embedder: Option<&dyn crate::embedding::Embedder>,
     ) -> Result<ExtractOutcome> {
         let journal = self.journal(agent)?;
-        let existing: HashSet<(String, String)> = journal
-            .entries()?
-            .into_iter()
-            .map(|e| (e.summary, e.body))
+        let entries = journal.entries()?;
+        let existing: HashSet<(String, String)> = entries
+            .iter()
+            .map(|e| (e.summary.clone(), e.body.clone()))
             .collect();
         // `known` gives a bound-compliant backend memory of what landed:
         // without it the backend re-proposes the same first `cap` claims
         // every run and dedupe skips them forever — transcript claims past
-        // the reply bound would never be offered.
-        let known: Vec<(String, String)> = existing.iter().cloned().collect();
+        // the reply bound would never be offered. Scope it to what this
+        // agent's own extractions produced: the caller's journal is
+        // already private, and manual notes it contains are none of the
+        // backend's business.
+        let known: Vec<(String, String)> = entries
+            .into_iter()
+            .filter(|e| e.source_tool.as_deref() == Some(SOURCE_TOOL))
+            .map(|e| (e.summary, e.body))
+            .collect();
         // The reply bound is at least the default, never the write cap:
         // the write bound lives in the gate, and a larger offer window
         // costs nothing — reruns resume through `known` and dedupe.
