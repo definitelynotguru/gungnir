@@ -853,18 +853,25 @@ impl Gungnir {
         // use, so conflict candidates are unchanged — a run's writes are
         // unverified, and only verified facts are candidates.
         let mut written = Vec::with_capacity(accepted.len());
+        let mut write_error = None;
         for entry in accepted {
             match journal.create_with(&entry, &|id| self.exists_anywhere(id)) {
                 Ok(()) => written.push(entry),
                 // The gate already ran validate_entry, so a late Invalid
                 // means the store moved under us — still a verdict, not a
-                // crash. I/O errors propagate.
+                // crash. I/O errors propagate — but only after the prefix
+                // that did land gets its conflict scan: every persisted
+                // claim must be scanned or its candidates are lost (a
+                // retry dedupes on summary+body and never re-scans it).
                 Err(e @ Error::Invalid(_)) => outcome.refused.push(Refusal {
                     summary: entry.summary.clone(),
                     reason: format!("write rejected: {e}"),
                     sensitive: false,
                 }),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    write_error = Some(e);
+                    break;
+                }
             }
         }
         // `entries` is the dedupe snapshot from before the writes; adding
@@ -882,6 +889,9 @@ impl Gungnir {
         for entry in written {
             let records = by_entry.remove(&entry.id).unwrap_or_default();
             outcome.accepted.push((entry, records));
+        }
+        if let Some(e) = write_error {
+            return Err(e);
         }
         Ok(outcome)
     }
