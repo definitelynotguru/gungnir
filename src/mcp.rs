@@ -99,48 +99,43 @@ fn format_extract(outcome: &crate::ExtractOutcome) -> String {
 
 /// A path diagnostic that can't name its journal partition: peer coverage
 /// is counts-only, so an agent name must not ride a path out of the store
-/// any more than it rides a summary. Replaces the `journal/<agent>` segment
-/// with `<peer>`; anything else passes through unchanged.
-fn redact_journal_name(path: &std::path::Path) -> std::path::PathBuf {
-    let mut redacted = std::path::PathBuf::new();
-    let mut redact_next = false;
-    for c in path.components() {
-        if redact_next {
-            redacted.push("<peer>");
-            redact_next = false;
-            continue;
-        }
-        if let std::path::Component::Normal(name) = c {
-            if name == crate::layout::JOURNAL {
-                redact_next = true;
-            }
-        }
-        redacted.push(c);
+/// any more than it rides a summary. Anchored at the store root — only the
+/// component directly under `<root>/journal/` becomes `<peer>`, so a root
+/// that itself contains a `journal` segment survives intact.
+fn redact_journal_name(path: &std::path::Path, root: &std::path::Path) -> std::path::PathBuf {
+    let journal = root.join(crate::layout::JOURNAL);
+    let Ok(rest) = path.strip_prefix(&journal) else {
+        return path.to_path_buf();
+    };
+    let mut redacted = journal;
+    redacted.push("<peer>");
+    if let Some(rest) = rest.iter().nth(1) {
+        redacted.push(rest);
     }
     redacted
 }
 
 /// Same redaction for free text: a scan error can embed the canonical path
 /// ("placed in wrong shard; canonical path is …/journal/<agent>/…"), so the
-/// `journal/<name>` segment is scrubbed there too.
-fn scrub_journal_names(text: &str) -> String {
+/// segment under `<root>/journal/` is scrubbed there too. `journal` text
+/// outside the store root is left alone.
+fn scrub_journal_names(text: &str, root: &std::path::Path) -> String {
+    let journal = root.join(crate::layout::JOURNAL);
+    let needle = journal.to_string_lossy().into_owned();
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(pos) = rest.find(crate::layout::JOURNAL) {
-        let (before, after) = rest.split_at(pos);
+    while let Some(pos) = rest.find(&needle) {
+        let (before, at) = rest.split_at(pos);
         out.push_str(before);
-        let after_journal = &after[crate::layout::JOURNAL.len()..];
-        match after_journal.strip_prefix(['/', '\\']) {
+        out.push_str(&needle);
+        let after = &at[needle.len()..];
+        match after.strip_prefix(['/', '\\']) {
             Some(stripped) if stripped.find(['/', '\\']).is_some_and(|end| end > 0) => {
-                out.push_str(crate::layout::JOURNAL);
-                out.push(after_journal.chars().next().unwrap());
+                out.push(after.chars().next().unwrap());
                 out.push_str("<peer>");
                 rest = &stripped[stripped.find(['/', '\\']).unwrap()..];
             }
-            _ => {
-                out.push_str(crate::layout::JOURNAL);
-                rest = after_journal;
-            }
+            _ => rest = after,
         }
     }
     out.push_str(rest);
@@ -151,7 +146,7 @@ fn scrub_journal_names(text: &str) -> String {
 /// UNREADABLE lines plus its intact-vs-failed summary. The summary's failed
 /// count is the machine-branchable signal, the same role `abstained` plays
 /// in recall's coverage line.
-fn format_revalidate(report: &crate::RevalidateReport) -> String {
+fn format_revalidate(report: &crate::RevalidateReport, root: &std::path::Path) -> String {
     let mut intact = 0usize;
     let mut out = String::new();
     for c in &report.checks {
@@ -175,7 +170,7 @@ fn format_revalidate(report: &crate::RevalidateReport) -> String {
     for path in &report.unreadable {
         out.push_str(&format!(
             "UNREADABLE {}\n",
-            redact_journal_name(path).display()
+            redact_journal_name(path, root).display()
         ));
     }
     let failed = report.checks.iter().filter(|c| !c.intact()).count() + report.unreadable.len();
@@ -834,8 +829,8 @@ impl Server {
                 for s in &r.skipped {
                     out.push_str(&format!(
                         "\n(skipped unreadable entry {}: {})",
-                        redact_journal_name(&s.path).display(),
-                        scrub_journal_names(&s.error)
+                        redact_journal_name(&s.path, self.g.root()).display(),
+                        scrub_journal_names(&s.error, self.g.root())
                     ));
                 }
                 Ok(out)
@@ -864,7 +859,7 @@ impl Server {
                 };
                 // A completed sweep is never a tool error — drift is the
                 // answer, not a failure.
-                Ok(format_revalidate(&report))
+                Ok(format_revalidate(&report, self.g.root()))
             }
             other => Err(Error::Invalid(format!("unknown tool '{other}'"))),
         }
