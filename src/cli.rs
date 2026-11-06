@@ -622,13 +622,19 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 // superseded — session archives are bookkeeping, not
                 // review items.
                 let l = layer_of(&layer)?;
-                let partition = if l == crate::layout::CODEX {
-                    crate::layout::CODEX.to_string()
+                // Partition names use the sanitized agent — journal dirs
+                // always do. The target store's own scan keeps the skipped
+                // warnings the ordinary listing reports.
+                let (partition, skipped) = if l == crate::layout::CODEX {
+                    (crate::layout::CODEX.to_string(), g.codex()?.scan()?.skipped)
                 } else {
                     let a = agent
                         .as_deref()
                         .ok_or_else(|| Error::Invalid("ls journal requires --agent".into()))?;
-                    format!("{l}/{a}")
+                    (
+                        format!("{l}/{}", crate::layout::sanitize_component(a)),
+                        g.journal(a)?.scan()?.skipped,
+                    )
                 };
                 let mut all = g.all_entries()?;
                 all.retain(|e| e.partition == partition);
@@ -640,6 +646,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                         e.id, e.kind, e.summary, e.agent, extracted
                     );
                 }
+                warn_skipped(&skipped);
                 return Ok(0);
             }
             let scan = match layer_of(&layer)? {
@@ -652,7 +659,15 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 }
             };
             for e in &scan.entries {
-                println!("{}  {}\t{}\t{}", e.id, e.kind, e.summary, e.agent);
+                let extracted = if e.source_tool.is_some() {
+                    "  [extracted]"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}  {}\t{}\t{}{}",
+                    e.id, e.kind, e.summary, e.agent, extracted
+                );
             }
             warn_skipped(&scan.skipped);
         }

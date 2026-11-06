@@ -853,3 +853,60 @@ fn briefing_and_recall_flag_extracted_origin() {
     assert_eq!(code, 0);
     assert!(stdout.contains("extracted"), "{stdout}");
 }
+
+#[test]
+fn plain_ls_marks_extracted_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let (_, session_id) = archived_session(&g, &["postgres replaced mysql"]);
+    drop(g);
+    gungnir_at(
+        dir.path(),
+        Some("heuristic"),
+        &["extract", "--from", &session_id, "--agent", "builder"],
+    );
+
+    // Machine origin shows on every listing, not only the review view.
+    let (stdout, _, code) = gungnir_at(
+        dir.path(),
+        None,
+        &["ls", "--layer", "journal", "--agent", "builder"],
+    );
+    assert_eq!(code, 0);
+    let observation_line = stdout
+        .lines()
+        .find(|l| l.contains("postgres replaced mysql"))
+        .unwrap_or_default();
+    assert!(observation_line.contains("[extracted]"), "{stdout}");
+}
+
+#[test]
+fn unreviewed_uses_sanitized_agent_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let s = g
+        .start_session("Builder Agent", "work on checkout")
+        .unwrap();
+    g.add_observation(&s, "postgres replaced mysql").unwrap();
+    g.end_session(&s, "done", vec![]).unwrap();
+    let entry = Entry::new("Builder Agent", EntryKind::Observation, "unverified note");
+    g.journal("Builder Agent").unwrap().create(&entry).unwrap();
+    drop(g);
+
+    // The journal dir is sanitized; --unreviewed must match that
+    // partition name or the queue comes back empty.
+    let (stdout, _, code) = gungnir_at(
+        dir.path(),
+        None,
+        &[
+            "ls",
+            "--layer",
+            "journal",
+            "--agent",
+            "Builder Agent",
+            "--unreviewed",
+        ],
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("unverified note"), "{stdout}");
+}

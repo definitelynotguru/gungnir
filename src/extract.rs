@@ -164,9 +164,11 @@ pub enum ExtractSource {
 
 /// A backend that turns transcript units into proposals. Implement this for
 /// an LLM, a paraphrase service, or anything else — the gate applies the
-/// same way to every implementation. `cap` is the caller's write bound:
-/// backends should bound their reply to it so the gate's skip count means
-/// "over proposal volume", not "the backend lied about how much it found".
+/// same way to every implementation. `cap` bounds the reply: it is at
+/// least [`DEFAULT_CAP`] so a small write cap can still resume — the
+/// gate's dedupe is what makes later runs land the remainder, and a
+/// backend that only offered `cap` proposals would offer the same ones
+/// forever.
 pub trait Extractor: Send + Sync {
     /// Provenance marker recorded in `extracted_by`.
     fn backend(&self) -> &str;
@@ -640,8 +642,11 @@ impl Gungnir {
                 }
                 // The journal privacy boundary holds here too: a peer's
                 // journal is not transcript input for your extraction.
+                // Compare against the sanitized name — journal dirs are
+                // always sanitized, so a spaced agent name must not fail
+                // open or closed on the raw string.
                 if store.root().starts_with(&journal_root)
-                    && store.root() != journal_root.join(agent)
+                    && store.root() != journal_root.join(crate::layout::sanitize_component(agent))
                 {
                     return Err(Error::Invalid(
                         "extraction reads the caller's journal and the codex, not a peer's journal"
@@ -703,7 +708,12 @@ impl Gungnir {
         opts: &ExtractOptions,
         embedder: Option<&dyn crate::embedding::Embedder>,
     ) -> Result<ExtractOutcome> {
-        let proposals = extractor.propose(units, opts.cap)?;
+        // The reply bound is at least the default, never the write cap:
+        // with --cap 1 a compliant backend would return the same single
+        // proposal every run, journal-deduped to nothing, and later units
+        // would never be offered. Offerings may exceed the cap; the gate
+        // enforces the write bound.
+        let proposals = extractor.propose(units, opts.cap.max(DEFAULT_CAP))?;
         let journal = self.journal(agent)?;
         let existing: HashSet<(String, String)> = journal
             .entries()?
@@ -1010,5 +1020,66 @@ mod tests {
         assert_eq!(proposals[1].summary, "tried index hint");
         assert_eq!(proposals[0].cites, vec![0]);
         assert_eq!(proposals[1].cites, vec![1]);
+    }
+
+    /// A backend that honors the reply bound exactly: returns at most
+    /// `cap` proposals, always the first ones — the starvation case.
+    struct FirstN;
+    impl Extractor for FirstN {
+        fn backend(&self) -> &str {
+            "first-n"
+        }
+
+        fn propose(&self, units: &[TranscriptUnit], cap: usize) -> Result<Vec<Proposal>> {
+            Ok(units
+                .iter()
+                .take(cap)
+                .enumerate()
+                .map(|(i, u)| Proposal {
+                    summary: u.text.clone(),
+                    body: String::new(),
+                    cites: vec![i],
+                    kind: ProposalKind::Observation,
+                    entities: Vec::new(),
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn small_write_cap_still_resumes_through_dedupe() {
+        // --cap 1 asks the backend for a bounded reply, not a bounded
+        // transcript: the reply bound floors at DEFAULT_CAP so a compliant
+        // backend keeps offering new candidates across runs while the gate
+        // dedupes what already landed.
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gungnir::open(dir.path()).unwrap();
+        let units: Vec<TranscriptUnit> = (0..3)
+            .map(|i| TranscriptUnit {
+                text: format!("claim {i}"),
+                evidence: vec![Evidence::File {
+                    path: "notes.md".into(),
+                    excerpt: format!("claim {i}"),
+                    sha256: "f".repeat(64),
+                }],
+            })
+            .collect();
+        let opts = ExtractOptions {
+            cap: 1,
+            ..ExtractOptions::default()
+        };
+        for _ in 0..4 {
+            let out = g.extract(&units, "builder", &FirstN, &opts, None).unwrap();
+            assert!(out.accepted.len() <= 1);
+        }
+        let count = g
+            .journal("builder")
+            .unwrap()
+            .entries()
+            .unwrap()
+            .iter()
+            .filter(|e| e.source_tool.as_deref() == Some(SOURCE_TOOL))
+            .count();
+        assert_eq!(count, 3, "every unit lands once across runs");
     }
 }
