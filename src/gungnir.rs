@@ -218,8 +218,12 @@ impl Gungnir {
         if dir.is_dir() {
             return dir;
         }
-        let legacy = base.join(layout::sanitize_component_legacy(agent));
-        if legacy.is_dir() {
+        // The legacy component is empty for punctuation-only names —
+        // joining it would resolve to the journal root itself, turning a
+        // journal("///") into a listing of every agent's private entries.
+        let legacy_name = layout::sanitize_component_legacy(agent);
+        let legacy = base.join(&legacy_name);
+        if layout::is_component_dir(&legacy_name) && legacy.is_dir() {
             legacy
         } else {
             dir
