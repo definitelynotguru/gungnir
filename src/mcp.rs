@@ -97,6 +97,41 @@ fn format_extract(outcome: &crate::ExtractOutcome) -> String {
     conflict_note(out.trim_end().to_string(), &conflicts, &outcome.warnings)
 }
 
+/// Revalidation results as tool text, mirroring the CLI's DRIFT / MISSING /
+/// UNREADABLE lines plus its intact-vs-failed summary. The summary's failed
+/// count is the machine-branchable signal, the same role `abstained` plays
+/// in recall's coverage line.
+fn format_revalidate(report: &crate::RevalidateReport) -> String {
+    let mut intact = 0usize;
+    let mut out = String::new();
+    for c in &report.checks {
+        match (&c.actual_sha256, &c.read_error) {
+            (Some(_), _) if c.intact() => intact += 1,
+            (_, Some(e)) => {
+                out.push_str(&format!("UNREADABLE {} {} ({e})\n", c.entry, c.path));
+            }
+            (Some(actual), _) => out.push_str(&format!(
+                "DRIFT   {} {} expected {} got {}\n",
+                c.entry,
+                c.path,
+                &c.expected_sha256[..8.min(c.expected_sha256.len())],
+                &actual[..8.min(actual.len())],
+            )),
+            (None, None) => {
+                out.push_str(&format!("MISSING {} {}\n", c.entry, c.path));
+            }
+        }
+    }
+    for path in &report.unreadable {
+        out.push_str(&format!("UNREADABLE {}\n", path.display()));
+    }
+    let failed = report.checks.iter().filter(|c| !c.intact()).count() + report.unreadable.len();
+    out.push_str(&format!(
+        "{intact} intact, {failed} drifted, missing, or unreadable"
+    ));
+    out
+}
+
 /// Open sessions by id, so agents only pass a session handle between calls.
 pub struct Server {
     g: Gungnir,
@@ -290,6 +325,22 @@ impl Server {
                 "inputSchema": schema(json!({
                     "id": {"type": "string"}
                 }), &["id"])
+            },
+            {
+                "name": "stats",
+                "description": "Memory health summary: counts by layer and verification state, supersession depth, staleness. agent scopes the journal count. topic adds cross-journal peer coverage — aggregate counts only, peer content never crosses.",
+                "inputSchema": schema(json!({
+                    "agent": {"type": "string"},
+                    "topic": {"type": "string"}
+                }), &[])
+            },
+            {
+                "name": "revalidate",
+                "description": "Re-hash an entry's file evidence against the SHA-256 recorded at citation time and report drift, missing, or unreadable files. Read-only: it never rewrites history. all sweeps every entry in every layer. The result ends with a 'N intact, M drifted, missing, or unreadable' summary — M>0 means checks failed.",
+                "inputSchema": schema(json!({
+                    "id": {"type": "string"},
+                    "all": {"type": "boolean"}
+                }), &[])
             }
         ])
     }
@@ -690,6 +741,77 @@ impl Server {
                 let store = self.g.locate(id)?.ok_or(Error::NotFound(id))?;
                 let e = store.require(id)?;
                 Ok(format!("{}  {}\n{}\n\n{}", e.id, e.kind, e.summary, e.body))
+            }
+            "stats" => {
+                let r = self.g.stats(arg("agent"))?;
+                let mut out = format!(
+                    "codex entries      {}\n\
+                     journal entries    {}\n\
+                     scratch sessions   {}\n\
+                     verified           {}\n\
+                     unverified         {}\n\
+                     contradicted       {}\n\
+                     rolled back        {}\n\
+                     superseded         {}\n\
+                     stale (>30d)       {}\n\
+                     verification rate  {:.0}%\n\
+                     skipped (unparseable) {}",
+                    r.codex_entries,
+                    r.journal_entries,
+                    r.scratch_sessions,
+                    r.verified,
+                    r.unverified,
+                    r.contradicted,
+                    r.rolled_back,
+                    r.superseded,
+                    r.stale_over_30d,
+                    r.verification_rate * 100.0,
+                    r.skipped.len()
+                );
+                // Counts only, same as `stats --topic`: how many peer
+                // journals match the topic and how many recorded a failed
+                // attempt. No summary, body, or agent name crosses.
+                if let Some(topic) = arg("topic") {
+                    let p = self.g.peer_coverage(arg("agent"), topic)?;
+                    out.push_str(&format!(
+                        "\npeer coverage      {} agents attempted, {} failed ({} entries)",
+                        p.agents_attempted, p.agents_failed, p.entries
+                    ));
+                }
+                for s in &r.skipped {
+                    out.push_str(&format!(
+                        "\n(skipped unreadable entry {}: {})",
+                        s.path.display(),
+                        s.error
+                    ));
+                }
+                Ok(out)
+            }
+            "revalidate" => {
+                let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+                if arg("id").is_some() && all {
+                    return Err(Error::Invalid("pass an entry id or all, not both".into()));
+                }
+                let report = match (arg("id"), all) {
+                    (_, true) => self.g.revalidate_all()?,
+                    (Some(raw), false) => {
+                        let id: EntryId = raw
+                            .parse()
+                            .map_err(|e| Error::Invalid(format!("bad id: {e}")))?;
+                        crate::RevalidateReport {
+                            checks: self.g.revalidate(id)?,
+                            unreadable: Vec::new(),
+                        }
+                    }
+                    (None, false) => {
+                        return Err(Error::Invalid(
+                            "revalidate needs an entry id or all:true".into(),
+                        ))
+                    }
+                };
+                // A completed sweep is never a tool error — drift is the
+                // answer, not a failure.
+                Ok(format_revalidate(&report))
             }
             other => Err(Error::Invalid(format!("unknown tool '{other}'"))),
         }

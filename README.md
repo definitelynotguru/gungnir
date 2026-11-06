@@ -206,7 +206,8 @@ Protocol:
 
 Tools: `start_session`, `add_observation`, `add_attempt`, `end_session`,
 `recall`, `brief`, `verify`, `contradict`, `promote`, `supersede`,
-`rollback`, `conflicts`, `resolve_conflict`, `list`, `get`. Agents drive
+`rollback`, `conflicts`, `resolve_conflict`, `extract`, `stats`,
+`revalidate`, `list`, `get`. Agents drive
 the full correction lifecycle over the wire.
 
 ## Design notes
