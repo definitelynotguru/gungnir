@@ -1052,10 +1052,17 @@ fn punctuation_only_agent_never_escapes_to_journal_root() {
 
     for name in ["///", "---", "...", ""] {
         let store = g.journal(name).unwrap();
+        // Compare components, not paths: macOS canonicalizes /var →
+        // /private/var inside tempdir roots.
+        let mut parts = store
+            .root()
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned());
         assert_eq!(
-            store.root(),
-            dir.path().join("journal").join("anon"),
-            "{name:?} must land in the anon journal, not {store:?}",
+            (parts.next_back(), parts.next_back()),
+            (Some("anon".to_string()), Some("journal".to_string())),
+            "{name:?} must land in journal/anon, not {:?}",
+            store.root()
         );
         assert!(
             store.entries().unwrap().is_empty(),
