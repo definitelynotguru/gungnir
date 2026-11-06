@@ -97,6 +97,56 @@ fn format_extract(outcome: &crate::ExtractOutcome) -> String {
     conflict_note(out.trim_end().to_string(), &conflicts, &outcome.warnings)
 }
 
+/// A path diagnostic that can't name its journal partition: peer coverage
+/// is counts-only, so an agent name must not ride a path out of the store
+/// any more than it rides a summary. Replaces the `journal/<agent>` segment
+/// with `<peer>`; anything else passes through unchanged.
+fn redact_journal_name(path: &std::path::Path) -> std::path::PathBuf {
+    let mut redacted = std::path::PathBuf::new();
+    let mut redact_next = false;
+    for c in path.components() {
+        if redact_next {
+            redacted.push("<peer>");
+            redact_next = false;
+            continue;
+        }
+        if let std::path::Component::Normal(name) = c {
+            if name == crate::layout::JOURNAL {
+                redact_next = true;
+            }
+        }
+        redacted.push(c);
+    }
+    redacted
+}
+
+/// Same redaction for free text: a scan error can embed the canonical path
+/// ("placed in wrong shard; canonical path is …/journal/<agent>/…"), so the
+/// `journal/<name>` segment is scrubbed there too.
+fn scrub_journal_names(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(crate::layout::JOURNAL) {
+        let (before, after) = rest.split_at(pos);
+        out.push_str(before);
+        let after_journal = &after[crate::layout::JOURNAL.len()..];
+        match after_journal.strip_prefix(['/', '\\']) {
+            Some(stripped) if stripped.find(['/', '\\']).is_some_and(|end| end > 0) => {
+                out.push_str(crate::layout::JOURNAL);
+                out.push(after_journal.chars().next().unwrap());
+                out.push_str("<peer>");
+                rest = &stripped[stripped.find(['/', '\\']).unwrap()..];
+            }
+            _ => {
+                out.push_str(crate::layout::JOURNAL);
+                rest = after_journal;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Revalidation results as tool text, mirroring the CLI's DRIFT / MISSING /
 /// UNREADABLE lines plus its intact-vs-failed summary. The summary's failed
 /// count is the machine-branchable signal, the same role `abstained` plays
@@ -114,8 +164,8 @@ fn format_revalidate(report: &crate::RevalidateReport) -> String {
                 "DRIFT   {} {} expected {} got {}\n",
                 c.entry,
                 c.path,
-                &c.expected_sha256[..8.min(c.expected_sha256.len())],
-                &actual[..8.min(actual.len())],
+                crate::cli::short(&c.expected_sha256),
+                crate::cli::short(actual),
             )),
             (None, None) => {
                 out.push_str(&format!("MISSING {} {}\n", c.entry, c.path));
@@ -123,7 +173,10 @@ fn format_revalidate(report: &crate::RevalidateReport) -> String {
         }
     }
     for path in &report.unreadable {
-        out.push_str(&format!("UNREADABLE {}\n", path.display()));
+        out.push_str(&format!(
+            "UNREADABLE {}\n",
+            redact_journal_name(path).display()
+        ));
     }
     let failed = report.checks.iter().filter(|c| !c.intact()).count() + report.unreadable.len();
     out.push_str(&format!(
@@ -781,8 +834,8 @@ impl Server {
                 for s in &r.skipped {
                     out.push_str(&format!(
                         "\n(skipped unreadable entry {}: {})",
-                        s.path.display(),
-                        s.error
+                        redact_journal_name(&s.path).display(),
+                        scrub_journal_names(&s.error)
                     ));
                 }
                 Ok(out)

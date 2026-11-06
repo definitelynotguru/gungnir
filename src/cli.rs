@@ -437,7 +437,7 @@ fn layer_of(name: &str) -> Result<&'static str> {
 /// First 8 chars of a digest, enough to identify drift at a glance.
 /// Char-bounded, not byte-bounded: sha256 is a free string field and a
 /// hand-edited value must not panic the report.
-fn short(sha: &str) -> &str {
+pub(crate) fn short(sha: &str) -> &str {
     let mut end = 8.min(sha.len());
     while !sha.is_char_boundary(end) {
         end -= 1;
