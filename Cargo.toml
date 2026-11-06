@@ -10,8 +10,10 @@ categories = ["command-line-utilities", "development-tools"]
 
 [features]
 # Local embedding model (bge-small-en-v1.5 via fastembed/ONNX) for
-# `--semantic` recall and briefings. Default build stays zero-network:
-# the model downloads on first semantic use only, into `<root>/.cache`.
+# `--semantic` recall and briefings. Must stay opt-in — never in
+# `default`: a default build stays zero-network and semantic requests
+# error rather than silently degrading to keyword. The model downloads
+# on first semantic use only, into `<root>/.cache`.
 embed = ["dep:fastembed"]
 # Test-only: lets `GUNGNIR_TEST_EMBEDDER=1` swap the shipped model for the
 # uniform-vector `embedding::Uniform`, so semantic dispatch runs offline.

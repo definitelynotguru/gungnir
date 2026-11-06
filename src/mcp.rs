@@ -891,6 +891,15 @@ impl Server {
     #[cfg(feature = "embed")]
     fn ensure_embedder(&mut self) -> Result<()> {
         if self.embedder.is_none() {
+            // Same swap `cli::embedder_for` honors: under the test-only
+            // `test-embedder` feature, GUNGNIR_TEST_EMBEDDER=1 serves the
+            // offline uniform embedder, so the stdio surface can be
+            // exercised without model weights. Compiled out otherwise.
+            #[cfg(feature = "test-embedder")]
+            if std::env::var("GUNGNIR_TEST_EMBEDDER").is_ok_and(|v| v == "1") {
+                self.embedder = Some(Box::new(crate::embedding::Uniform));
+                return Ok(());
+            }
             self.embedder = Some(Box::new(crate::embedding::CachedEmbedder::new(
                 crate::embedding::local::Fastembed::new(self.g.root())?,
                 self.g.root(),
