@@ -1033,3 +1033,33 @@ fn journal_reads_legacy_truncated_dir() {
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("legacy note"), "{stdout}");
 }
+
+#[test]
+fn punctuation_only_agent_never_escapes_to_journal_root() {
+    // "///" sanitizes to "anon" today but to an empty component under the
+    // legacy scheme; joining that would resolve journal("///") to the
+    // journal root and expose every agent's private entries.
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    g.journal("real-agent")
+        .unwrap()
+        .create(&Entry::new(
+            "real-agent",
+            EntryKind::Observation,
+            "private note",
+        ))
+        .unwrap();
+
+    for name in ["///", "---", "...", ""] {
+        let store = g.journal(name).unwrap();
+        assert_eq!(
+            store.root(),
+            dir.path().join("journal").join("anon"),
+            "{name:?} must land in the anon journal, not {store:?}",
+        );
+        assert!(
+            store.entries().unwrap().is_empty(),
+            "{name:?} must not list other agents' entries",
+        );
+    }
+}
