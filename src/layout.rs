@@ -44,7 +44,12 @@ pub fn sanitize_component(name: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-");
+    // The cap can cut on a separator, leaving a trailing '-': re-applying
+    // sanitize to such a dir name would drop the dir (it is not a fixed
+    // point), so trim separator remnants after the cut. Result is a fixed
+    // point of this function, which `layer_child_names` relies on.
     let capped: String = collapsed.chars().take(64).collect();
+    let capped = capped.trim_end_matches('-').to_string();
     if capped.is_empty() {
         "anon".into()
     } else {

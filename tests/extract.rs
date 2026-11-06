@@ -286,14 +286,14 @@ fn volume_cap_and_rerun_dedupe() {
     assert_eq!(extracted_count(&g), extract::DEFAULT_CAP);
     drop(g);
 
-    // The cap limits one run, not the total: a rerun dedupes what landed
+    // The cap limits one run, not the total: a rerun knows what landed
     // and writes only the remainder — same flood protection, resumable.
     let (stdout, _, _) = gungnir_at(
         dir.path(),
         Some("heuristic"),
         &["extract", "--from", &session_id, "--agent", "builder"],
     );
-    assert!(stdout.contains("skipped"), "{stdout}");
+    assert!(stdout.contains("wrote"), "{stdout}");
     let g = Gungnir::open(dir.path()).unwrap();
     assert_eq!(extracted_count(&g), 30);
     drop(g);
@@ -908,5 +908,74 @@ fn unreviewed_uses_sanitized_agent_partition() {
         ],
     );
     assert_eq!(code, 0);
+    assert!(stdout.contains("unverified note"), "{stdout}");
+}
+
+#[test]
+fn unreviewed_reports_skipped_unreadable_files() {
+    // A ULID-named entry file in the wrong shard is reported as skipped on
+    // every listing path, including the review branch.
+    for (layer_args, broken_root) in [
+        (
+            vec!["ls", "--layer", "codex", "--unreviewed"],
+            "codex/1999/01/01",
+        ),
+        (
+            vec![
+                "ls",
+                "--layer",
+                "journal",
+                "--agent",
+                "builder",
+                "--unreviewed",
+            ],
+            "journal/builder/1999/01/01",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gungnir::open(dir.path()).unwrap();
+        drop(g);
+        let wrong = dir.path().join(broken_root);
+        std::fs::create_dir_all(&wrong).unwrap();
+        std::fs::write(
+            wrong.join(format!("{}.md", gungnir::EntryId::generate())),
+            "---\nkind: observation\n---\nplaced by hand\n",
+        )
+        .unwrap();
+        let (_, stderr, code) = gungnir_at(dir.path(), None, &layer_args);
+        assert_eq!(code, 0);
+        assert!(
+            stderr.contains("skipped unreadable entry"),
+            "{layer_args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn unreviewed_handles_separator_truncated_agent_dir() {
+    // Long agent names sanitize to a 64-char dir that can end in '-' after
+    // the cut; the partition filter and the store must read the same name
+    // instead of dropping the whole journal silently.
+    let dir = tempfile::tempdir().unwrap();
+    let agent = format!("a{}x", "b".repeat(63));
+    assert!(agent.chars().count() > 64);
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = Entry::new(&agent, EntryKind::Observation, "unverified note");
+    g.journal(&agent).unwrap().create(&entry).unwrap();
+    drop(g);
+
+    let (stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        None,
+        &[
+            "ls",
+            "--layer",
+            "journal",
+            "--agent",
+            &agent,
+            "--unreviewed",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("unverified note"), "{stdout}");
 }
