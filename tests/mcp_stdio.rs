@@ -664,20 +664,21 @@ fn mcp_journal_named_root_keeps_diagnostic_paths_real() {
     // The codex diagnostic reports the file's path intact — the `journal`
     // component inside the root is not touched. The store canonicalizes the
     // root (Windows spells it as a verbatim \\?\ path, and the runner's temp
-    // dir may differ from ours), so assert on the separators-agnostic tail:
-    // the codex shard plus the filename both present in one line.
-    let codex_name = codex_file
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    let codex_line = |text: &str| {
-        text.lines()
-            .find(|l| l.contains(&codex_name))
-            .unwrap_or("")
-            .to_string()
-    };
+    // dir may differ from ours), so normalize separators and assert on the
+    // root-relative tail `journal/project/<layer>/<file>` — that proves the
+    // full store path survived, not just a bare filename.
+    let norm = |text: &str| text.replace('\\', "/");
+    let codex_tail = format!(
+        "journal/project/codex/{}",
+        codex_file.file_name().unwrap().to_str().unwrap()
+    );
+    // The journal file's own diagnostic must redact its partition segment
+    // in place: `journal/<peer>/<file>` at the journal-layer position, not
+    // a bare `<peer>` that could come from anywhere.
+    let journal_tail = format!(
+        "journal/project/journal/<peer>/{}",
+        journal_file.file_name().unwrap().to_str().unwrap()
+    );
 
     let r = p.rpc(&msg(
         2,
@@ -686,14 +687,9 @@ fn mcp_journal_named_root_keeps_diagnostic_paths_real() {
     ));
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("skipped (unparseable) 2"), "{text}");
-    // `<peer>` anywhere on the codex line means the root's own `journal`
-    // segment got redacted — the corruption this regression guards.
-    let line = codex_line(text);
-    assert!(line.contains("codex"), "{line}");
-    assert!(!line.contains("<peer>"), "{line}");
-
-    // The journal diagnostic redacts only the partition segment.
-    assert!(text.contains("<peer>"), "{text}");
+    let text = norm(text);
+    assert!(text.contains(&codex_tail), "{text}");
+    assert!(text.contains(&journal_tail), "{text}");
     assert!(!text.contains("scout"), "{text}");
 
     // Same anchoring in the revalidate sweep.
@@ -703,10 +699,9 @@ fn mcp_journal_named_root_keeps_diagnostic_paths_real() {
         serde_json::json!({"name": "revalidate", "arguments": {"all": true}}),
     ));
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
-    let line = codex_line(text);
-    assert!(line.contains("codex"), "{line}");
-    assert!(!line.contains("<peer>"), "{line}");
-    assert!(text.contains("<peer>"), "{text}");
+    let text = norm(text);
+    assert!(text.contains(&codex_tail), "{text}");
+    assert!(text.contains(&journal_tail), "{text}");
     assert!(!text.contains("scout"), "{text}");
 }
 
