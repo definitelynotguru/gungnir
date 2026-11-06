@@ -62,7 +62,7 @@ use crate::Store;
 
 /// Candidates scanned per write. Verified hits sort first under the
 /// bucket-first ordering, so the cap only sheds unverified noise.
-const CANDIDATE_LIMIT: usize = 64;
+pub(crate) const CANDIDATE_LIMIT: usize = 64;
 
 /// Cosine floor for the semantic channel: "same claim, different words".
 /// Higher than the recall match floor (0.45) because a conflict candidate
@@ -308,6 +308,40 @@ impl Conflicts {
         Ok(None)
     }
 
+    /// `record` for a batch under one lock with the existing queue read
+    /// once: a scan that surfaces C candidates costs one queue walk
+    /// instead of C. `results[i]` answers `recs[i]` the way `record`
+    /// would, plus a third state `record` reported as its `Err` arm —
+    /// `Failed` names which pair could not persist without aborting the
+    /// rest of the batch. Duplicate pairs inside `recs` itself dedupe to
+    /// the first.
+    pub(crate) fn record_many(&self, recs: &[ConflictRecord]) -> Result<Vec<RecordOutcome>> {
+        fs::create_dir_all(&self.dir)?;
+        let _guard = self.lock()?;
+        let mut by_pair: HashMap<(EntryId, EntryId), ConflictRecord> = HashMap::new();
+        for id in self.ids()? {
+            let Some(existing) = self.get(id).ok().flatten() else {
+                continue;
+            };
+            by_pair.insert((existing.new_entry, existing.conflicting_entry), existing);
+        }
+        let mut results = Vec::with_capacity(recs.len());
+        for rec in recs {
+            if let Some(existing) = by_pair.get(&(rec.new_entry, rec.conflicting_entry)) {
+                results.push(RecordOutcome::Existing(existing.clone()));
+                continue;
+            }
+            match self.persist_locked(rec) {
+                Ok(()) => {
+                    by_pair.insert((rec.new_entry, rec.conflicting_entry), rec.clone());
+                    results.push(RecordOutcome::New);
+                }
+                Err(e) => results.push(RecordOutcome::Failed(e)),
+            }
+        }
+        Ok(results)
+    }
+
     /// Overwrite an existing record (resolution bookkeeping). Test-only:
     /// production closes records through `resolve_locked`, which serializes
     /// the status recheck — a public blind update could overwrite a
@@ -444,6 +478,17 @@ impl Conflicts {
     }
 }
 
+/// What `record_many` did with one candidate. `New` persisted it;
+/// `Existing` found the same pair already queued (the record it names);
+/// `Failed` carries the persist error so the caller can name the lost
+/// pair — per-candidate failures never abort the batch.
+#[derive(Debug)]
+pub enum RecordOutcome {
+    New,
+    Existing(ConflictRecord),
+    Failed(Error),
+}
+
 fn parse_record_file(path: &Path) -> Result<ConflictRecord> {
     let raw = fs::read_to_string(path)?;
     let rest = raw
@@ -546,16 +591,50 @@ pub fn detect_many(
     entries: &[Entry],
     embedder: Option<&dyn Embedder>,
 ) -> Result<Vec<ConflictRecord>> {
+    // Check detectability before paying the scan: a Session archive or a
+    // Rollback record is bookkeeping, and skipping the store walk is what
+    // keeps verbatim ingest cheap.
+    if entries.iter().all(|e| !detectable(e)) {
+        return Ok(vec![]);
+    }
+    let q = Query::new("", CANDIDATE_LIMIT).current();
+    let (pool, revised, _skipped) = recall::temporal_pool(store, &q)?;
+    detect_many_pool(pool, revised, layer, entries, embedder)
+}
+
+/// `detect_many` over an already-built pool: batch writes reuse the
+/// entries they just persisted (plus any the caller already loaded)
+/// instead of rescanning the store for every write in the batch.
+/// Same candidate rules — `pool` must be the layer's `current`-view
+/// temporal pool or candidacy drifts.
+pub(crate) fn detect_many_pool(
+    pool: Vec<recall::Candidate>,
+    revised: HashSet<EntryId>,
+    layer: &str,
+    entries: &[Entry],
+    embedder: Option<&dyn Embedder>,
+) -> Result<Vec<ConflictRecord>> {
     let entries: Vec<&Entry> = entries.iter().filter(|e| detectable(e)).collect();
     if entries.is_empty() {
         return Ok(vec![]);
     }
     let excluded: Vec<HashSet<EntryId>> = entries.iter().map(|e| excluded_ids(e)).collect();
 
-    // One `current`-view pool for both channels: `state`/`revised` hide
-    // superseded tails and contradicted facts from candidacy.
-    let q = Query::new("", CANDIDATE_LIMIT).current();
-    let (pool, revised, _skipped) = recall::temporal_pool(store, &q)?;
+    // No live verified claim in the pool means no possible candidate:
+    // every channel scores only verified, unrevised, claim-shaped entries.
+    // Skip corpus stats and the embedder call — on a journal of nothing
+    // but unverified extracts this is the whole detection cost.
+    let eligible = |cand: &recall::Candidate, excluded: &HashSet<EntryId>| {
+        cand.state == StateAt::Verified
+            && !revised.contains(&cand.entry.id)
+            && detectable(&cand.entry)
+            && cand.entry.verification == VerificationState::Verified
+            && !excluded.contains(&cand.entry.id)
+    };
+    let any_eligible = pool.iter().any(|c| excluded.iter().any(|x| eligible(c, x)));
+    if !any_eligible {
+        return Ok(vec![]);
+    }
     let stats = recall::CorpusStats::new(pool.iter().map(|c| &c.entry));
 
     // Semantic vectors: every pool text, then one per new claim — a single
@@ -587,13 +666,6 @@ pub fn detect_many(
     let mut records = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
         let excluded = &excluded[i];
-        let eligible = |cand: &recall::Candidate| {
-            cand.state == StateAt::Verified
-                && !revised.contains(&cand.entry.id)
-                && detectable(&cand.entry)
-                && cand.entry.verification == VerificationState::Verified
-                && !excluded.contains(&cand.entry.id)
-        };
 
         let mut signals_by_id: BTreeMap<EntryId, Vec<ConflictSignal>> = BTreeMap::new();
         // Record order for the candidate cap: keyword hits by relevance
@@ -611,7 +683,7 @@ pub fn detect_many(
         q_tokens.dedup();
         let mut scored: Vec<(f64, &recall::Candidate)> = pool
             .iter()
-            .filter(|c| eligible(c))
+            .filter(|c| eligible(c, excluded))
             .map(|c| {
                 (
                     recall::score(&c.entry, &q_tokens, &stats)
@@ -642,7 +714,7 @@ pub fn detect_many(
                     .into_iter()
                     .collect();
             for (cand, vec) in pool.iter().zip(&vectors[..pool.len()]) {
-                if !eligible(cand) {
+                if !eligible(cand, excluded) {
                     continue;
                 }
                 if embedding::cosine(qv, vec) < SEMANTIC_CONFLICT_FLOOR {
@@ -861,6 +933,48 @@ mod tests {
             queue.require(rec.id).unwrap().status,
             ConflictStatus::Dismissed
         );
+    }
+
+    #[test]
+    fn record_many_dedupes_batch_and_queue_pairs_under_one_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Conflicts::open(dir.path().join(".conflicts"));
+
+        let mut rec = ConflictRecord {
+            id: ConflictId::generate(),
+            layer: "codex".into(),
+            new_entry: EntryId::generate(),
+            conflicting_entry: EntryId::generate(),
+            new_summary: "sessions use postgres".into(),
+            conflicting_summary: "sessions use mysql".into(),
+            signals: vec![ConflictSignal::SharedFrame],
+            detected_at: Utc::now(),
+            status: ConflictStatus::Open,
+            resolved_by: None,
+            resolved_at: None,
+        };
+        let results = queue.record_many(&[rec.clone(), rec.clone()]).unwrap();
+        // The same pair inside one batch dedupes to the first write:
+        // result[0] is New, result[1] resolves to the record just
+        // persisted, exactly as a second `record` call would answer.
+        assert!(matches!(results[0], RecordOutcome::New));
+        assert!(
+            matches!(&results[1], RecordOutcome::Existing(e) if e.id == rec.id),
+            "{:?}",
+            results[1]
+        );
+        assert_eq!(queue.list().unwrap().len(), 1);
+
+        // A pair already on the queue returns the existing record without
+        // writing a second file.
+        rec.id = ConflictId::generate();
+        let results = queue.record_many(std::slice::from_ref(&rec)).unwrap();
+        assert_eq!(results.len(), 1);
+        let RecordOutcome::Existing(existing) = &results[0] else {
+            panic!("expected Existing, got {:?}", results[0]);
+        };
+        assert_ne!(existing.id, rec.id);
+        assert_eq!(queue.list().unwrap().len(), 1);
     }
 
     #[test]

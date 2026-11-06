@@ -5,10 +5,10 @@
 //! entry, or a file — and *proposes* claims. Proposals never write
 //! themselves: [`gate`] applies every mitigation from
 //! docs/EXTRACTION-THREAT-MODEL.md before an [`Entry`] exists, and the write
-//! itself lands through `Gungnir::add_inner`, so evidence refs, write-time
-//! validation, journal-only placement, and conflict detection are exactly the
-//! manual path's. Nothing about an extracted entry is trusted a human entry
-//! is not.
+//! itself lands through the same validated `Store::create_with` path as a
+//! manual `add`, so evidence refs, write-time validation, journal-only
+//! placement, and conflict detection are exactly the manual path's.
+//! Nothing about an extracted entry is trusted a human entry is not.
 //!
 //! Backends are pluggable. `GUNGNIR_EXTRACTOR` names a command that reads the
 //! hardened prompt + transcript on stdin and answers with a JSON array of
@@ -36,6 +36,12 @@
 //! What survives lands in the agent's Journal only, `unverified`,
 //! `source_tool: extract`, `extracted_by: <backend>`. Promotion to Codex and
 //! verification stay deliberate acts through the ordinary verbs.
+//!
+//! A run writes its accepted entries first, then runs one batched
+//! conflict-detection pass over them — the same `detect_many` `end_session`
+//! promotions use. Per-write rescans made ingest quadratic on large
+//! journals; batching keeps the candidates identical, because a run's own
+//! writes are `unverified` and only live verified facts are candidates.
 
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -45,7 +51,7 @@ use serde::Deserialize;
 use sha2::Digest as _;
 
 use crate::entry::{Entry, EntryKind, Evidence};
-use crate::gungnir::{ExtractOutcome, Gungnir, Layer};
+use crate::gungnir::{ExtractOutcome, Gungnir};
 use crate::id::EntryId;
 use crate::validate::{self, MAX_SUMMARY_LEN};
 use crate::{Error, Result};
@@ -721,6 +727,53 @@ impl Gungnir {
         }
     }
 
+    /// The whole extract verb in one pass: resolve `source` into units and
+    /// run the gate, sharing a single journal scan between archive
+    /// resolution and write dedupe. `extract_units` + `extract` on a
+    /// session source parses the journal twice per call; this costs one —
+    /// the difference that keeps `--from` ingest linear in journal size
+    /// per call rather than paying N scans per session.
+    pub fn extract_source(
+        &self,
+        source: &ExtractSource,
+        agent: &str,
+        extractor: &dyn Extractor,
+        opts: &ExtractOptions,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> Result<ExtractOutcome> {
+        let ExtractSource::Session { id } = source else {
+            let units = self.extract_units(source, agent)?;
+            return self.extract(&units, agent, extractor, opts, embedder);
+        };
+        let journal = self.journal(agent)?;
+        let scan = journal.scan()?;
+        // Same fail-closed rule as find_archive: an unreadable journal file
+        // might be the archive itself, so "no archive" is never reported
+        // over a corrupt layer.
+        if let Some(bad) = scan.skipped.first() {
+            return Err(Error::Invalid(format!(
+                "journal for {agent} has unreadable entry {}: {}; cannot confirm whether session {id} is archived",
+                bad.path.display(),
+                bad.error
+            )));
+        }
+        let Some(archive) = scan
+            .entries
+            .iter()
+            .find(|e| e.kind == EntryKind::Session && e.session_id.as_deref() == Some(id.as_str()))
+        else {
+            return Err(if self.session_dir_exists(id) {
+                Error::Invalid(format!(
+                    "session {id} is still live; extract its archive after end_session"
+                ))
+            } else {
+                Error::Invalid(format!("no session archive or live scratch for '{id}'"))
+            });
+        };
+        let units = archive_units(archive);
+        self.extract_inner(&units, agent, scan.entries, extractor, opts, embedder)
+    }
+
     /// Run `extractor` over `units`, gate its proposals, and write the
     /// survivors into the agent's Journal through the ordinary `add` path —
     /// which is where conflict candidates come from. `dry_run` reports the
@@ -734,8 +787,24 @@ impl Gungnir {
         opts: &ExtractOptions,
         embedder: Option<&dyn crate::embedding::Embedder>,
     ) -> Result<ExtractOutcome> {
+        let entries = self.journal(agent)?.entries()?;
+        self.extract_inner(units, agent, entries, extractor, opts, embedder)
+    }
+
+    /// `extract` over a journal snapshot the caller already loaded —
+    /// `extract_source` resolves the archive and the dedupe set from the
+    /// same scan it passes here. `entries` is the journal's full contents:
+    /// it drives `existing`/`known`, then rides into the detection pool.
+    fn extract_inner(
+        &self,
+        units: &[TranscriptUnit],
+        agent: &str,
+        mut entries: Vec<Entry>,
+        extractor: &dyn Extractor,
+        opts: &ExtractOptions,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> Result<ExtractOutcome> {
         let journal = self.journal(agent)?;
-        let entries = journal.entries()?;
         let existing: HashSet<(String, String)> = entries
             .iter()
             .map(|e| (e.summary.clone(), e.body.clone()))
@@ -748,9 +817,9 @@ impl Gungnir {
         // already private, and manual notes it contains are none of the
         // backend's business.
         let known: Vec<(String, String)> = entries
-            .into_iter()
+            .iter()
             .filter(|e| e.source_tool.as_deref() == Some(SOURCE_TOOL))
-            .map(|e| (e.summary, e.body))
+            .map(|e| (e.summary.clone(), e.body.clone()))
             .collect();
         // The reply bound is at least the default, never the write cap:
         // the write bound lives in the gate, and a larger offer window
@@ -773,26 +842,56 @@ impl Gungnir {
             accepted: Vec::new(),
             dry_run: opts.dry_run,
         };
+        if opts.dry_run {
+            outcome.accepted = accepted.into_iter().map(|e| (e, Vec::new())).collect();
+            return Ok(outcome);
+        }
+        // Persist the batch first, then scan once: detection needs the
+        // writes on disk, but a per-write `add_inner` rescan made ingest
+        // quadratic (O(writes × journal + codex) file parses per run).
+        // `detect_many` is the same batched scan `end_session` promotions
+        // use, so conflict candidates are unchanged — a run's writes are
+        // unverified, and only verified facts are candidates.
+        let mut written = Vec::with_capacity(accepted.len());
+        let mut write_error = None;
         for entry in accepted {
-            if opts.dry_run {
-                outcome.accepted.push((entry, Vec::new()));
-                continue;
-            }
-            match self.add_inner(entry.clone(), Layer::Journal { agent }, embedder) {
-                Ok(w) => {
-                    outcome.warnings.extend(w.warnings);
-                    outcome.accepted.push((entry, w.conflicts));
-                }
+            match journal.create_with(&entry, &|id| self.exists_anywhere(id)) {
+                Ok(()) => written.push(entry),
                 // The gate already ran validate_entry, so a late Invalid
                 // means the store moved under us — still a verdict, not a
-                // crash. I/O errors propagate.
+                // crash. I/O errors propagate — but only after the prefix
+                // that did land gets its conflict scan: every persisted
+                // claim must be scanned or its candidates are lost (a
+                // retry dedupes on summary+body and never re-scans it).
                 Err(e @ Error::Invalid(_)) => outcome.refused.push(Refusal {
                     summary: entry.summary.clone(),
                     reason: format!("write rejected: {e}"),
                     sensitive: false,
                 }),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    write_error = Some(e);
+                    break;
+                }
             }
+        }
+        // `entries` is the dedupe snapshot from before the writes; adding
+        // the batch gives the journal scope its detection pool without a
+        // second full parse of the layer the run just filled.
+        entries.extend(written.iter().cloned());
+        let (conflicts, warnings) =
+            self.scan_and_record_over(&journal, &written, Some(entries), embedder);
+        outcome.warnings.extend(warnings);
+        let mut by_entry: std::collections::HashMap<EntryId, Vec<_>> =
+            std::collections::HashMap::new();
+        for record in conflicts {
+            by_entry.entry(record.new_entry).or_default().push(record);
+        }
+        for entry in written {
+            let records = by_entry.remove(&entry.id).unwrap_or_default();
+            outcome.accepted.push((entry, records));
+        }
+        if let Some(e) = write_error {
+            return Err(e);
         }
         Ok(outcome)
     }
