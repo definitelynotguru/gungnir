@@ -1052,15 +1052,12 @@ fn punctuation_only_agent_never_escapes_to_journal_root() {
 
     for name in ["///", "---", "...", ""] {
         let store = g.journal(name).unwrap();
-        // Compare components, not paths: macOS canonicalizes /var →
-        // /private/var inside tempdir roots.
-        let mut parts = store
-            .root()
-            .iter()
-            .map(|c| c.to_string_lossy().into_owned());
+        // Strip the (canonicalized) store root and compare the remainder:
+        // the dir must be journal/anon inside THIS store, not merely a
+        // path that happens to end in journal/anon.
         assert_eq!(
-            (parts.next_back(), parts.next_back()),
-            (Some("anon".to_string()), Some("journal".to_string())),
+            store.root().strip_prefix(g.root()),
+            Ok(std::path::Path::new("journal").join("anon").as_path()),
             "{name:?} must land in journal/anon, not {:?}",
             store.root()
         );
