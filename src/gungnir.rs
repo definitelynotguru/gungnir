@@ -1080,7 +1080,7 @@ impl Gungnir {
         let mut entry = store.require(id)?;
         for path in evidence_paths {
             let raw = std::fs::read(path)?;
-            let (recorded, digest) = self.file_evidence_digest(path)?;
+            let (recorded, digest) = self.file_evidence_parts(path, &raw);
             let text = String::from_utf8_lossy(&raw);
             let text = text.trim_start();
             let mut end = validate::MAX_EXCERPT_LEN.min(text.len());

@@ -6,8 +6,6 @@ mitigations below shipped with the feature and are covered by
 the reason for its shape.
 
 Auto-extraction lets a configured LLM watch session transcripts and write
-
-Auto-extraction lets a configured LLM watch session transcripts and write
 facts into Gungnir automatically. It removes the discipline tax ("remember to
 call `add`") and it introduces three real attack surfaces into a system whose
 entire value proposition is trustworthy memory.

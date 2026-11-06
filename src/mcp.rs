@@ -64,14 +64,24 @@ fn format_extract(outcome: &crate::ExtractOutcome) -> String {
         return "nothing to extract".into();
     }
     let mut out = String::new();
+    let verb = if outcome.dry_run {
+        "would write"
+    } else {
+        "wrote"
+    };
     for (entry, _) in &outcome.accepted {
         out.push_str(&format!(
-            "wrote {}  \"{}\"  (unverified, extracted)\n",
+            "{verb} {}  \"{}\"  (unverified, extracted)\n",
             entry.id, entry.summary
         ));
     }
     for r in &outcome.refused {
-        out.push_str(&format!("refused \"{}\" — {}\n", r.summary, r.reason));
+        let text = if r.sensitive {
+            "[redacted]"
+        } else {
+            &r.summary
+        };
+        out.push_str(&format!("refused \"{text}\" — {}\n", r.reason));
     }
     if outcome.skipped > 0 {
         out.push_str(&format!(
@@ -260,6 +270,7 @@ impl Server {
                     "transcript": {"type": "string"},
                     "agent": {"type": "string"},
                     "allow_unbacked": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
                     "cap": {"type": "integer"},
                     "semantic": {"type": "boolean"}
                 }), &["agent"])
@@ -384,7 +395,17 @@ impl Server {
                 } else {
                     out.hits
                         .iter()
-                        .map(|h| format!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary))
+                        .map(|h| {
+                            let extracted = if h.entry.source_tool.is_some() {
+                                "  [extracted]"
+                            } else {
+                                ""
+                            };
+                            format!(
+                                "{:.3}  {}  {}{}",
+                                h.score, h.entry.id, h.entry.summary, extracted
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
@@ -604,7 +625,10 @@ impl Server {
                         .and_then(Value::as_u64)
                         .map(|c| (c as usize).clamp(1, 1000))
                         .unwrap_or(crate::extract::DEFAULT_CAP),
-                    dry_run: false,
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 };
                 let outcome = if self.semantic_enabled(args)? {
                     #[cfg(feature = "embed")]

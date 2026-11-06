@@ -164,11 +164,13 @@ pub enum ExtractSource {
 
 /// A backend that turns transcript units into proposals. Implement this for
 /// an LLM, a paraphrase service, or anything else — the gate applies the
-/// same way to every implementation.
+/// same way to every implementation. `cap` is the caller's write bound:
+/// backends should bound their reply to it so the gate's skip count means
+/// "over proposal volume", not "the backend lied about how much it found".
 pub trait Extractor: Send + Sync {
     /// Provenance marker recorded in `extracted_by`.
     fn backend(&self) -> &str;
-    fn propose(&self, units: &[TranscriptUnit]) -> Result<Vec<Proposal>>;
+    fn propose(&self, units: &[TranscriptUnit], cap: usize) -> Result<Vec<Proposal>>;
 }
 
 /// Resolve the configured backend. `None` is the no-op case: no
@@ -193,12 +195,16 @@ impl Extractor for Heuristic {
         "heuristic"
     }
 
-    fn propose(&self, units: &[TranscriptUnit]) -> Result<Vec<Proposal>> {
+    fn propose(&self, units: &[TranscriptUnit], _cap: usize) -> Result<Vec<Proposal>> {
         Ok(units
             .iter()
             .enumerate()
             .filter_map(|(i, u)| {
-                let summary = claim_line(&u.text)?;
+                // First line only: the whole unit still lands as body, but
+                // the summary must stay a single printable line or the
+                // write-time validation the proposal just passed would
+                // reject it at the store.
+                let summary = claim_line(u.text.lines().next().unwrap_or_default())?;
                 Some(Proposal {
                     summary: summary.to_string(),
                     body: u.text.clone(),
@@ -264,9 +270,9 @@ impl Extractor for CommandExtractor {
         &self.command
     }
 
-    fn propose(&self, units: &[TranscriptUnit]) -> Result<Vec<Proposal>> {
+    fn propose(&self, units: &[TranscriptUnit], cap: usize) -> Result<Vec<Proposal>> {
         let input = serde_json::json!({
-            "instruction": PROMPT.replace("{cap}", &DEFAULT_CAP.to_string()),
+            "instruction": PROMPT.replace("{cap}", &cap.to_string()),
             "transcript": units
                 .iter()
                 .enumerate()
@@ -312,17 +318,23 @@ impl Extractor for CommandExtractor {
 
 /// One proposal the gate refused, with the reason a reviewer needs. These
 /// are the extraction path's abstention signal — refusals are data, printed
-/// on every surface rather than swallowed.
+/// on every surface rather than swallowed. `sensitive` marks refusals whose
+/// text may itself carry the secret that tripped the gate; surfaces
+/// redact the summary for those rather than echoing it.
 #[derive(Clone, Debug)]
 pub struct Refusal {
     pub summary: String,
     pub reason: String,
+    /// The refusal text itself may contain secret material.
+    pub sensitive: bool,
 }
 
-/// Gate verdict for a single proposal.
+/// Gate verdict for a single proposal. `Refuse(reason, sensitive)` —
+/// sensitive verdicts carry text that may hold the very secret the gate
+/// rejected, so surfaces redact the summary for them.
 enum Verdict {
     Accept,
-    Refuse(String),
+    Refuse(String, bool),
 }
 
 /// Evaluate `proposal` against the gate: evidence backing, the secret
@@ -331,59 +343,100 @@ enum Verdict {
 fn evaluate(units: &[TranscriptUnit], proposal: &Proposal, opts: &ExtractOptions) -> Verdict {
     let summary = proposal.summary.trim();
     if summary.is_empty() {
-        return Verdict::Refuse("proposal carries no claim".into());
+        return Verdict::Refuse("proposal carries no claim".into(), false);
     }
     if summary.chars().count() > MAX_SUMMARY_LEN {
-        return Verdict::Refuse(format!(
-            "summary is {} chars; the schema cap is {MAX_SUMMARY_LEN}",
-            summary.chars().count()
-        ));
+        return Verdict::Refuse(
+            format!(
+                "summary is {} chars; the schema cap is {MAX_SUMMARY_LEN}",
+                summary.chars().count()
+            ),
+            false,
+        );
     }
     for &i in &proposal.cites {
         if i >= units.len() {
-            return Verdict::Refuse(format!(
-                "cites transcript unit {i}, out of range ({} units)",
-                units.len()
-            ));
+            return Verdict::Refuse(
+                format!(
+                    "cites transcript unit {i}, out of range ({} units)",
+                    units.len()
+                ),
+                false,
+            );
         }
     }
-    let evidence: Vec<Evidence> = proposal
-        .cites
+    let cited: Vec<&TranscriptUnit> = proposal.cites.iter().map(|&i| &units[i]).collect();
+    let evidence: Vec<Evidence> = cited
         .iter()
-        .flat_map(|&i| units[i].evidence.iter().cloned())
+        .flat_map(|u| u.evidence.iter().cloned())
         .collect();
     if evidence.is_empty() && !opts.allow_unbacked {
         return Verdict::Refuse(
             "no backing evidence; refused (unverified needs a durable citation, or --allow-unbacked)"
                 .into(),
+            false,
         );
     }
-    // The denylist guards every field that lands in a durable file —
-    // including cited transcript text, which becomes the evidence excerpt.
+    // The denylist guards every field that lands in a durable file: the
+    // proposal's own text, its entity names, cited transcript text, and the
+    // evidence excerpts copied verbatim onto the new entry.
     let scan_target = format!("{}\n{}", proposal.summary, proposal.body);
     if let Some(hit) = detect_secret(&scan_target) {
-        return Verdict::Refuse(format!("looks like a secret ({hit})"));
+        return Verdict::Refuse(format!("looks like a secret ({hit})"), true);
     }
-    for &i in &proposal.cites {
-        if let Some(hit) = detect_secret(&units[i].text) {
-            return Verdict::Refuse(format!("cited transcript looks like a secret ({hit})"));
+    for name in &proposal.entities {
+        if let Some(hit) = detect_secret(name) {
+            return Verdict::Refuse(format!("entity name looks like a secret ({hit})"), true);
+        }
+    }
+    for u in &cited {
+        if let Some(hit) = detect_secret(&u.text) {
+            return Verdict::Refuse(
+                format!("cited transcript looks like a secret ({hit})"),
+                true,
+            );
+        }
+        for ev in &u.evidence {
+            if let Evidence::File { excerpt, .. } = ev {
+                if let Some(hit) = detect_secret(excerpt) {
+                    return Verdict::Refuse(
+                        format!("cited excerpt looks like a secret ({hit})"),
+                        true,
+                    );
+                }
+            }
         }
     }
     if let Some(hit) = detect_directive(&scan_target) {
-        return Verdict::Refuse(format!("looks like an injected instruction ({hit})"));
+        return Verdict::Refuse(format!("looks like an injected instruction ({hit})"), false);
+    }
+    // Cited units are content the claim derives from — an instruction
+    // hiding in one is exactly the A1 attack. Scanning cited text stops a
+    // paraphrasing backend from laundering the directive into a claim.
+    for u in &cited {
+        if let Some(hit) = detect_directive(&u.text) {
+            return Verdict::Refuse(
+                format!("cited transcript carries an injected instruction ({hit})"),
+                false,
+            );
+        }
     }
     Verdict::Accept
 }
 
 /// The gate, applied to a backend's proposals. Returns the entries to write
-/// (built but not persisted), the refusals to report, and how many
-/// proposals the volume cap or run/store dedupe skipped.
+/// (built and validated but not persisted), the refusals to report, and how
+/// many proposals the volume cap or run/store dedupe skipped. Every
+/// candidate passes the same `validate_entry` the write runs, so the cap
+/// counts only entries that can actually land and a dry run's "would
+/// write" means "will write".
 fn gate(
     units: &[TranscriptUnit],
     proposals: Vec<Proposal>,
     agent: &str,
     backend: &str,
     existing: &HashSet<(String, String)>,
+    exists: validate::Exists<'_>,
     opts: &ExtractOptions,
 ) -> (Vec<Entry>, Vec<Refusal>, usize) {
     let mut accepted = Vec::new();
@@ -392,15 +445,24 @@ fn gate(
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for proposal in proposals {
         match evaluate(units, &proposal, opts) {
-            Verdict::Refuse(reason) => refused.push(Refusal {
+            Verdict::Refuse(reason, sensitive) => refused.push(Refusal {
                 summary: validate::one_line(proposal.summary.trim()),
                 reason,
+                sensitive,
             }),
             Verdict::Accept => {
                 let summary = proposal.summary.trim().to_string();
+                // Normalize the way the store does on write and load —
+                // the dedupe key must match what a re-run reads back, or
+                // idempotency breaks on trailing whitespace.
+                let body = proposal
+                    .body
+                    .trim_start_matches('\n')
+                    .trim_end()
+                    .to_string();
                 // Idempotency is the volume mitigation's other half: a
                 // re-run over the same transcript must not double-write.
-                let key = (summary.clone(), proposal.body.clone());
+                let key = (summary.clone(), body.clone());
                 if accepted.len() >= opts.cap
                     || !seen.insert(key.clone())
                     || existing.contains(&key)
@@ -409,7 +471,7 @@ fn gate(
                     continue;
                 }
                 let mut entry = Entry::new(agent, proposal.kind.kind(), summary);
-                entry.body = proposal.body.clone();
+                entry.body = body;
                 entry.entities = proposal.entities.clone();
                 entry.source_tool = Some(SOURCE_TOOL.to_string());
                 entry.extracted_by = Some(backend.to_string());
@@ -424,6 +486,17 @@ fn gate(
                     }
                 }
                 entry.evidence = evidence;
+                // Same validation the write itself runs. A shape error is
+                // a verdict, not a skipped write: refusing here keeps the
+                // cap honest and makes --dry-run truthful.
+                if let Err(e) = validate::validate_entry(&entry, exists, true) {
+                    refused.push(Refusal {
+                        summary: entry.summary.clone(),
+                        reason: format!("write rejected: {e}"),
+                        sensitive: false,
+                    });
+                    continue;
+                }
                 accepted.push(entry);
             }
         }
@@ -555,12 +628,23 @@ impl Gungnir {
             }
             ExtractSource::Entry { id } => {
                 let store = self.locate(*id)?.ok_or(Error::NotFound(*id))?;
+                let journal_root = self.root().join(crate::layout::JOURNAL);
                 if store
                     .root()
                     .starts_with(self.root().join(crate::layout::SCRATCH))
                 {
                     return Err(Error::Invalid(
                         "scratch entries are ephemeral and cannot back claims; extract the journal archive instead"
+                            .into(),
+                    ));
+                }
+                // The journal privacy boundary holds here too: a peer's
+                // journal is not transcript input for your extraction.
+                if store.root().starts_with(&journal_root)
+                    && store.root() != journal_root.join(agent)
+                {
+                    return Err(Error::Invalid(
+                        "extraction reads the caller's journal and the codex, not a peer's journal"
                             .into(),
                     ));
                 }
@@ -577,10 +661,11 @@ impl Gungnir {
                 })
             }
             ExtractSource::File { path } => {
-                let raw = std::fs::read_to_string(path).map_err(|e| {
+                let bytes = std::fs::read(path).map_err(|e| {
                     Error::Invalid(format!("cannot read transcript {}: {e}", path.display()))
                 })?;
-                let (recorded, sha256) = self.file_evidence_digest(path)?;
+                let (recorded, sha256) = self.file_evidence_parts(path, &bytes);
+                let raw = String::from_utf8_lossy(&bytes);
                 Ok(raw
                     .lines()
                     .filter(|l| !l.trim().is_empty())
@@ -618,7 +703,7 @@ impl Gungnir {
         opts: &ExtractOptions,
         embedder: Option<&dyn crate::embedding::Embedder>,
     ) -> Result<ExtractOutcome> {
-        let proposals = extractor.propose(units)?;
+        let proposals = extractor.propose(units, opts.cap)?;
         let journal = self.journal(agent)?;
         let existing: HashSet<(String, String)> = journal
             .entries()?
@@ -631,6 +716,7 @@ impl Gungnir {
             agent,
             extractor.backend(),
             &existing,
+            &|id| self.exists_anywhere(id),
             opts,
         );
         let mut outcome = ExtractOutcome {
@@ -651,12 +737,13 @@ impl Gungnir {
                     outcome.warnings.extend(w.warnings);
                     outcome.accepted.push((entry, w.conflicts));
                 }
-                // A gated entry failing write-time validation is a verdict,
-                // not a crash: report it with the refusals. I/O errors
-                // still propagate.
+                // The gate already ran validate_entry, so a late Invalid
+                // means the store moved under us — still a verdict, not a
+                // crash. I/O errors propagate.
                 Err(e @ Error::Invalid(_)) => outcome.refused.push(Refusal {
                     summary: entry.summary.clone(),
                     reason: format!("write rejected: {e}"),
+                    sensitive: false,
                 }),
                 Err(e) => return Err(e),
             }
@@ -673,18 +760,18 @@ impl Gungnir {
         self.session_dir(session_id).exists()
     }
 
-    /// Hash `path` and record it the way `verify --evidence` does: store
-    /// root-relative when the file lives under the root, absolute
-    /// otherwise.
-    pub(crate) fn file_evidence_digest(&self, path: &Path) -> Result<(String, String)> {
-        let raw = std::fs::read(path)?;
-        let digest = format!("{:x}", sha2::Sha256::digest(&raw));
+    /// Evidence fields for `path` given bytes the caller already read —
+    /// hashing caller-provided bytes keeps excerpt and digest describing
+    /// one snapshot of the file. The recorded path is store root-relative
+    /// when the file lives under the root, absolute otherwise.
+    pub(crate) fn file_evidence_parts(&self, path: &Path, bytes: &[u8]) -> (String, String) {
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let recorded = canonical
             .strip_prefix(self.root())
             .map(|p| p.to_path_buf())
             .unwrap_or(canonical);
-        Ok((recorded.display().to_string(), digest))
+        (recorded.display().to_string(), digest)
     }
 }
 
@@ -745,7 +832,7 @@ mod tests {
         let p = proposal("an observation", vec![0]);
         assert!(matches!(
             evaluate(&units, &p, &ExtractOptions::default()),
-            Verdict::Refuse(_)
+            Verdict::Refuse(_, _)
         ));
         let opts = ExtractOptions {
             allow_unbacked: true,
@@ -760,7 +847,7 @@ mod tests {
         let p = proposal("a", vec![7]);
         assert!(matches!(
             evaluate(&units, &p, &ExtractOptions::default()),
-            Verdict::Refuse(_)
+            Verdict::Refuse(_, _)
         ));
     }
 
@@ -770,13 +857,13 @@ mod tests {
         let honest = proposal("rotated credentials weekly", vec![0]);
         assert!(matches!(
             evaluate(&units, &honest, &ExtractOptions::default()),
-            Verdict::Refuse(refusal) if refusal.contains("secret")
+            Verdict::Refuse(reason, _) if reason.contains("secret")
         ));
         let units = vec![unit("clean transcript", true)];
         let leaking = proposal("note: api_key=abcdef123456", vec![0]);
         assert!(matches!(
             evaluate(&units, &leaking, &ExtractOptions::default()),
-            Verdict::Refuse(_)
+            Verdict::Refuse(_, _)
         ));
     }
 
@@ -791,7 +878,7 @@ mod tests {
             vec![0],
         );
         match evaluate(&units, &p, &ExtractOptions::default()) {
-            Verdict::Refuse(reason) => assert!(reason.contains("injected"), "{reason}"),
+            Verdict::Refuse(reason, _) => assert!(reason.contains("injected"), "{reason}"),
             Verdict::Accept => panic!("injected instruction accepted"),
         }
     }
@@ -803,8 +890,15 @@ mod tests {
             .map(|i| proposal(&format!("claim {i}"), vec![i]))
             .collect();
         let opts = ExtractOptions::default();
-        let (accepted, refused, skipped) =
-            gate(&units, proposals, "a", "heuristic", &HashSet::new(), &opts);
+        let (accepted, refused, skipped) = gate(
+            &units,
+            proposals,
+            "a",
+            "heuristic",
+            &HashSet::new(),
+            &|_| Ok(true),
+            &opts,
+        );
         assert_eq!(accepted.len(), DEFAULT_CAP);
         assert_eq!(skipped, 10);
         assert!(refused.is_empty());
@@ -827,6 +921,7 @@ mod tests {
             "a",
             "heuristic",
             &HashSet::new(),
+            &|_| Ok(true),
             &ExtractOptions::default(),
         );
         assert_eq!(accepted.len(), 1);
@@ -844,6 +939,7 @@ mod tests {
             "a",
             "heuristic",
             &existing,
+            &|_| Ok(true),
             &ExtractOptions::default(),
         );
         assert!(accepted.is_empty());
@@ -892,7 +988,10 @@ mod tests {
     #[test]
     fn command_backend_reports_spawn_and_exit_failures() {
         let bad = CommandExtractor::new("definitely-not-a-real-gungnir-command-xyz");
-        let err = bad.propose(&[unit("a", true)]).unwrap_err().to_string();
+        let err = bad
+            .propose(&[unit("a", true)], DEFAULT_CAP)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("did not start") || err.contains("exited"),
             "{err}"
@@ -905,7 +1004,7 @@ mod tests {
             unit("- observation: postgres replaced mysql [succeeded]", true),
             unit("- attempt: tried index hint [failed]", true),
         ];
-        let proposals = Heuristic.propose(&units).unwrap();
+        let proposals = Heuristic.propose(&units, DEFAULT_CAP).unwrap();
         assert_eq!(proposals.len(), 2);
         assert_eq!(proposals[0].summary, "postgres replaced mysql");
         assert_eq!(proposals[1].summary, "tried index hint");

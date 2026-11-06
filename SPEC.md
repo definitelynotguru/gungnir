@@ -241,8 +241,10 @@ specifies. Source is `--from <session-id-or-entry>`, `--file <path>`, or
   `unverified`, `source_tool: extract`, `extracted_by: <backend>` — and run
   conflict detection like any claim write. Nothing the extractor produces
   is ever born verified or written to the codex.
-- `ls --unreviewed` and `review` flag extracted entries (`[extracted]`);
-  `log`/`blame`/`show` render `origin: extract via <backend>`.
+- Machine origin is visible everywhere an agent reads: `ls --unreviewed`
+  and `review` flag extracted entries (`[extracted]`), `get`/`log`/`blame`
+  render `origin: extract via <backend>`, briefings tag hits `extracted`,
+  and recall lines carry `[extracted]` on CLI and MCP.
 
 ## Surfaces
 
