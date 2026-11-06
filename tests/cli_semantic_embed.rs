@@ -41,6 +41,32 @@ fn recall_semantic_reaches_hybrid_search() {
 }
 
 #[test]
+fn extract_semantic_dispatches_past_the_feature_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    // No backend is extract's own clean no-op; what matters is --semantic
+    // no longer errors on this build — the flag reached dispatch, which
+    // requires the test embedder where the real model would otherwise
+    // init.
+    let out = Command::new(env!("CARGO_BIN_EXE_gungnir"))
+        .args([
+            "--root",
+            dir.path().to_str().unwrap(),
+            "extract",
+            "--agent",
+            "ops",
+            "--text",
+            "ran migrations",
+            "--semantic",
+        ])
+        .env("GUNGNIR_TEST_EMBEDDER", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("extraction unavailable"), "{stdout}");
+}
+
+#[test]
 fn brief_semantic_reaches_hybrid_search() {
     let dir = tempfile::tempdir().unwrap();
     let g = gungnir::Gungnir::open(dir.path()).unwrap();

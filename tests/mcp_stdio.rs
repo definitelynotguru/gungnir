@@ -749,9 +749,7 @@ fn mcp_brief_require_verified_hides_unverified_hits() {
 #[test]
 fn mcp_semantic_true_errors_without_the_embed_feature() {
     let dir = tempfile::tempdir().unwrap();
-    // extract no-ops on an unset backend before its semantic gate, so the
-    // shipped `heuristic` backend is what lets the call reach it.
-    let mut p = Proc::spawn_env(dir.path(), &[("GUNGNIR_EXTRACTOR", "heuristic")]);
+    let mut p = Proc::spawn(dir.path());
     p.rpc(&msg(1, "initialize", serde_json::json!({})));
 
     for (id, (name, arguments)) in [
@@ -801,8 +799,8 @@ fn mcp_semantic_true_reaches_hybrid_search() {
     g.codex().unwrap().create(&e).unwrap();
     drop(g);
 
-    // `heuristic` keeps extract offline while letting its call reach the
-    // semantic arm (an unset backend no-ops earlier).
+    // `heuristic` is the shipped offline backend; extract needs one to
+    // reach its write path at all.
     let mut p = Proc::spawn_env(
         dir.path(),
         &[
@@ -821,11 +819,14 @@ fn mcp_semantic_true_reaches_hybrid_search() {
             "brief",
             serde_json::json!({"agent": "ops", "task": "query cache eviction", "semantic": true}),
         ),
-        // semantic:true must reach extract's dispatch without erroring;
-        // `allow_unbacked` admits the literal transcript source.
+        // Every text shares zero tokens with the seed, so the keyword
+        // channel can't reach it. Under Uniform (cosine 1.0) the semantic
+        // channel must: recall/brief surface the entry, and extract's
+        // conflict scan flags the proposed claim against the verified
+        // seed — observable proof the flag dispatched in each arm.
         (
             "extract",
-            serde_json::json!({"agent": "ops", "transcript": "ran migrations",
+            serde_json::json!({"agent": "ops", "transcript": "cache eviction strategy",
                                "allow_unbacked": true, "semantic": true}),
         ),
     ]
@@ -838,10 +839,12 @@ fn mcp_semantic_true_reaches_hybrid_search() {
             serde_json::json!({"name": name, "arguments": arguments}),
         ));
         assert_eq!(r["result"]["isError"], false, "{name}: {r}");
-        if name == "extract" {
-            continue;
-        }
         let text = r["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("postgres pooling limits"), "{name}: {text}");
+        let want = if name == "extract" {
+            "conflict candidate"
+        } else {
+            "postgres pooling limits"
+        };
+        assert!(text.contains(want), "{name}: {text}");
     }
 }
