@@ -428,6 +428,16 @@ fn mcp_stats_reports_counts_and_peer_coverage() {
             Layer::Journal { agent: "watcher" },
         )
         .unwrap();
+        // A corrupt file in a third journal: skipped on the stats scan,
+        // and the diagnostic must not name its partition's agent.
+        let journal = dir.path().join("journal/gremlin");
+        std::fs::create_dir_all(&journal).unwrap();
+        let fake = Entry::new("gremlin", EntryKind::Observation, "corrupt me");
+        std::fs::write(
+            journal.join(format!("{}.md", fake.id)),
+            "---\nunclosed: [list\n---\n",
+        )
+        .unwrap();
     }
 
     let mut p = Proc::spawn(dir.path());
@@ -454,6 +464,10 @@ fn mcp_stats_reports_counts_and_peer_coverage() {
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("codex entries      1"), "{text}");
     assert!(text.contains("journal entries    2"), "{text}");
+    // The corrupt file reports as skipped with the agent name redacted.
+    assert!(text.contains("skipped (unparseable) 1"), "{text}");
+    assert!(text.contains("<peer>"), "{text}");
+    assert!(!text.contains("gremlin"), "{text}");
 
     // topic adds aggregate peer coverage: scout's failed attempt counts,
     // watcher's off-topic journal does not, and no peer text crosses.
@@ -492,6 +506,18 @@ fn mcp_revalidate_reports_drift_and_missing() {
             .unwrap();
         std::fs::write(&adr, "decision: use sqlite").unwrap();
         std::fs::remove_file(&gone).unwrap();
+
+        // A corrupt ULID-named file in a peer journal: unreadable on the
+        // sweep, and its path must not carry the agent's name back across
+        // the wire.
+        let journal = dir.path().join("journal/scout");
+        std::fs::create_dir_all(&journal).unwrap();
+        let fake = gungnir::Entry::new("scout", gungnir::EntryKind::Observation, "corrupt me");
+        std::fs::write(
+            journal.join(format!("{}.md", fake.id)),
+            "---\nunclosed: [list\n---\n",
+        )
+        .unwrap();
     }
 
     let mut p = Proc::spawn(dir.path());
@@ -531,7 +557,8 @@ fn mcp_revalidate_reports_drift_and_missing() {
         "{text}"
     );
 
-    // all sweeps every layer and finds the same two failed checks.
+    // all sweeps every layer: the same two failed checks plus the corrupt
+    // journal file, reported UNREADABLE with its agent segment redacted.
     let r = p.rpc(&msg(
         5,
         "tools/call",
@@ -542,10 +569,13 @@ fn mcp_revalidate_reports_drift_and_missing() {
     ));
     assert_eq!(r["result"]["isError"], false, "{r}");
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("UNREADABLE"), "{text}");
     assert!(
-        text.contains("0 intact, 2 drifted, missing, or unreadable"),
+        text.contains("0 intact, 3 drifted, missing, or unreadable"),
         "{text}"
     );
+    assert!(text.contains("<peer>"), "{text}");
+    assert!(!text.contains("scout"), "{text}");
 
     // Fix the drifted file back and restore the missing one: the entry
     // revalidates clean.
@@ -565,6 +595,45 @@ fn mcp_revalidate_reports_drift_and_missing() {
         text.contains("2 intact, 0 drifted, missing, or unreadable"),
         "{text}"
     );
+}
+
+/// A hand-edited citation hash is free text; one with a multibyte char
+/// crossing byte 8 must render as DRIFT, not panic the server mid-loop.
+#[test]
+fn mcp_revalidate_renders_weird_hash_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let cited = dir.path().join("file.txt");
+    std::fs::write(&cited, "content").unwrap();
+    {
+        let g = gungnir::Gungnir::open(dir.path()).unwrap();
+        let mut e = gungnir::Entry::new("ops", gungnir::EntryKind::Decision, "hand-edited hash");
+        e.evidence.push(gungnir::Evidence::File {
+            path: cited.display().to_string(),
+            excerpt: "content".into(),
+            sha256: "abcdefgéh".into(),
+        });
+        g.codex().unwrap().create(&e).unwrap();
+    }
+
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+    let r = p.rpc(&msg(
+        2,
+        "tools/call",
+        serde_json::json!({"name": "revalidate", "arguments": {"all": true}}),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("DRIFT"), "{text}");
+    assert!(text.contains("expected abcdefg"), "{text}");
+
+    // The server survived: a follow-up call still answers.
+    let r = p.rpc(&msg(
+        3,
+        "tools/call",
+        serde_json::json!({"name": "stats", "arguments": {}}),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
 }
 
 #[test]
