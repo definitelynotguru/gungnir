@@ -206,11 +206,24 @@ impl Gungnir {
     }
 
     pub fn journal(&self, agent: &str) -> Result<Store> {
-        Store::open(
-            self.root
-                .join(JOURNAL)
-                .join(layout::sanitize_component(agent)),
-        )
+        Store::open(self.journal_dir(agent))
+    }
+
+    /// The journal dir for `agent`: today's hashed component name, falling
+    /// back to the pre-hash truncated name so journals written by older
+    /// builds stay readable.
+    pub(crate) fn journal_dir(&self, agent: &str) -> PathBuf {
+        let base = self.root.join(JOURNAL);
+        let dir = base.join(layout::sanitize_component(agent));
+        if dir.is_dir() {
+            return dir;
+        }
+        let legacy = base.join(layout::sanitize_component_legacy(agent));
+        if legacy.is_dir() {
+            legacy
+        } else {
+            dir
+        }
     }
 
     pub fn scratch(&self, session_id: &str) -> Result<Store> {
@@ -437,10 +450,7 @@ impl Gungnir {
     /// scratch cleanup; Store::scan only reads ULID-named .md files, so
     /// dotfiles are invisible to it.
     fn session_lock(&self, agent: &str, session_id: &str) -> Result<(PathBuf, std::fs::File)> {
-        let journal_root = self
-            .root
-            .join(JOURNAL)
-            .join(layout::sanitize_component(agent));
+        let journal_root = self.journal_dir(agent);
         std::fs::create_dir_all(&journal_root)?;
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
@@ -960,7 +970,11 @@ impl Gungnir {
         embedder: Option<&dyn crate::embedding::Embedder>,
     ) -> Result<PeerCoverage> {
         let base = self.root.join(JOURNAL);
-        let exclude = agent.map(layout::sanitize_component);
+        let exclude = agent.and_then(|a| {
+            self.journal_dir(a)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        });
         let q = Query::new(topic, usize::MAX);
         let mut pc = PeerCoverage::default();
         for name in layer_child_names(&base)? {
@@ -1366,7 +1380,11 @@ impl Gungnir {
 
         let journal_base = self.root.join(JOURNAL);
         let agents: Vec<_> = match agent {
-            Some(a) => vec![layout::sanitize_component(a)],
+            Some(a) => vec![self
+                .journal_dir(a)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| layout::sanitize_component(a))],
             None => layer_child_names(&journal_base)?,
         };
         for a in agents {
@@ -1521,7 +1539,9 @@ fn layer_child_names(base: &Path) -> Result<Vec<String>> {
     for dent in std::fs::read_dir(base)? {
         let dent = dent?;
         let name = dent.file_name().to_string_lossy().into_owned();
-        if layout::sanitize_component(&name) != name {
+        // Both eras of sanitized names: today's hashed components and the
+        // legacy truncated-with-remnant shape.
+        if !layout::is_component_dir(&name) {
             continue;
         }
         let meta = match std::fs::symlink_metadata(dent.path()) {
