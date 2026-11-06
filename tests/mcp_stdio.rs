@@ -636,6 +636,66 @@ fn mcp_revalidate_renders_weird_hash_without_panicking() {
     assert_eq!(r["result"]["isError"], false, "{r}");
 }
 
+/// Redaction must anchor at the store root: a root that itself contains a
+/// `journal` component keeps every path outside `<root>/journal/<agent>/`
+/// intact, so reported diagnostics still name real files.
+#[test]
+fn mcp_journal_named_root_keeps_diagnostic_paths_real() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("journal/project");
+    let codex_file;
+    let journal_file;
+    {
+        use gungnir::{Entry, EntryKind};
+        std::fs::create_dir_all(root.join("codex")).unwrap();
+        let fake_c = Entry::new("ops", EntryKind::Observation, "codex corrupt");
+        codex_file = root.join("codex").join(format!("{}.md", fake_c.id));
+        std::fs::write(&codex_file, "---\nunclosed: [list\n---\n").unwrap();
+
+        std::fs::create_dir_all(root.join("journal/scout")).unwrap();
+        let fake_j = Entry::new("scout", EntryKind::Observation, "journal corrupt");
+        journal_file = root.join("journal/scout").join(format!("{}.md", fake_j.id));
+        std::fs::write(&journal_file, "---\nunclosed: [list\n---\n").unwrap();
+    }
+
+    let mut p = Proc::spawn(&root);
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+
+    // The codex diagnostic reports the real, existing path — the `journal`
+    // component inside the root is not touched.
+    let r = p.rpc(&msg(
+        2,
+        "tools/call",
+        serde_json::json!({"name": "stats", "arguments": {}}),
+    ));
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("skipped (unparseable) 2"), "{text}");
+    assert!(
+        text.contains(codex_file.to_str().unwrap()),
+        "{text} vs {}",
+        codex_file.display()
+    );
+
+    // The journal diagnostic redacts only the partition segment.
+    assert!(text.contains("journal/<peer>"), "{text}");
+    assert!(!text.contains("scout"), "{text}");
+
+    // Same anchoring in the revalidate sweep.
+    let r = p.rpc(&msg(
+        3,
+        "tools/call",
+        serde_json::json!({"name": "revalidate", "arguments": {"all": true}}),
+    ));
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(codex_file.to_str().unwrap()),
+        "{text} vs {}",
+        codex_file.display()
+    );
+    assert!(text.contains("journal/<peer>"), "{text}");
+    assert!(!text.contains("scout"), "{text}");
+}
+
 #[test]
 fn mcp_brief_require_verified_hides_unverified_hits() {
     let dir = tempfile::tempdir().unwrap();
