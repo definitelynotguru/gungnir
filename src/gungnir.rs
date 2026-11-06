@@ -337,6 +337,21 @@ impl Gungnir {
         entries: &[Entry],
         embedder: Option<&dyn crate::embedding::Embedder>,
     ) -> (Vec<ConflictRecord>, Vec<String>) {
+        self.scan_and_record_over(home, entries, None, embedder)
+    }
+
+    /// `scan_and_record` with a caller-loaded snapshot of `home`'s
+    /// contents. Batch writes pass the entries they already read plus the
+    /// ones they just persisted, so the home scope's detection pool costs
+    /// no store rescan at all — the quadratic shape per-write detection
+    /// had. Other scopes still scan their own store.
+    pub(crate) fn scan_and_record_over(
+        &self,
+        home: &Store,
+        entries: &[Entry],
+        home_entries: Option<Vec<Entry>>,
+        embedder: Option<&dyn crate::embedding::Embedder>,
+    ) -> (Vec<ConflictRecord>, Vec<String>) {
         let queue = self.conflicts_queue();
         let mut records = Vec::new();
         let mut warnings = Vec::new();
@@ -347,31 +362,51 @@ impl Gungnir {
             Ok(s) => s,
             Err(e) => return (records, vec![format!("conflict detection skipped: {e}")]),
         };
+        let mut home_entries = home_entries;
         for (store, layer) in scopes {
-            let candidates = match conflicts::detect_many(&store, &layer, entries, embedder) {
+            // The snapshot applies only to the store it came from; a
+            // journal write's codex scope scans the codex itself.
+            let candidates = if store.root() == home.root() && home_entries.is_some() {
+                let q = Query::new("", conflicts::CANDIDATE_LIMIT).current();
+                let snapshot = home_entries.take().unwrap();
+                let (pool, revised) = recall::temporal_pool_entries(snapshot, &q);
+                conflicts::detect_many_pool(pool, revised, &layer, entries, embedder)
+            } else {
+                conflicts::detect_many(&store, &layer, entries, embedder)
+            };
+            let candidates = match candidates {
                 Ok(c) => c,
                 Err(e) => {
                     warnings.push(format!("conflict detection on {layer} failed: {e}"));
                     continue;
                 }
             };
-            for rec in candidates {
-                match queue.record(&rec) {
-                    Ok(None) => records.push(rec),
-                    // A record already covers this pair. Surface an open
-                    // one so the outcome reflects the live queue; a
-                    // settled one stays settled — the rescan must not
-                    // reopen a dismissed or resolved disagreement.
-                    Ok(Some(existing)) => {
-                        if existing.status == ConflictStatus::Open {
-                            records.push(existing);
+            // No candidates → no queue touch: the `.conflicts/` dir is
+            // created lazily by recording, never by a scan that found
+            // nothing.
+            if candidates.is_empty() {
+                continue;
+            }
+            match queue.record_many(&candidates) {
+                Ok(results) => {
+                    for (rec, existing) in candidates.into_iter().zip(results) {
+                        match existing {
+                            None => records.push(rec),
+                            // A record already covers this pair. Surface an
+                            // open one so the outcome reflects the live
+                            // queue; a settled one stays settled — the
+                            // rescan must not reopen a dismissed or
+                            // resolved disagreement.
+                            Some(existing) if existing.status == ConflictStatus::Open => {
+                                records.push(existing)
+                            }
+                            Some(_) => {}
                         }
                     }
-                    Err(e) => warnings.push(format!(
-                        "conflict candidate {} could not be recorded: {e}",
-                        rec.id
-                    )),
                 }
+                Err(e) => warnings.push(format!(
+                    "conflict candidates from {layer} could not be recorded: {e}"
+                )),
             }
         }
         (records, warnings)

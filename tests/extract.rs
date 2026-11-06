@@ -155,6 +155,68 @@ fn extracted_claims_feed_conflict_detection() {
 }
 
 #[test]
+fn batched_extract_attributes_each_candidate_to_its_new_entry() {
+    // One run lands several claims; detection is batched behind the batch
+    // write, and each recorded candidate must still name the extracted
+    // entry that raised it — not merely the run's.
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    for claim in ["sessions use mysql", "deploy on fridays"] {
+        let mut verified = Entry::new("builder", EntryKind::Decision, claim);
+        verified.verify("ops", None);
+        g.codex().unwrap().create(&verified).unwrap();
+    }
+    let (_, session_id) =
+        archived_session(&g, &["sessions use postgres", "never deploy on fridays"]);
+    drop(g);
+
+    let (_stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        Some("heuristic"),
+        &["extract", "--from", &session_id, "--agent", "builder"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    // The advisory line pairs each new claim with the verified fact it
+    // disputes — the per-entry attribution the batch preserves.
+    assert!(
+        stderr.contains("\"sessions use postgres\" vs verified \"sessions use mysql\""),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\"never deploy on fridays\" vs verified \"deploy on fridays\""),
+        "{stderr}"
+    );
+
+    let g = Gungnir::open(dir.path()).unwrap();
+    let conflicts = g.open_conflicts().unwrap();
+    assert_eq!(conflicts.len(), 2, "{conflicts:?}");
+    let journal = g.journal("builder").unwrap();
+    for c in &conflicts {
+        assert_eq!(c.layer, "codex");
+        let new = journal.require(c.new_entry).unwrap();
+        assert_eq!(new.source_tool.as_deref(), Some("extract"));
+        assert_eq!(new.summary, c.new_summary);
+    }
+}
+
+#[test]
+fn extract_from_live_session_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let s = g.start_session("builder", "still running").unwrap();
+    g.add_observation(&s, "mid-flight note").unwrap();
+    drop(g);
+
+    let (_, stderr, code) = gungnir_at(
+        dir.path(),
+        Some("heuristic"),
+        &["extract", "--from", &s.id, "--agent", "builder"],
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("still live"), "{stderr}");
+}
+
+#[test]
 fn unbacked_transcript_is_refused_then_admitted_unverified() {
     let dir = tempfile::tempdir().unwrap();
     // Literal --text has no durable citation: the gate refuses by default.

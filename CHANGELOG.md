@@ -173,6 +173,18 @@ All notable changes to Gungnir are documented here. The format follows
   recall in hybrid mode, and returned no `Coverage`, which would have
   disabled the abstention signal. It now shares the keyword path's temporal
   pool and coverage accounting.
+- **`extract` ingest is no longer quadratic.** Every accepted write ran
+  `add_inner`, which rescanned both the journal and the codex for conflict
+  detection — O(writes × store size) file parses per session. A run now
+  writes its batch first, then runs one batched `detect_many` pass (the
+  same one `end_session` promotions use), reusing the journal snapshot it
+  already loaded for dedupe as the detection pool. Candidates are
+  unchanged: a run's own writes are `unverified` and only live verified
+  facts are candidates. `Conflicts::record_many` similarly records a
+  batch's candidates under one queue read instead of one walk per record.
+  The gate also skips corpus stats when no pool entry is candidate-eligible,
+  and `Gungnir::extract_source` resolves a session archive and the dedupe
+  set from one journal scan — the CLI and MCP `extract` verb use it.
 
 ## [0.2.0] - 2026-08-26
 

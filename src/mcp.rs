@@ -725,7 +725,6 @@ impl Server {
                     },
                     _ => unreachable!("exactly one source enforced above"),
                 };
-                let units = self.g.extract_units(&source, agent)?;
                 let opts = crate::extract::ExtractOptions {
                     allow_unbacked: args
                         .get("allow_unbacked")
@@ -741,8 +740,8 @@ impl Server {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                 };
-                let outcome = self.g.extract(
-                    &units,
+                let outcome = self.g.extract_source(
+                    &source,
                     agent,
                     extractor.as_ref(),
                     &opts,

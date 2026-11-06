@@ -729,7 +729,6 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 (None, None, Some(text)) => crate::extract::ExtractSource::Text { text },
                 _ => unreachable!("exactly one source enforced above"),
             };
-            let units = g.extract_units(&source, &agent)?;
             let cap = cap
                 .map(|c| c.clamp(1, 1000))
                 .unwrap_or(crate::extract::DEFAULT_CAP);
@@ -738,7 +737,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 dry_run,
                 cap,
             };
-            let outcome = g.extract(&units, &agent, extractor.as_ref(), &opts, emb.as_deref())?;
+            let outcome =
+                g.extract_source(&source, &agent, extractor.as_ref(), &opts, emb.as_deref())?;
             print_extract(&outcome);
         }
 
