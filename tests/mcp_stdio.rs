@@ -450,22 +450,31 @@ fn mcp_brief_require_verified_hides_unverified_hits() {
 #[test]
 fn mcp_semantic_true_errors_without_the_embed_feature() {
     let dir = tempfile::tempdir().unwrap();
-    let mut p = Proc::spawn(dir.path());
+    // extract no-ops on an unset backend before its semantic gate, so the
+    // shipped `heuristic` backend is what lets the call reach it.
+    let mut p = Proc::spawn_env(dir.path(), &[("GUNGNIR_EXTRACTOR", "heuristic")]);
     p.rpc(&msg(1, "initialize", serde_json::json!({})));
 
-    for (id, arguments) in [
+    for (id, (name, arguments)) in [
         (
-            2u64,
+            "recall",
             serde_json::json!({"query": "postgres", "semantic": true}),
         ),
         (
-            3,
+            "brief",
             serde_json::json!({"agent": "ops", "task": "cache eviction", "semantic": true}),
         ),
-    ] {
-        let name = if id == 2 { "recall" } else { "brief" };
+        (
+            "extract",
+            serde_json::json!({"agent": "ops", "transcript": "ran migrations",
+                               "allow_unbacked": true, "semantic": true}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let r = p.rpc(&msg(
-            id,
+            id as u64 + 2,
             "tools/call",
             serde_json::json!({"name": name, "arguments": arguments}),
         ));
@@ -493,26 +502,46 @@ fn mcp_semantic_true_reaches_hybrid_search() {
     g.codex().unwrap().create(&e).unwrap();
     drop(g);
 
-    let mut p = Proc::spawn_env(dir.path(), &[("GUNGNIR_TEST_EMBEDDER", "1")]);
+    // `heuristic` keeps extract offline while letting its call reach the
+    // semantic arm (an unset backend no-ops earlier).
+    let mut p = Proc::spawn_env(
+        dir.path(),
+        &[
+            ("GUNGNIR_TEST_EMBEDDER", "1"),
+            ("GUNGNIR_EXTRACTOR", "heuristic"),
+        ],
+    );
     p.rpc(&msg(1, "initialize", serde_json::json!({})));
 
-    for (id, arguments) in [
+    for (id, (name, arguments)) in [
         (
-            2u64,
+            "recall",
             serde_json::json!({"query": "query cache eviction", "semantic": true}),
         ),
         (
-            3,
+            "brief",
             serde_json::json!({"agent": "ops", "task": "query cache eviction", "semantic": true}),
         ),
-    ] {
-        let name = if id == 2 { "recall" } else { "brief" };
+        // semantic:true must reach extract's dispatch without erroring;
+        // `allow_unbacked` admits the literal transcript source.
+        (
+            "extract",
+            serde_json::json!({"agent": "ops", "transcript": "ran migrations",
+                               "allow_unbacked": true, "semantic": true}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let r = p.rpc(&msg(
-            id,
+            id as u64 + 2,
             "tools/call",
             serde_json::json!({"name": name, "arguments": arguments}),
         ));
         assert_eq!(r["result"]["isError"], false, "{name}: {r}");
+        if name == "extract" {
+            continue;
+        }
         let text = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("postgres pooling limits"), "{name}: {text}");
     }

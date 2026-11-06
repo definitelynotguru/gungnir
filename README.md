@@ -86,9 +86,9 @@ gungnir brief --agent builder "cache eviction" --semantic
 # MCP: "semantic": true on the recall / brief / extract tools
 ```
 
-Ask for semantic on a build without the feature and gungnir errors
-("semantic recall requires a build with `--features embed`") instead of
-silently answering with keyword results. To hybrid search against your own
+Ask for semantic on a build without the feature and gungnir errors loudly
+— nonzero exit on the CLI, an error result over MCP — instead of silently
+answering with keyword results. To hybrid search against your own
 embedder instead of the shipped model, implement the `Embedder` trait —
 see [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
 
