@@ -86,11 +86,13 @@ it.
 
 Machine origin is structural, not cosmetic. Entries written by
 `gungnir extract` carry `source_tool: extract` and `extracted_by:
-<backend>` in frontmatter, so `ls --unreviewed`, `review`, `log`, `blame`,
-and `show` all flag where the claim came from; no surface presents an
-extracted fact as human-entered knowledge. They are born `unverified`,
-journal-only, and can only move forward through `verify()` — the same
-transition human-written findings take.
+<backend>` in frontmatter, and every surface an agent reads flags that:
+briefings tag hits `extracted`, recall lines carry `[extracted]` on CLI
+and MCP, `ls --unreviewed` and `review` mark them, and `get`/`log`/`blame`
+render `origin: extract via <backend>`. No surface presents an extracted
+fact as human-entered knowledge. They are born `unverified`, journal-only,
+and can only move forward through `verify()` — the same transition
+human-written findings take.
 
 ## Revalidation
 

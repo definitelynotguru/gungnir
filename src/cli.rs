@@ -498,7 +498,14 @@ fn print_extract(outcome: &crate::ExtractOutcome) {
         }
     }
     for r in &outcome.refused {
-        println!("refused  \"{}\" — {}", r.summary, r.reason);
+        // Sensitive verdicts may carry the secret they refused on; the
+        // reason names the pattern, so the text stays redacted.
+        let text = if r.sensitive {
+            "[redacted]"
+        } else {
+            &r.summary
+        };
+        println!("refused  \"{text}\" — {}", r.reason);
     }
     if outcome.skipped > 0 {
         println!(
@@ -578,6 +585,16 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let e = store.require(id)?;
             println!("{}  {}  {:?}  [{}]", e.id, e.kind, e.verification, e.agent);
             println!("{}", e.summary);
+            if let Some(tool) = &e.source_tool {
+                match &e.extracted_by {
+                    Some(backend) => println!(
+                        "origin: {} via {}",
+                        crate::validate::one_line(tool),
+                        crate::validate::one_line(backend)
+                    ),
+                    None => println!("origin: {}", crate::validate::one_line(tool)),
+                }
+            }
             let mentions = e.entity_mentions();
             if !mentions.is_empty() {
                 println!(
@@ -599,6 +616,32 @@ fn dispatch(cli: Cli) -> Result<i32> {
             agent,
             unreviewed,
         } => {
+            if unreviewed {
+                // The review queue's contract, not a bare unverified scan:
+                // belief kinds only, and never a chain tail already
+                // superseded — session archives are bookkeeping, not
+                // review items.
+                let l = layer_of(&layer)?;
+                let partition = if l == crate::layout::CODEX {
+                    crate::layout::CODEX.to_string()
+                } else {
+                    let a = agent
+                        .as_deref()
+                        .ok_or_else(|| Error::Invalid("ls journal requires --agent".into()))?;
+                    format!("{l}/{a}")
+                };
+                let mut all = g.all_entries()?;
+                all.retain(|e| e.partition == partition);
+                for item in crate::audit::review_queue(&all) {
+                    let e = &item.entry;
+                    let extracted = if item.extracted { "  [extracted]" } else { "" };
+                    println!(
+                        "{}  {}\t{}\t{}{}",
+                        e.id, e.kind, e.summary, e.agent, extracted
+                    );
+                }
+                return Ok(0);
+            }
             let scan = match layer_of(&layer)? {
                 crate::layout::CODEX => g.codex()?.scan()?,
                 _ => {
@@ -609,18 +652,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 }
             };
             for e in &scan.entries {
-                if unreviewed && e.verification != crate::entry::VerificationState::Unverified {
-                    continue;
-                }
-                let extracted = if e.source_tool.is_some() {
-                    "  [extracted]"
-                } else {
-                    ""
-                };
-                println!(
-                    "{}  {}\t{}\t{}{}",
-                    e.id, e.kind, e.summary, e.agent, extracted
-                );
+                println!("{}  {}\t{}\t{}", e.id, e.kind, e.summary, e.agent);
             }
             warn_skipped(&scan.skipped);
         }
@@ -743,7 +775,15 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&doc)?);
             } else {
                 for h in &out.hits {
-                    println!("{:.3}  {}  {}", h.score, h.entry.id, h.entry.summary);
+                    let extracted = if h.entry.source_tool.is_some() {
+                        "  [extracted]"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{:.3}  {}  {}{}",
+                        h.score, h.entry.id, h.entry.summary, extracted
+                    );
                 }
                 if out.hits.is_empty() {
                     let hidden = out.coverage.hidden_superseded + out.coverage.hidden_rolled_back;

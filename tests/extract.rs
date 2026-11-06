@@ -16,17 +16,39 @@ fn gungnir_at(
     extractor: Option<&str>,
     args: &[&str],
 ) -> (String, String, i32) {
+    gungnir_env(root, extractor, args, &[])
+}
+
+fn gungnir_env(
+    root: &std::path::Path,
+    extractor: Option<&str>,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (String, String, i32) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnir"));
     cmd.args(args).env("GUNGNIR_ROOT", root);
     match extractor {
         Some(e) => cmd.env(extract::EXTRACTOR_ENV, e),
         None => cmd.env_remove(extract::EXTRACTOR_ENV),
     };
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let out = cmd.output().expect("spawn gungnir");
     (
         String::from_utf8(out.stdout).unwrap(),
         String::from_utf8(out.stderr).unwrap(),
         out.status.code().unwrap_or(-1),
+    )
+}
+
+/// A command backend that prints a fixed proposals file — `cat`/`type`
+/// under the extractor's own stdin/stdout contract.
+fn file_backend(proposals_path: &std::path::Path) -> String {
+    format!(
+        "{} {}",
+        if cfg!(windows) { "type" } else { "cat" },
+        proposals_path.display()
     )
 }
 
@@ -360,18 +382,17 @@ fn ls_unreviewed_lists_machine_entries() {
             "--unreviewed",
         ],
     );
-    // The extracted observation carries the marker; the session archive,
-    // being unverified bookkeeping, lists without it.
+    // The extracted observation carries the marker; the session archive is
+    // bookkeeping, not a review item, so it never lists.
     let observation_line = stdout
         .lines()
         .find(|l| l.contains("observation"))
         .unwrap_or_default();
     assert!(observation_line.contains("[extracted]"), "{stdout}");
-    let session_line = stdout
-        .lines()
-        .find(|l| l.contains("session"))
-        .unwrap_or_default();
-    assert!(!session_line.contains("[extracted]"), "{stdout}");
+    assert!(
+        !stdout.lines().any(|l| l.contains("session")),
+        "session archives are not review items: {stdout}"
+    );
 }
 
 #[test]
@@ -398,11 +419,7 @@ fn command_backend_contract_round_trips() {
     )
     .unwrap();
 
-    let cmd = format!(
-        "{} {}",
-        if cfg!(windows) { "type" } else { "cat" },
-        proposals_path.display()
-    );
+    let cmd = file_backend(&proposals_path);
     let (stdout, stderr, code) = gungnir_at(
         dir.path(),
         Some(&cmd),
@@ -491,4 +508,348 @@ fn mcp_extract_reports_verdicts_and_refusals() {
         serde_json::from_str(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("wrote"), "{text}");
+}
+
+#[test]
+fn blame_and_log_report_origin_for_extracted_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let (_, session_id) = archived_session(&g, &["postgres replaced mysql"]);
+    drop(g);
+
+    gungnir_at(
+        dir.path(),
+        Some("heuristic"),
+        &["extract", "--from", &session_id, "--agent", "builder"],
+    );
+
+    let g = Gungnir::open(dir.path()).unwrap();
+    let id = g
+        .journal("builder")
+        .unwrap()
+        .entries()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.source_tool.as_deref() == Some("extract"))
+        .unwrap()
+        .id
+        .to_string();
+    drop(g);
+
+    for verb in ["blame", "log"] {
+        let (stdout, stderr, code) = gungnir_at(dir.path(), None, &[verb, &id]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(
+            stdout.contains("origin: extract via heuristic"),
+            "{verb}: {stdout}"
+        );
+    }
+    // `get` shows the same provenance on the entry itself.
+    let (stdout, _, code) = gungnir_at(dir.path(), None, &["get", &id]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("origin: extract via heuristic"), "{stdout}");
+}
+
+#[test]
+fn denylist_env_extension_is_enforced() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let (_, session_id) = archived_session(&g, &["the project-bluebird rollout finished"]);
+    drop(g);
+
+    let (stdout, stderr, code) = gungnir_env(
+        dir.path(),
+        Some("heuristic"),
+        &["extract", "--from", &session_id, "--agent", "builder"],
+        &[(extract::DENYLIST_ENV, "project-bluebird")],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("refused"), "{stdout}");
+    assert!(stdout.contains("denylisted 'project-bluebird'"), "{stdout}");
+    let g = Gungnir::open(dir.path()).unwrap();
+    assert!(!g
+        .journal("builder")
+        .unwrap()
+        .entries()
+        .unwrap()
+        .iter()
+        .any(|e| e.source_tool.as_deref() == Some("extract")));
+}
+
+#[test]
+fn cap_flag_bounds_writes_per_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let (_, session_id) =
+        archived_session(&g, &["c1 done", "c2 done", "c3 done", "c4 done", "c5 done"]);
+    drop(g);
+
+    let (stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        Some("heuristic"),
+        &[
+            "extract",
+            "--from",
+            &session_id,
+            "--agent",
+            "builder",
+            "--cap",
+            "1",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("skipped  4 proposal(s)"), "{stdout}");
+    let g = Gungnir::open(dir.path()).unwrap();
+    let count = g
+        .journal("builder")
+        .unwrap()
+        .entries()
+        .unwrap()
+        .iter()
+        .filter(|e| e.source_tool.as_deref() == Some("extract"))
+        .count();
+    assert_eq!(count, 1);
+    drop(g);
+
+    // --cap 0 clamps to 1: a rerun lands at most one more (the rest dedupe).
+    let (stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        Some("heuristic"),
+        &[
+            "extract",
+            "--from",
+            &session_id,
+            "--agent",
+            "builder",
+            "--cap",
+            "0",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let g = Gungnir::open(dir.path()).unwrap();
+    let count = g
+        .journal("builder")
+        .unwrap()
+        .entries()
+        .unwrap()
+        .iter()
+        .filter(|e| e.source_tool.as_deref() == Some("extract"))
+        .count();
+    assert_eq!(count, 2, "cap clamps to 1 write per run: {stdout}");
+}
+
+#[test]
+fn file_source_records_hashed_evidence_per_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let notes = dir.path().join("notes.md");
+    std::fs::write(&notes, "checkout migrated\n\nindex covers lookup\n").unwrap();
+
+    let (stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        Some("heuristic"),
+        &[
+            "extract",
+            "--file",
+            notes.to_str().unwrap(),
+            "--agent",
+            "builder",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout.matches("wrote").count(), 2, "{stdout}");
+    assert!(!stdout.contains("skipped"), "{stdout}");
+
+    let expected_sha = {
+        use sha2::Digest as _;
+        format!("{:x}", sha2::Sha256::digest(std::fs::read(&notes).unwrap()))
+    };
+    let g = Gungnir::open(dir.path()).unwrap();
+    let extracted: Vec<_> = g
+        .journal("builder")
+        .unwrap()
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.source_tool.as_deref() == Some("extract"))
+        .collect();
+    assert_eq!(extracted.len(), 2);
+    for e in &extracted {
+        let file_ev = e
+            .evidence
+            .iter()
+            .find_map(|ev| match ev {
+                Evidence::File {
+                    path,
+                    excerpt,
+                    sha256,
+                } => Some((path, excerpt, sha256)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("entry {} lacks file evidence: {e:?}", e.id));
+        assert_eq!(*file_ev.2, expected_sha);
+        assert!(e.body.contains(file_ev.1.as_str()), "{e:?}");
+        // The file lives under the store root, so the evidence records the
+        // portable root-relative path.
+        assert_eq!(*file_ev.0, "notes.md");
+    }
+}
+
+#[test]
+fn write_time_rejection_is_reported_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let (_, session_id) = archived_session(&g, &["source line"]);
+    drop(g);
+
+    let proposals_path = dir.path().join("proposals.json");
+    std::fs::write(
+        &proposals_path,
+        serde_json::json!([
+            {"summary": "claim\u{7}corrupt", "cites": [0]},
+            {"summary": "checkout migrated to postgres", "cites": [0]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        Some(&file_backend(&proposals_path)),
+        &["extract", "--from", &session_id, "--agent", "builder"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("write rejected"), "{stdout}");
+    let g = Gungnir::open(dir.path()).unwrap();
+    let extracted: Vec<_> = g
+        .journal("builder")
+        .unwrap()
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.source_tool.as_deref() == Some("extract"))
+        .collect();
+    assert_eq!(extracted.len(), 1, "the clean proposal still landed");
+    assert_eq!(extracted[0].summary, "checkout migrated to postgres");
+}
+
+#[test]
+fn secrets_in_entity_names_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let (_, session_id) = archived_session(&g, &["source line"]);
+    drop(g);
+
+    let proposals_path = dir.path().join("proposals.json");
+    std::fs::write(
+        &proposals_path,
+        serde_json::json!([{
+            "summary": "rotated the key",
+            "cites": [0],
+            "entities": ["sk-abcdef123456789"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        Some(&file_backend(&proposals_path)),
+        &["extract", "--from", &session_id, "--agent", "builder"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("refused"), "{stdout}");
+    let g = Gungnir::open(dir.path()).unwrap();
+    assert!(!g
+        .journal("builder")
+        .unwrap()
+        .entries()
+        .unwrap()
+        .iter()
+        .any(|e| e.source_tool.as_deref() == Some("extract")));
+}
+
+#[test]
+fn refused_secret_text_is_redacted_from_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let (_, session_id) = archived_session(&g, &["source line"]);
+    drop(g);
+
+    let proposals_path = dir.path().join("proposals.json");
+    std::fs::write(
+        &proposals_path,
+        serde_json::json!([{
+            "summary": "the token sk-live9abcdef12 was rotated",
+            "cites": [0]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = gungnir_at(
+        dir.path(),
+        Some(&file_backend(&proposals_path)),
+        &["extract", "--from", &session_id, "--agent", "builder"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("refused"), "{stdout}");
+    assert!(stdout.contains("[redacted]"), "{stdout}");
+    // The refusal names the pattern class, never the secret itself.
+    assert!(
+        !stdout.contains("sk-live9abcdef12"),
+        "refusal echoed the secret: {stdout}"
+    );
+}
+
+#[test]
+fn peer_journal_entries_are_not_extractable() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = Entry::new("peer-agent", EntryKind::Observation, "peer secret note");
+    let peer_id = entry.id.to_string();
+    g.journal("peer-agent").unwrap().create(&entry).unwrap();
+    drop(g);
+
+    // The boundary holds whether or not the caller asks for unbacked text:
+    // another agent's journal is not transcript input.
+    let (_, stderr, code) = gungnir_at(
+        dir.path(),
+        Some("heuristic"),
+        &["extract", "--from", &peer_id, "--agent", "builder"],
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("journal"), "{stderr}");
+}
+
+#[test]
+fn briefing_and_recall_flag_extracted_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let (_, session_id) = archived_session(&g, &["checkout requires postgres index"]);
+    drop(g);
+    gungnir_at(
+        dir.path(),
+        Some("heuristic"),
+        &["extract", "--from", &session_id, "--agent", "builder"],
+    );
+
+    // Recall hits mark machine origin on the line an agent reads.
+    let (stdout, _, code) = gungnir_at(
+        dir.path(),
+        None,
+        &[
+            "recall", "checkout", "--layer", "journal", "--agent", "builder",
+        ],
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("[extracted]"), "{stdout}");
+
+    // The briefing — the payload agents act on — tags the same hit.
+    let (stdout, _, code) = gungnir_at(
+        dir.path(),
+        None,
+        &["brief", "--agent", "builder", "checkout"],
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("extracted"), "{stdout}");
 }

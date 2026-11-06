@@ -52,6 +52,12 @@ fn label(hit: &Hit, superseded: &HashSet<EntryId>, task_tokens: &[String]) -> St
     if superseded.contains(&hit.entry.id) {
         tags.push("superseded");
     }
+    if hit.entry.source_tool.is_some() {
+        // Machine origin is structural: a briefing is the payload agents
+        // act on, so it must distinguish extracted proposals from
+        // human-entered knowledge.
+        tags.push("extracted");
+    }
     if hit.entry.kind == EntryKind::Attempt {
         tags.push("prior attempt");
     }
