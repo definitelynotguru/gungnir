@@ -9,7 +9,8 @@ is safe; every write goes through the same validation and locking.
 The server speaks newline-delimited JSON-RPC over stdio per the Model Context
 Protocol. Tools: `start_session`, `add_observation`, `add_attempt`,
 `end_session`, `recall`, `brief`, `verify`, `contradict`, `promote`,
-`supersede`, `rollback`, `list`, `get`.
+`supersede`, `rollback`, `conflicts`, `resolve_conflict`, `extract`,
+`stats`, `revalidate`, `list`, `get`.
 
 Build first:
 

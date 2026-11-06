@@ -259,7 +259,7 @@ specifies. Source is `--from <session-id-or-entry>`, `--file <path>`, or
 - **MCP server**: tools `start_session`, `end_session`, `add_observation`,
   `add_attempt`, `extract`, `recall`, `brief`, `verify`, `contradict`,
   `promote`, `supersede`, `rollback`, `conflicts`, `resolve_conflict`,
-  `list`, `get`.
+  `stats`, `revalidate`, `list`, `get`.
 
 ## Deliberate departures from the reference design
 

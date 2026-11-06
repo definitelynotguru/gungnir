@@ -407,6 +407,167 @@ fn mcp_contradict_marks_state() {
 }
 
 #[test]
+fn mcp_stats_reports_counts_and_peer_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        use gungnir::{Entry, EntryKind, Gungnir, Layer};
+        let g = Gungnir::open(dir.path()).unwrap();
+        g.add(
+            Entry::new("ops", EntryKind::Decision, "postgres pooling"),
+            Layer::Codex,
+        )
+        .unwrap();
+        // A peer journal partition holding one on-topic failed attempt —
+        // only its counts may cross, never the text.
+        let mut attempt = Entry::new("scout", EntryKind::Attempt, "checkout latency fix");
+        attempt.body = "outcome: failed\n\ntried index hint".into();
+        g.add(attempt, Layer::Journal { agent: "scout" }).unwrap();
+        // An off-topic partition must not inflate the counts.
+        g.add(
+            Entry::new("ops", EntryKind::Observation, "dns unrelated"),
+            Layer::Journal { agent: "watcher" },
+        )
+        .unwrap();
+    }
+
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+
+    // Both new tools advertise.
+    let tools = p.rpc(&msg(2, "tools/list", serde_json::json!({})));
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"stats"), "{names:?}");
+    assert!(names.contains(&"revalidate"), "{names:?}");
+
+    // Bare stats reports the layer counts.
+    let r = p.rpc(&msg(
+        3,
+        "tools/call",
+        serde_json::json!({"name": "stats", "arguments": {}}),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("codex entries      1"), "{text}");
+    assert!(text.contains("journal entries    2"), "{text}");
+
+    // topic adds aggregate peer coverage: scout's failed attempt counts,
+    // watcher's off-topic journal does not, and no peer text crosses.
+    let r = p.rpc(&msg(
+        4,
+        "tools/call",
+        serde_json::json!({
+            "name": "stats",
+            "arguments": {"agent": "builder", "topic": "checkout"}
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("peer coverage      1 agents attempted, 1 failed (1 entries)"),
+        "{text}"
+    );
+    assert!(!text.contains("checkout latency fix"), "{text}");
+    assert!(!text.contains("tried index hint"), "{text}");
+}
+
+#[test]
+fn mcp_revalidate_reports_drift_and_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let adr = dir.path().join("adr.md");
+    std::fs::write(&adr, "decision: use postgres").unwrap();
+    let gone = dir.path().join("gone.md");
+    std::fs::write(&gone, "proof").unwrap();
+    let entry_id;
+    {
+        let g = gungnir::Gungnir::open(dir.path()).unwrap();
+        let e = gungnir::Entry::new("ops", gungnir::EntryKind::Decision, "use postgres");
+        g.codex().unwrap().create(&e).unwrap();
+        entry_id = e.id.to_string();
+        g.verify_with_evidence(e.id, "team", None, &[adr.clone(), gone.clone()])
+            .unwrap();
+        std::fs::write(&adr, "decision: use sqlite").unwrap();
+        std::fs::remove_file(&gone).unwrap();
+    }
+
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+
+    // Argument validation mirrors the CLI: neither id nor all, and id
+    // plus all together, are rejected.
+    for (id, arguments) in [
+        (2u64, serde_json::json!({})),
+        (3, serde_json::json!({"id": entry_id, "all": true})),
+    ] {
+        let r = p.rpc(&msg(
+            id,
+            "tools/call",
+            serde_json::json!({"name": "revalidate", "arguments": arguments}),
+        ));
+        assert_eq!(r["result"]["isError"], true, "{r}");
+    }
+
+    // A completed sweep is a normal result even when checks fail — drift
+    // is the answer, and the summary line carries the count.
+    let r = p.rpc(&msg(
+        4,
+        "tools/call",
+        serde_json::json!({
+            "name": "revalidate",
+            "arguments": {"id": entry_id}
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("DRIFT"), "{text}");
+    assert!(text.contains("MISSING"), "{text}");
+    assert!(text.contains("adr.md"), "{text}");
+    assert!(
+        text.contains("0 intact, 2 drifted, missing, or unreadable"),
+        "{text}"
+    );
+
+    // all sweeps every layer and finds the same two failed checks.
+    let r = p.rpc(&msg(
+        5,
+        "tools/call",
+        serde_json::json!({
+            "name": "revalidate",
+            "arguments": {"all": true}
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("0 intact, 2 drifted, missing, or unreadable"),
+        "{text}"
+    );
+
+    // Fix the drifted file back and restore the missing one: the entry
+    // revalidates clean.
+    std::fs::write(&adr, "decision: use postgres").unwrap();
+    std::fs::write(&gone, "proof").unwrap();
+    let r = p.rpc(&msg(
+        6,
+        "tools/call",
+        serde_json::json!({
+            "name": "revalidate",
+            "arguments": {"id": entry_id}
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("2 intact, 0 drifted, missing, or unreadable"),
+        "{text}"
+    );
+}
+
+#[test]
 fn mcp_brief_require_verified_hides_unverified_hits() {
     let dir = tempfile::tempdir().unwrap();
     let g = gungnir::Gungnir::open(dir.path()).unwrap();
