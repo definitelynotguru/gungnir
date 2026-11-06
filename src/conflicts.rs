@@ -310,11 +310,12 @@ impl Conflicts {
 
     /// `record` for a batch under one lock with the existing queue read
     /// once: a scan that surfaces C candidates costs one queue walk
-    /// instead of C. `results[i]` answers `recs[i]` the same way `record`
-    /// would — `Some(existing)` when the pair is already queued, `None`
-    /// when `recs[i]` was persisted as a new candidate. Duplicate pairs
-    /// inside `recs` itself dedupe to the first.
-    pub fn record_many(&self, recs: &[ConflictRecord]) -> Result<Vec<Option<ConflictRecord>>> {
+    /// instead of C. `results[i]` answers `recs[i]` the way `record`
+    /// would, plus a third state `record` reported as its `Err` arm —
+    /// `Failed` names which pair could not persist without aborting the
+    /// rest of the batch. Duplicate pairs inside `recs` itself dedupe to
+    /// the first.
+    pub(crate) fn record_many(&self, recs: &[ConflictRecord]) -> Result<Vec<RecordOutcome>> {
         fs::create_dir_all(&self.dir)?;
         let _guard = self.lock()?;
         let mut by_pair: HashMap<(EntryId, EntryId), ConflictRecord> = HashMap::new();
@@ -327,12 +328,16 @@ impl Conflicts {
         let mut results = Vec::with_capacity(recs.len());
         for rec in recs {
             if let Some(existing) = by_pair.get(&(rec.new_entry, rec.conflicting_entry)) {
-                results.push(Some(existing.clone()));
+                results.push(RecordOutcome::Existing(existing.clone()));
                 continue;
             }
-            self.persist_locked(rec)?;
-            by_pair.insert((rec.new_entry, rec.conflicting_entry), rec.clone());
-            results.push(None);
+            match self.persist_locked(rec) {
+                Ok(()) => {
+                    by_pair.insert((rec.new_entry, rec.conflicting_entry), rec.clone());
+                    results.push(RecordOutcome::New);
+                }
+                Err(e) => results.push(RecordOutcome::Failed(e)),
+            }
         }
         Ok(results)
     }
@@ -471,6 +476,17 @@ impl Conflicts {
         file.lock_exclusive()?;
         Ok(file)
     }
+}
+
+/// What `record_many` did with one candidate. `New` persisted it;
+/// `Existing` found the same pair already queued (the record it names);
+/// `Failed` carries the persist error so the caller can name the lost
+/// pair — per-candidate failures never abort the batch.
+#[derive(Debug)]
+pub enum RecordOutcome {
+    New,
+    Existing(ConflictRecord),
+    Failed(Error),
 }
 
 fn parse_record_file(path: &Path) -> Result<ConflictRecord> {
@@ -939,10 +955,14 @@ mod tests {
         };
         let results = queue.record_many(&[rec.clone(), rec.clone()]).unwrap();
         // The same pair inside one batch dedupes to the first write:
-        // result[0] is new (None), result[1] resolves to the record just
+        // result[0] is New, result[1] resolves to the record just
         // persisted, exactly as a second `record` call would answer.
-        assert!(results[0].is_none());
-        assert_eq!(results[1].as_ref().unwrap().id, rec.id);
+        assert!(matches!(results[0], RecordOutcome::New));
+        assert!(
+            matches!(&results[1], RecordOutcome::Existing(e) if e.id == rec.id),
+            "{:?}",
+            results[1]
+        );
         assert_eq!(queue.list().unwrap().len(), 1);
 
         // A pair already on the queue returns the existing record without
@@ -950,7 +970,9 @@ mod tests {
         rec.id = ConflictId::generate();
         let results = queue.record_many(std::slice::from_ref(&rec)).unwrap();
         assert_eq!(results.len(), 1);
-        let existing = results[0].as_ref().unwrap();
+        let RecordOutcome::Existing(existing) = &results[0] else {
+            panic!("expected Existing, got {:?}", results[0]);
+        };
         assert_ne!(existing.id, rec.id);
         assert_eq!(queue.list().unwrap().len(), 1);
     }
