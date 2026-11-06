@@ -661,8 +661,24 @@ fn mcp_journal_named_root_keeps_diagnostic_paths_real() {
     let mut p = Proc::spawn(&root);
     p.rpc(&msg(1, "initialize", serde_json::json!({})));
 
-    // The codex diagnostic reports the real, existing path — the `journal`
-    // component inside the root is not touched.
+    // The codex diagnostic reports the file's path intact — the `journal`
+    // component inside the root is not touched. The store canonicalizes the
+    // root (Windows spells it as a verbatim \\?\ path, and the runner's temp
+    // dir may differ from ours), so assert on the separators-agnostic tail:
+    // the codex shard plus the filename both present in one line.
+    let codex_name = codex_file
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let codex_line = |text: &str| {
+        text.lines()
+            .find(|l| l.contains(&codex_name))
+            .unwrap_or("")
+            .to_string()
+    };
+
     let r = p.rpc(&msg(
         2,
         "tools/call",
@@ -670,14 +686,14 @@ fn mcp_journal_named_root_keeps_diagnostic_paths_real() {
     ));
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("skipped (unparseable) 2"), "{text}");
-    assert!(
-        text.contains(codex_file.to_str().unwrap()),
-        "{text} vs {}",
-        codex_file.display()
-    );
+    // `<peer>` anywhere on the codex line means the root's own `journal`
+    // segment got redacted — the corruption this regression guards.
+    let line = codex_line(text);
+    assert!(line.contains("codex"), "{line}");
+    assert!(!line.contains("<peer>"), "{line}");
 
     // The journal diagnostic redacts only the partition segment.
-    assert!(text.contains("journal/<peer>"), "{text}");
+    assert!(text.contains("<peer>"), "{text}");
     assert!(!text.contains("scout"), "{text}");
 
     // Same anchoring in the revalidate sweep.
@@ -687,12 +703,10 @@ fn mcp_journal_named_root_keeps_diagnostic_paths_real() {
         serde_json::json!({"name": "revalidate", "arguments": {"all": true}}),
     ));
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(
-        text.contains(codex_file.to_str().unwrap()),
-        "{text} vs {}",
-        codex_file.display()
-    );
-    assert!(text.contains("journal/<peer>"), "{text}");
+    let line = codex_line(text);
+    assert!(line.contains("codex"), "{line}");
+    assert!(!line.contains("<peer>"), "{line}");
+    assert!(text.contains("<peer>"), "{text}");
     assert!(!text.contains("scout"), "{text}");
 }
 
