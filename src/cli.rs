@@ -108,7 +108,9 @@ enum Cmd {
         semantic: bool,
     },
 
-    /// Keyword recall within a layer.
+    /// Keyword recall within a layer. Task-shaped queries also surface
+    /// standing constraints (e.g. "always syntax-highlight") even when they
+    /// share no words with the question; fact/temporal queries do not.
     Recall {
         query: String,
         #[arg(long, default_value = "codex")]

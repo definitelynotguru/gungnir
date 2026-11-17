@@ -100,6 +100,20 @@ feature ships one — bge-small-en-v1.5 quantized via fastembed/ONNX, ~100MB
 of weights downloaded on first use into `.cache/fastembed`. Without the
 feature, semantic requests error rather than silently degrading to keyword.
 
+**Standing-constraint lane (both modes).** A deterministic cue tagger
+(`always`, `never`, `from now on`, `I prefer`, `don't`, and close cousins)
+marks entries as standing rules. The lane is a derived view rebuilt from the
+canonical files on each query — no second store, no model on the write path,
+and a cue match never verifies an entry. A query-shape router unions a capped
+slice (at most 4) into **task-shaped** queries only: queries that ask the
+agent to produce or act, with no fact cue. Fact questions (temporal and
+knowledge-update included) and all `as_of`/`current_only` queries are
+fact-shaped and get no lane, so generic rules cannot crowd their top-k. The
+lane appends after the ordered lexical hits into spare slots below `limit`;
+it never evicts or reorders a lexical hit, and lane entries carry score 0.0.
+`require_verified` stays purely lexical, so strict provenance queries never
+union standing guidance.
+
 **Scoring formula, both modes.** Final order is a verification bucket
 (verified > unverified > contradicted) sorted lexicographically first, then
 the score `relevance × trust × recency`:

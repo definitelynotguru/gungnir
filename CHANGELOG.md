@@ -8,6 +8,15 @@ All notable changes to Gungnir are documented here. The format follows
 
 ### Added
 
+- **Standing-constraint lane in recall.** A deterministic cue tagger
+  (`always`, `never`, `from now on`, `I prefer`, `don't`, and close
+  cousins) marks standing rules/preferences, and a query-shape router
+  unions a capped slice (at most 4, appended into spare slots below
+  `--limit`) into task-shaped queries only. So "always syntax-highlight
+  code" surfaces for "show me a login implementation" despite sharing no
+  content words, while fact/temporal/knowledge-update queries never get
+  the lane. The lane is a derived view rebuilt from the canonical files;
+  nothing verifies an entry for matching a cue, and `embed` stays opt-in.
 - **Gated auto-extraction** (`gungnir extract`, MCP `extract`, Rust
   `Gungnir::extract`): a configured backend — `GUNGNIR_EXTRACTOR` naming a
   command honoring a JSON stdin/stdout contract, or the shipped

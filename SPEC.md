@@ -146,6 +146,31 @@ use); without it, semantic requests error. Vector cache keyed by
 skew. Scoring is O(N) cosine per query; ~10k entries is the practical
 ceiling before a real index is worth its corruption modes.
 
+### Standing constraints
+
+A deterministic cue tagger marks entries as standing rules or preferences
+(`always`, `never`, `from now on`, `I prefer`, `don't`, `must not`,
+`make sure`, `whenever`, and close cousins). The tagger is read-only: it
+never writes, never verifies, and uses no model. The lane is a derived view
+rebuilt from the canonical files on every query — markdown stays the store of
+truth, and no second store is introduced.
+
+A query-shape router unions a capped slice of the lane (at most 4 entries)
+into **task-shaped** queries only. A query is task-shaped when it asks the
+agent to produce or act (`show me`, `write`, `how do I`, `please`, and
+similar), with no fact cue. Fact questions — especially temporal and
+knowledge-update queries (`when`, `did`, `current`, `moved to`, `no
+longer`) — and every `as_of`/`current_only` query are fact-shaped and never
+receive the lane, so generic rules cannot drop temporal hit@10. An
+unrecognized query shape defaults to fact-shaped.
+
+The lane **appends** into spare slots below `limit`, after the lexical hits
+are ordered. It never evicts or reorders a lexical hit; when lexical hits
+fill the limit the union is empty. Lane entries carry no lexical relevance
+(score 0.0). `require_verified` is a strict provenance query and stays purely
+lexical — it does not union standing constraints. The same lane applies to
+keyword and hybrid recall; `embed` stays opt-in.
+
 ## Rollback (non-destructive)
 
 No file is ever deleted.
