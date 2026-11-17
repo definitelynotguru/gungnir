@@ -307,22 +307,10 @@ pub(crate) fn temporal_pool(
     store: &Store,
     query: &Query,
 ) -> Result<(Vec<Candidate>, HashSet<EntryId>, Vec<Skipped>)> {
-    let scan = store.scan()?;
-    let (pool, revised) = temporal_pool_entries(scan.entries, query);
-    Ok((pool, revised, scan.skipped))
-}
-
-/// The pool over entries the caller already loaded: the write path keeps
-/// `store.scan()` out of loops this way — a batched extract scan builds
-/// its pool from the entries it just wrote plus the dedupe snapshot the
-/// run already read, instead of reparsing the layer once per write.
-pub(crate) fn temporal_pool_entries(
-    entries: Vec<Entry>,
-    query: &Query,
-) -> (Vec<Candidate>, HashSet<EntryId>) {
     let mut pool = Vec::new();
     let mut revised = HashSet::new();
-    for entry in entries {
+    let scan = store.scan()?;
+    for entry in scan.entries {
         if let Some(cutoff) = query.as_of {
             if entry.timestamp > cutoff {
                 continue;
@@ -339,7 +327,7 @@ pub(crate) fn temporal_pool_entries(
         }
         pool.push(Candidate { entry, state });
     }
-    (pool, revised)
+    Ok((pool, revised, scan.skipped))
 }
 
 /// Shared tail of every search: coverage accounting, trust×recency

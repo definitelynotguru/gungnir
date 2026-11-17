@@ -177,10 +177,10 @@ All notable changes to Gungnir are documented here. The format follows
   `add_inner`, which rescanned both the journal and the codex for conflict
   detection — O(writes × store size) file parses per session. A run now
   writes its batch first, then runs one batched `detect_many` pass (the
-  same one `end_session` promotions use), reusing the journal snapshot it
-  already loaded for dedupe as the detection pool. Candidates are
-  unchanged: a run's own writes are `unverified` and only live verified
-  facts are candidates. `Conflicts::record_many` similarly records a
+  same one `end_session` promotions use), reading each scope fresh at
+  detection time so a concurrent verification during extraction is still
+  seen. Candidates are unchanged: a run's own writes are `unverified` and
+  only live verified facts are candidates. `Conflicts::record_many` similarly records a
   batch's candidates under one queue read instead of one walk per record.
   The gate also skips corpus stats when no pool entry is candidate-eligible,
   and `Gungnir::extract_source` resolves a session archive and the dedupe

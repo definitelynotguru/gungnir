@@ -597,23 +597,12 @@ pub fn detect_many(
     if entries.iter().all(|e| !detectable(e)) {
         return Ok(vec![]);
     }
+    // One `current`-view pool for both channels: `state`/`revised` hide
+    // superseded tails and contradicted facts from candidacy. The scan
+    // happens after the writes land, so concurrent verifications are
+    // visible — a caller-supplied snapshot would miss them.
     let q = Query::new("", CANDIDATE_LIMIT).current();
     let (pool, revised, _skipped) = recall::temporal_pool(store, &q)?;
-    detect_many_pool(pool, revised, layer, entries, embedder)
-}
-
-/// `detect_many` over an already-built pool: batch writes reuse the
-/// entries they just persisted (plus any the caller already loaded)
-/// instead of rescanning the store for every write in the batch.
-/// Same candidate rules — `pool` must be the layer's `current`-view
-/// temporal pool or candidacy drifts.
-pub(crate) fn detect_many_pool(
-    pool: Vec<recall::Candidate>,
-    revised: HashSet<EntryId>,
-    layer: &str,
-    entries: &[Entry],
-    embedder: Option<&dyn Embedder>,
-) -> Result<Vec<ConflictRecord>> {
     let entries: Vec<&Entry> = entries.iter().filter(|e| detectable(e)).collect();
     if entries.is_empty() {
         return Ok(vec![]);
