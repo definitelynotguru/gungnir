@@ -507,10 +507,12 @@ fn query_shape(query: &Query) -> QueryShape {
 
 /// Deterministic cue tagger. The lane is derived from the canonical entries
 /// on every query; files stay the store of truth and nothing is persisted.
+/// Summary and body are checked separately, so a multi-word cue cannot be
+/// assembled across the field boundary ("...from now" + "on..." is not
+/// "from now on").
 fn is_standing_constraint(entry: &Entry) -> bool {
-    let mut words = normalized(&entry.summary);
-    words.extend(normalized(&entry.body));
-    has_cue(&words, STANDING_CUES)
+    has_cue(&normalized(&entry.summary), STANDING_CUES)
+        || has_cue(&normalized(&entry.body), STANDING_CUES)
 }
 
 /// The capped standing-constraint slice for a task-shaped query. Drawn from
@@ -1409,6 +1411,133 @@ mod tests {
         assert!(
             gated.hits.iter().all(|h| h.entry.id != rule.id),
             "a strict provenance query must not union standing constraints"
+        );
+    }
+
+    /// A task query with limit 0 has no spare slots, so the lane must not
+    /// append any hits. And lane hits never count as topic-matched coverage:
+    /// the abstention signal describes the lexical pool, not the guidance.
+    #[test]
+    fn task_limit_zero_returns_no_lane_hits_and_lane_hits_leave_coverage_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        rule.verify("review", None);
+        store.create(&rule).unwrap();
+
+        let zero =
+            search_with_coverage(&store, &Query::new("show me a login implementation", 0)).unwrap();
+        assert!(
+            zero.hits.is_empty(),
+            "limit 0 must return no hits, lane included"
+        );
+
+        let wide = search_with_coverage(&store, &Query::new("show me a login implementation", 10))
+            .unwrap();
+        assert_eq!(wide.hits.len(), 1, "the lane surfaces the rule");
+        assert_eq!(
+            wide.coverage.verified, 0,
+            "lane hits are not verified facts on the topic"
+        );
+        assert_eq!(
+            wide.coverage.total_matched(),
+            0,
+            "coverage counts the lexical pool only"
+        );
+        assert_eq!(
+            wide.coverage.total, 1,
+            "the corpus entry still counts in scope"
+        );
+    }
+
+    /// The tagger matches whole words. "nevertheless" carries "never" as a
+    /// substring, but it is not the standing cue "never".
+    #[test]
+    fn standing_cues_match_whole_words_not_substrings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let e = Entry::new("a", EntryKind::Decision, "nevertheless the plan proceeded");
+        store.create(&e).unwrap();
+
+        let out = search_with_coverage(&store, &Query::new("show me a login implementation", 10))
+            .unwrap();
+        assert!(
+            out.hits.iter().all(|h| h.entry.id != e.id),
+            "a substring-only cue match must not enter the lane"
+        );
+    }
+
+    /// A multi-word standing cue cannot be assembled across the summary and
+    /// body boundary: neither field contains the phrase on its own.
+    #[test]
+    fn standing_cues_do_not_span_summary_and_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut e = Entry::new("a", EntryKind::Decision, "remember from now");
+        e.body = "on we review the deploy log".into();
+        store.create(&e).unwrap();
+        // "from now" is not itself a cue; "from now on" is. Splitting the
+        // phrase across the two fields must not fabricate the cue.
+        let out = search_with_coverage(&store, &Query::new("show me a login implementation", 10))
+            .unwrap();
+        assert!(
+            out.hits.iter().all(|h| h.entry.id != e.id),
+            "a cue phrase spanning the field boundary must not count"
+        );
+    }
+
+    /// When the cap binds, the exact four verified rules survive in ULID
+    /// order (newest first), and the two oldest are dropped. Verified rules
+    /// also precede a contradicted one regardless of creation order.
+    #[test]
+    fn lane_cap_keeps_the_newest_verified_rules_and_orders_by_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rules = Vec::new();
+        for i in 0..6 {
+            let mut r = Entry::new("a", EntryKind::Decision, format!("Always use layout {i}"));
+            r.verify("review", None);
+            store.create(&r).unwrap();
+            rules.push(r);
+        }
+        let out = search_with_coverage(&store, &Query::new("show me a login implementation", 20))
+            .unwrap();
+        let survivors: Vec<_> = out.hits.iter().map(|h| h.entry.id).collect();
+        assert_eq!(survivors.len(), STANDING_LANE_CAP);
+        // ULIDs are time-sortable; descending id = newest first. Six rules,
+        // cap 4, so the last four created survive in reverse creation order.
+        let mut expected: Vec<_> = rules.iter().skip(2).map(|r| r.id).collect();
+        expected.sort_by(|a, b| b.cmp(a));
+        assert_eq!(
+            survivors, expected,
+            "the cap keeps the newest four in order"
+        );
+
+        // A contradicted rule, even created later, must sort after the
+        // verified ones in the lane.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = Store::open(dir2.path()).unwrap();
+        let mut verified = Entry::new("a", EntryKind::Decision, "Always use dark mode");
+        verified.verify("review", None);
+        store2.create(&verified).unwrap();
+        let counter = Entry::new("a", EntryKind::Observation, "counter evidence");
+        store2.create(&counter).unwrap();
+        let mut contradicted = Entry::new("a", EntryKind::Decision, "Always use light mode");
+        contradicted.contradict(counter.id, "ops", None);
+        store2.create(&contradicted).unwrap();
+        let mixed =
+            search_with_coverage(&store2, &Query::new("show me a login implementation", 10))
+                .unwrap();
+        let lane: Vec<_> = mixed
+            .hits
+            .iter()
+            .filter(|h| h.score == 0.0)
+            .map(|h| h.entry.id)
+            .collect();
+        assert_eq!(
+            lane,
+            vec![verified.id, contradicted.id],
+            "verified guidance precedes contradicted guidance"
         );
     }
 }

@@ -111,6 +111,9 @@ knowledge-update included) and all `as_of`/`current_only` queries are
 fact-shaped and get no lane, so generic rules cannot crowd their top-k. The
 lane appends after the ordered lexical hits into spare slots below `limit`;
 it never evicts or reorders a lexical hit, and lane entries carry score 0.0.
+Cues match whole words in either field, never across the summary/body
+boundary. Lane hits are not topic-matched coverage, so a briefing that lists
+them reports them instead of claiming no knowledge matched.
 `require_verified` stays purely lexical, so strict provenance queries never
 union standing guidance.
 
