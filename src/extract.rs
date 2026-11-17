@@ -40,8 +40,10 @@
 //! A run writes its accepted entries first, then runs one batched
 //! conflict-detection pass over them — the same `detect_many` `end_session`
 //! promotions use. Per-write rescans made ingest quadratic on large
-//! journals; batching keeps the candidates identical, because a run's own
-//! writes are `unverified` and only live verified facts are candidates.
+//! journals; one scan per scope per run keeps ingest linear and still
+//! reads the layer at detection time, so a concurrent verification is
+//! visible. A run's own writes are `unverified` and only live verified
+//! facts are candidates.
 
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -794,12 +796,12 @@ impl Gungnir {
     /// `extract` over a journal snapshot the caller already loaded —
     /// `extract_source` resolves the archive and the dedupe set from the
     /// same scan it passes here. `entries` is the journal's full contents:
-    /// it drives `existing`/`known`, then rides into the detection pool.
+    /// it drives `existing`/`known`, the run's dedupe and backend memory.
     fn extract_inner(
         &self,
         units: &[TranscriptUnit],
         agent: &str,
-        mut entries: Vec<Entry>,
+        entries: Vec<Entry>,
         extractor: &dyn Extractor,
         opts: &ExtractOptions,
         embedder: Option<&dyn crate::embedding::Embedder>,
@@ -846,12 +848,13 @@ impl Gungnir {
             outcome.accepted = accepted.into_iter().map(|e| (e, Vec::new())).collect();
             return Ok(outcome);
         }
-        // Persist the batch first, then scan once: detection needs the
-        // writes on disk, but a per-write `add_inner` rescan made ingest
-        // quadratic (O(writes × journal + codex) file parses per run).
-        // `detect_many` is the same batched scan `end_session` promotions
-        // use, so conflict candidates are unchanged — a run's writes are
-        // unverified, and only verified facts are candidates.
+        // Persist the batch first, then scan once per scope: detection
+        // needs the writes on disk and reads the layer fresh, but a
+        // per-write `add_inner` rescan made ingest quadratic (O(writes ×
+        // journal + codex) file parses per run). `detect_many` is the
+        // same batched scan `end_session` promotions use, so conflict
+        // candidates are unchanged — a run's writes are `unverified`,
+        // and only verified facts are candidates.
         let mut written = Vec::with_capacity(accepted.len());
         let mut write_error = None;
         for entry in accepted {
@@ -874,12 +877,11 @@ impl Gungnir {
                 }
             }
         }
-        // `entries` is the dedupe snapshot from before the writes; adding
-        // the batch gives the journal scope its detection pool without a
-        // second full parse of the layer the run just filled.
-        entries.extend(written.iter().cloned());
-        let (conflicts, warnings) =
-            self.scan_and_record_over(&journal, &written, Some(entries), embedder);
+        // Detection reads the journal fresh, after the writes landed:
+        // a concurrent verification during `propose` must be visible as
+        // a candidate. One scan per run is still linear; the old path
+        // paid one scan per write.
+        let (conflicts, warnings) = self.scan_and_record(&journal, &written, embedder);
         outcome.warnings.extend(warnings);
         let mut by_entry: std::collections::HashMap<EntryId, Vec<_>> =
             std::collections::HashMap::new();
@@ -1225,5 +1227,72 @@ mod tests {
             .filter(|e| e.source_tool.as_deref() == Some(SOURCE_TOOL))
             .count();
         assert_eq!(count, DEFAULT_CAP + 5, "every unit lands once across runs");
+    }
+
+    /// A backend that simulates a concurrent journal write: the verified
+    /// fact lands while the backend is proposing, after the run read its
+    /// dedupe snapshot but before the batch write and detection pass.
+    struct VerifyWhileProposing {
+        root: std::path::PathBuf,
+    }
+    impl Extractor for VerifyWhileProposing {
+        fn backend(&self) -> &str {
+            "concurrent-verifier"
+        }
+
+        fn propose(
+            &self,
+            units: &[TranscriptUnit],
+            _cap: usize,
+            _known: &[(String, String)],
+        ) -> Result<Vec<Proposal>> {
+            let g = Gungnir::open(&self.root).unwrap();
+            let mut verified = Entry::new("builder", EntryKind::Decision, "sessions use mysql");
+            verified.verify("ops", None);
+            g.journal("builder").unwrap().create(&verified).unwrap();
+            Ok(units
+                .iter()
+                .enumerate()
+                .map(|(i, _)| Proposal {
+                    summary: "sessions use postgres".into(),
+                    body: String::new(),
+                    cites: vec![i],
+                    kind: ProposalKind::Observation,
+                    entities: Vec::new(),
+                })
+                .take(1)
+                .collect())
+        }
+    }
+
+    #[test]
+    fn concurrent_verification_during_propose_still_raises_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gungnir::open(dir.path()).unwrap();
+        let units = vec![TranscriptUnit {
+            text: "sessions use postgres".into(),
+            evidence: vec![Evidence::File {
+                path: "notes.md".into(),
+                excerpt: "sessions use postgres".into(),
+                sha256: "f".repeat(64),
+            }],
+        }];
+        let extractor = VerifyWhileProposing {
+            root: dir.path().to_path_buf(),
+        };
+        let out = g
+            .extract(
+                &units,
+                "builder",
+                &extractor,
+                &ExtractOptions::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(out.accepted.len(), 1);
+        let (_, conflicts) = &out.accepted[0];
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].conflicting_summary, "sessions use mysql");
+        assert_eq!(g.open_conflicts().unwrap().len(), 1);
     }
 }
