@@ -279,7 +279,9 @@ pub fn hybrid_search(
         .map(|i| (pool[i].entry.clone(), pool[i].state, relevance[i]))
         .collect();
 
-    Ok(recall::finish(matched, &revised, query, pool_len, skipped))
+    Ok(recall::finish(
+        matched, &pool, &revised, query, pool_len, skipped,
+    ))
 }
 
 /// The shipped embedder: bge-small-en-v1.5 through fastembed's ONNX runtime.
@@ -749,5 +751,39 @@ mod tests {
             assert_eq!(h1.score, h2.score, "hidden entry shifted a fused score");
         }
         assert_eq!(out2.coverage.hidden_rolled_back, 1);
+    }
+
+    /// Hybrid recall shares the standing-constraint lane with keyword recall:
+    /// a task-shaped query surfaces a standing rule that shares no words with
+    /// the question, and a fact-shaped query does not.
+    #[test]
+    fn hybrid_task_recall_surfaces_standing_constraints_but_fact_recall_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        rule.verify("review", None);
+        store.create(&rule).unwrap();
+        let fact_entry = Entry::new("a", EntryKind::Decision, "deployment schedule runs Friday");
+        store.create(&fact_entry).unwrap();
+
+        let embedder = CachedEmbedder::new(
+            Fake {
+                calls: Mutex::new(0),
+            },
+            dir.path(),
+        );
+        let task = Query::new("show me a login implementation", 10);
+        let task_out = hybrid_search(&store, &task, &embedder).unwrap();
+        assert!(
+            task_out.hits.iter().any(|h| h.entry.id == rule.id),
+            "hybrid task recall must surface the standing rule"
+        );
+
+        let fact = Query::new("what is the deployment schedule", 10);
+        let fact_out = hybrid_search(&store, &fact, &embedder).unwrap();
+        assert!(
+            fact_out.hits.iter().all(|h| h.entry.id != rule.id),
+            "hybrid fact recall must not pull in the standing rule"
+        );
     }
 }

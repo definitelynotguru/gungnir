@@ -63,6 +63,25 @@ Point-in-time questions work too:
 gungnir recall "deploys" --as-of 2026-08-01T00:00:00Z
 ```
 
+## Standing constraints in recall
+
+A rule such as "always syntax-highlight code" shares no words with a later
+task like "show me a login implementation", so keyword scoring cannot find
+it. Recall therefore keeps a **standing-constraint lane**: a deterministic
+cue tagger ("always", "never", "from now on", "I prefer", "don't", and close
+cousins) marks entries as standing rules, and a **task-shaped** query unions a
+capped slice (at most 4, appended into spare slots below `--limit`) of that
+lane into its hits. Lexical hits keep their order and scores; the lane only
+appends, and the slice is empty when lexical hits already fill the limit.
+
+The lane is rebuilt from the markdown files on every query. Files stay the
+store of truth, no model decides what is standing, and a cue match never
+verifies an entry. **Fact-shaped queries do not get the lane** — temporal
+questions and `--current`/knowledge-update queries stay on keyword recall so
+generic rules cannot crowd their top-k. `--require-verified` is a strict
+provenance query and stays lexical. The lane is part of keyword and hybrid
+recall; `embed` stays opt-in.
+
 ## Semantic recall (opt-in)
 
 The default build is BM25-lite keyword scoring with stemming and makes
@@ -183,7 +202,10 @@ Key behaviors:
   their heads and drops contradicted facts. `--as-of <RFC3339>` evaluates
   history from the verification log, no schema change required. Every search
   reports coverage, and briefings say plainly when no verified knowledge
-  covers a task. Hybrid vector+keyword fusion via reciprocal rank fusion is
+  covers a task. Task-shaped queries also surface standing constraints that
+  share no words with the question — see
+  [Standing constraints in recall](#standing-constraints-in-recall).
+  Hybrid vector+keyword fusion via reciprocal rank fusion is
   available per query through the opt-in `embed` build — see
   [Semantic recall (opt-in)](#semantic-recall-opt-in).
 

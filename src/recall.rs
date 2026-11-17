@@ -26,6 +26,12 @@
 //! Ordering sorts the verification bucket lexicographically first, then the
 //! final score: a contradicted entry can never outrank a verified one on
 //! the same topic, no matter how relevant it is.
+//!
+//! Standing constraints: a deterministic cue tagger marks rules and
+//! preferences, and task-shaped queries union a capped, appended slice of
+//! those entries into spare result slots. The lane is derived from the
+//! canonical files on every query; it writes nothing, verifies nothing, and
+//! fact-shaped (including temporal) queries never receive it.
 
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -330,8 +336,216 @@ pub(crate) fn temporal_pool(
     Ok((pool, revised, scan.skipped))
 }
 
+/// Cues that mark an entry as a standing constraint: a durable rule or
+/// preference meant to shape future work. Matching is deterministic and
+/// read-only — no model decides what is standing, and a cue never verifies
+/// the entry. Written as normalized whole-word sequences (lowercase,
+/// punctuation split), so "don't" is "don t" and "I'd prefer" is "i d prefer".
+const STANDING_CUES: &[&str] = &[
+    "always",
+    "never",
+    "from now on",
+    "i prefer",
+    "we prefer",
+    "prefer to",
+    "i d prefer",
+    "don t",
+    "do not",
+    "must not",
+    "must always",
+    "should not",
+    "should always",
+    "make sure",
+    "remember to",
+    "whenever",
+];
+
+/// Max standing constraints a task-shaped recall may append. The lane fills
+/// spare slots below `limit`; it never evicts or reorders a lexical hit.
+const STANDING_LANE_CAP: usize = 4;
+
+/// Fact-shaped queries ask about stored knowledge. A generic standing rule
+/// in a temporal or knowledge-update top-k is a false hit, so these cues
+/// take precedence over task cues and keep the lane out entirely.
+const FACT_CUES: &[&str] = &[
+    "what",
+    "who",
+    "where",
+    "which",
+    "why",
+    "whose",
+    "how many",
+    "how much",
+    "how long",
+    "how old",
+    "how often",
+    "how did",
+    "how was",
+    "how were",
+    "when",
+    "ago",
+    "as of",
+    "before",
+    "after",
+    "originally",
+    "previously",
+    "used to",
+    "did",
+    "was",
+    "were",
+    "happened",
+    "happen",
+    "current",
+    "currently",
+    "latest",
+    "still",
+    "no longer",
+    "anymore",
+    "changed",
+    "moved to",
+    "instead of",
+    "updated",
+    "superseded",
+];
+
+/// Task-shaped queries ask the agent to produce or act. Only a query with
+/// one of these and no fact cue gets the lane; every other query stays
+/// fact-shaped. Content-shape markers, not topic words.
+const TASK_CUES: &[&str] = &[
+    "show me",
+    "show us",
+    "give me",
+    "give us",
+    "give an",
+    "write",
+    "build",
+    "implement",
+    "implementation",
+    "create",
+    "generate",
+    "make a",
+    "make me",
+    "make an",
+    "draft",
+    "refactor",
+    "design",
+    "add a",
+    "add an",
+    "add the",
+    "set up",
+    "scaffold",
+    "can you",
+    "could you",
+    "would you",
+    "please",
+    "help me",
+    "let s",
+    "i need",
+    "i want",
+    "i d like",
+    "i would like",
+    "how do i",
+    "how should i",
+    "how can i",
+    "how to",
+    "how would i",
+    "produce",
+    "outline",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryShape {
+    Task,
+    Fact,
+}
+
+/// Lowercase whole-word sequence, punctuation split. Cues match whole words,
+/// so "never" does not fire on "nevertheless" and stemming cannot mangle a
+/// phrase the way `tokenize` would.
+fn normalized(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// True when a cue phrase appears as a contiguous whole-word sequence.
+fn has_cue(words: &[String], cues: &[&str]) -> bool {
+    cues.iter().any(|cue| {
+        let phrase: Vec<&str> = cue.split_whitespace().collect();
+        !phrase.is_empty()
+            && phrase.len() <= words.len()
+            && words.windows(phrase.len()).any(|w| {
+                w.iter()
+                    .zip(phrase.iter().copied())
+                    .all(|(a, b)| a.as_str() == b)
+            })
+    })
+}
+
+/// Route by query shape, not topic words. `require_verified` is a strict
+/// provenance query — it asks for verified facts on the topic and abstains
+/// otherwise — so standing constraints (off-topic guidance, a different
+/// kind of hit) stay out. Temporal and current-view queries are fact-shaped
+/// outright, independent of their wording. Fact cues win over task cues, and
+/// an unrecognized query defaults to fact-shaped — the conservative
+/// direction that keeps generic rules out of fact top-k.
+fn query_shape(query: &Query) -> QueryShape {
+    if query.require_verified || query.as_of.is_some() || query.current_only {
+        return QueryShape::Fact;
+    }
+    let words = normalized(&query.text);
+    if has_cue(&words, FACT_CUES) {
+        return QueryShape::Fact;
+    }
+    if has_cue(&words, TASK_CUES) {
+        return QueryShape::Task;
+    }
+    QueryShape::Fact
+}
+
+/// Deterministic cue tagger. The lane is derived from the canonical entries
+/// on every query; files stay the store of truth and nothing is persisted.
+fn is_standing_constraint(entry: &Entry) -> bool {
+    let mut words = normalized(&entry.summary);
+    words.extend(normalized(&entry.body));
+    has_cue(&words, STANDING_CUES)
+}
+
+/// The capped standing-constraint slice for a task-shaped query. Drawn from
+/// the same visible candidate pool as the lexical hits, so `as_of`,
+/// `current_only`, rollback, and `require_verified` apply. Rebuilt each
+/// time (a derived access view), verified-first then newest-first so the
+/// slice is stable when the cap binds.
+fn standing_lane(
+    pool: &[Candidate],
+    revised: &HashSet<EntryId>,
+    query: &Query,
+    lexical_ids: &HashSet<EntryId>,
+) -> Vec<(Entry, StateAt, f64)> {
+    if query_shape(query) != QueryShape::Task {
+        return Vec::new();
+    }
+    let mut lane: Vec<(Entry, StateAt, f64)> = visible_indices(pool, revised, query)
+        .into_iter()
+        .map(|i| (pool[i].entry.clone(), pool[i].state))
+        .filter(|(e, _)| is_standing_constraint(e) && !lexical_ids.contains(&e.id))
+        .map(|(e, st)| (e, st, 0.0))
+        .collect();
+    lane.sort_by(|a, b| {
+        bucket_at(&b.0, query.as_of)
+            .cmp(&bucket_at(&a.0, query.as_of))
+            .then(b.0.id.cmp(&a.0.id))
+    });
+    lane.truncate(STANDING_LANE_CAP);
+    lane
+}
+
 /// Shared tail of every search: coverage accounting, trust×recency
-/// weighting, bucket-first ordering, truncation.
+/// weighting, bucket-first ordering, truncation. Task-shaped queries also
+/// union a capped standing-constraint slice, appended after the lexical
+/// hits; coverage counts only the topic-matched lexical pool.
 ///
 /// `matched` holds topic-matched candidates with their raw relevance
 /// (BM25-lite or RRF). Coverage counts run over that pool before
@@ -339,6 +553,7 @@ pub(crate) fn temporal_pool(
 /// even when hits exist.
 pub(crate) fn finish(
     mut matched: Vec<(Entry, StateAt, f64)>,
+    pool: &[Candidate],
     revised: &HashSet<EntryId>,
     query: &Query,
     total: usize,
@@ -390,8 +605,16 @@ pub(crate) fn finish(
             .then(a.0.id.cmp(&b.0.id))
     });
 
+    // The lane appends into spare slots below `limit`, after the lexical
+    // hits are already ordered. Lexical hits keep their order and scores;
+    // when they fill the limit the union is empty, so the result is exactly
+    // the keyword result. Lane hits carry no lexical relevance (score 0.0).
+    let lexical_ids: HashSet<EntryId> = scored.iter().map(|(e, _, _)| e.id).collect();
+    let lane = standing_lane(pool, revised, query, &lexical_ids);
+
     let hits = scored
         .into_iter()
+        .chain(lane)
         .filter(|(_, st, _)| !query.require_verified || *st == StateAt::Verified)
         .take(query.limit)
         .map(|(entry, state, score)| Hit {
@@ -531,14 +754,14 @@ pub fn search_with_coverage(store: &Store, query: &Query) -> Result<SearchOutcom
     let total = pool.len();
 
     let matched: Vec<(Entry, StateAt, f64)> = pool
-        .into_iter()
+        .iter()
         .filter_map(|c| {
             let s = score(&c.entry, &qtokens, &stats);
-            (s > 0.0).then_some((c.entry, c.state, s))
+            (s > 0.0).then(|| (c.entry.clone(), c.state, s))
         })
         .collect();
 
-    Ok(finish(matched, &revised, query, total, skipped))
+    Ok(finish(matched, &pool, &revised, query, total, skipped))
 }
 
 /// Search, best hits first. Entries with zero overlap are dropped.
@@ -977,6 +1200,215 @@ mod tests {
         assert_eq!(
             out.hits[0].score, out.hits[1].score,
             "the 0.25 floor should equalize ancient entries"
+        );
+    }
+
+    /// The GUNG-18 case. A standing rule that shares no content words with a
+    /// task question must surface for a task-shaped query, and a fact-shaped
+    /// query over the same store must not pull it in. This is the recall
+    /// contract, not a test of the cue tagger or the lane helper.
+    #[test]
+    fn task_recall_surfaces_standing_constraints_but_fact_recall_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        rule.body = "Applies to every snippet the agent returns.".into();
+        store.create(&rule).unwrap();
+        // A plain fact in the same store, so fact recall has a real answer.
+        let fact_entry = Entry::new("a", EntryKind::Decision, "deployment schedule runs Friday");
+        store.create(&fact_entry).unwrap();
+
+        // Neither query shares a content word with the standing rule, so
+        // BM25 cannot return it for either. The only way it can appear is
+        // through the standing-constraint lane.
+        let fact = Query::new("what is the deployment schedule", 10);
+        let fact_out = search_with_coverage(&store, &fact).unwrap();
+        assert!(
+            fact_out.hits.iter().any(|h| h.entry.id == fact_entry.id),
+            "the fact question finds its answer"
+        );
+        assert!(
+            fact_out.hits.iter().all(|h| h.entry.id != rule.id),
+            "a fact question must not pull in the standing rule"
+        );
+
+        // "show me a login implementation" is task-shaped. The lane must
+        // surface the otherwise-unfindable standing rule.
+        let task = Query::new("show me a login implementation", 10);
+        let task_out = search_with_coverage(&store, &task).unwrap();
+        assert!(
+            task_out.hits.iter().any(|h| h.entry.id == rule.id),
+            "a task-shaped query must surface the standing rule: {:?}",
+            task_out
+                .hits
+                .iter()
+                .map(|h| h.entry.summary.as_str())
+                .collect::<Vec<_>>()
+        );
+        // The rule carries no lexical relevance for this question.
+        let lane_hit = task_out
+            .hits
+            .iter()
+            .find(|h| h.entry.id == rule.id)
+            .unwrap();
+        assert_eq!(lane_hit.score, 0.0);
+    }
+
+    /// The lane appends into spare slots; it never evicts or reorders the
+    /// lexical hits, even when the result limit is small.
+    #[test]
+    fn standing_lane_appends_without_displacing_lexical_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut lexical = Entry::new("a", EntryKind::Decision, "login form layout");
+        lexical.body = "username and password fields".into();
+        lexical.verify("review", None);
+        store.create(&lexical).unwrap();
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        rule.verify("review", None);
+        store.create(&rule).unwrap();
+
+        let task = Query::new("show me a login implementation", 10);
+        let full = search_with_coverage(&store, &task).unwrap();
+        let lex_first = full
+            .hits
+            .iter()
+            .position(|h| h.entry.id == lexical.id)
+            .unwrap();
+        let rule_pos = full
+            .hits
+            .iter()
+            .position(|h| h.entry.id == rule.id)
+            .unwrap();
+        assert!(
+            lex_first < rule_pos,
+            "lexical hit must rank before the appended lane hit"
+        );
+
+        // A limit of 1 leaves no spare slot: the lexical hit alone is the
+        // result, exactly as keyword recall would return.
+        let narrow =
+            search_with_coverage(&store, &Query::new("show me a login implementation", 1)).unwrap();
+        assert_eq!(narrow.hits.len(), 1);
+        assert_eq!(narrow.hits[0].entry.id, lexical.id);
+    }
+
+    /// The cap is pinned at 4. Six standing rules under a task query yield
+    /// at most four lane hits, and no lexical hit is displaced.
+    #[test]
+    fn standing_lane_is_capped_at_four_and_full_of_lexical_hits_wins() {
+        assert_eq!(STANDING_LANE_CAP, 4, "the cap named in the PR must hold");
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for i in 0..6 {
+            let mut rule = Entry::new(
+                "a",
+                EntryKind::Decision,
+                format!("Always use layout variant {i}"),
+            );
+            rule.verify("review", None);
+            store.create(&rule).unwrap();
+        }
+        let task = Query::new("show me a login implementation", 20);
+        let out = search_with_coverage(&store, &task).unwrap();
+        assert_eq!(
+            out.hits.len(),
+            STANDING_LANE_CAP,
+            "the capped slice must not exceed 4"
+        );
+
+        // With lexical hits filling spare slots, the union completes the
+        // result with no displacement of the lexical order.
+        let mut lexical = Entry::new("a", EntryKind::Decision, "login form layout");
+        lexical.body = "username and password fields".into();
+        lexical.verify("review", None);
+        store.create(&lexical).unwrap();
+        let with_lex =
+            search_with_coverage(&store, &Query::new("show me a login implementation", 4)).unwrap();
+        assert_eq!(with_lex.hits.len(), 4);
+        assert_eq!(
+            with_lex.hits[0].entry.id, lexical.id,
+            "lexical hit keeps the top rank"
+        );
+        assert_eq!(
+            with_lex.hits.iter().filter(|h| h.score == 0.0).count(),
+            3,
+            "exactly three lane hits fill the spare slots"
+        );
+    }
+
+    /// Temporal and knowledge-update queries stay fact-shaped regardless of
+    /// wording. The captain's failure case: stuffing generic constraints
+    /// into every query can drop temporal hit@10 off .98.
+    #[test]
+    fn temporal_and_knowledge_update_queries_never_get_the_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        rule.verify("review", None);
+        store.create(&rule).unwrap();
+        let mut fact = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "snippet budget reviews moved to q1",
+        );
+        fact.verify("review", None);
+        store.create(&fact).unwrap();
+
+        for q in [
+            Query::new("when did budget reviews move", 10),
+            Query::new("show me the current budget reviews", 10),
+            Query::new("show me budget reviews", 10).current(),
+            Query::new("show me budget reviews", 10).as_of(Utc::now() - chrono::Duration::days(1)),
+        ] {
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert!(
+                out.hits.iter().all(|h| h.entry.id != rule.id),
+                "{:?} must not receive the standing lane",
+                q.text
+            );
+        }
+    }
+
+    /// The lane is a derived read view. It never verifies a cue-matched
+    /// entry: an unverified rule stays unverified when it surfaces.
+    #[test]
+    fn standing_lane_never_verifies_an_entry_by_birth() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        store.create(&rule).unwrap();
+        assert_eq!(rule.verification, VerificationState::Unverified);
+
+        let task = Query::new("show me a login implementation", 10);
+        let out = search_with_coverage(&store, &task).unwrap();
+        let hit = out.hits.iter().find(|h| h.entry.id == rule.id).unwrap();
+        assert_eq!(hit.entry.verification, VerificationState::Unverified);
+        assert_eq!(hit.state, StateAt::Unverified);
+        // The file on disk is unchanged — no verification record was written.
+        let on_disk = store.require(rule.id).unwrap();
+        assert_eq!(on_disk.verification, VerificationState::Unverified);
+        assert!(on_disk.verification_log.is_empty());
+    }
+
+    /// `require_verified` is a strict provenance query, so it stays purely
+    /// lexical: no standing-constraint guidance enters the fact hit set.
+    #[test]
+    fn require_verified_queries_stay_lexical() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        rule.verify("review", None);
+        store.create(&rule).unwrap();
+
+        let gated = search_with_coverage(
+            &store,
+            &Query::new("show me a login implementation", 10).require_verified(),
+        )
+        .unwrap();
+        assert!(
+            gated.hits.iter().all(|h| h.entry.id != rule.id),
+            "a strict provenance query must not union standing constraints"
         );
     }
 }
