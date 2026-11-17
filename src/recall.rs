@@ -518,8 +518,9 @@ fn is_standing_constraint(entry: &Entry) -> bool {
 /// The capped standing-constraint slice for a task-shaped query. Drawn from
 /// the same visible candidate pool as the lexical hits, so `as_of`,
 /// `current_only`, rollback, and `require_verified` apply. Rebuilt each
-/// time (a derived access view), verified-first then newest-first so the
-/// slice is stable when the cap binds.
+/// time (a derived access view): verified-first, then newest-first by the
+/// entry's own timestamp, with the EntryId as a deterministic tie-break
+/// when timestamps are equal. The slice stays stable when the cap binds.
 fn standing_lane(
     pool: &[Candidate],
     revised: &HashSet<EntryId>,
@@ -538,6 +539,7 @@ fn standing_lane(
     lane.sort_by(|a, b| {
         bucket_at(&b.0, query.as_of)
             .cmp(&bucket_at(&a.0, query.as_of))
+            .then(b.0.timestamp.cmp(&a.0.timestamp))
             .then(b.0.id.cmp(&a.0.id))
     });
     lane.truncate(STANDING_LANE_CAP);
@@ -1486,16 +1488,25 @@ mod tests {
         );
     }
 
-    /// When the cap binds, the exact four verified rules survive in ULID
-    /// order (newest first), and the two oldest are dropped. Verified rules
-    /// also precede a contradicted one regardless of creation order.
+    /// When the cap binds, the surviving four are chosen deterministically:
+    /// newest by the entry timestamp first, then the EntryId as a stable
+    /// tie-break. ULIDs carry only millisecond time plus 80 random bits, so
+    /// entries written in one millisecond are NOT ordered by creation — the
+    /// tie-break, not creation order, decides. Verified rules also precede a
+    /// contradicted one regardless of creation order.
     #[test]
-    fn lane_cap_keeps_the_newest_verified_rules_and_orders_by_state() {
+    fn lane_cap_keeps_a_deterministic_slice_and_orders_by_state() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
+
+        // Six verified rules sharing one timestamp: the id tie-break alone
+        // decides which four the cap keeps. Asserting "the four last
+        // created" would be a false premise on a fast runner.
+        let tied = Utc::now() - chrono::Duration::days(1);
         let mut rules = Vec::new();
         for i in 0..6 {
             let mut r = Entry::new("a", EntryKind::Decision, format!("Always use layout {i}"));
+            r.timestamp = tied;
             r.verify("review", None);
             store.create(&r).unwrap();
             rules.push(r);
@@ -1503,14 +1514,38 @@ mod tests {
         let out = search_with_coverage(&store, &Query::new("show me a login implementation", 20))
             .unwrap();
         let survivors: Vec<_> = out.hits.iter().map(|h| h.entry.id).collect();
-        assert_eq!(survivors.len(), STANDING_LANE_CAP);
-        // ULIDs are time-sortable; descending id = newest first. Six rules,
-        // cap 4, so the last four created survive in reverse creation order.
-        let mut expected: Vec<_> = rules.iter().skip(2).map(|r| r.id).collect();
+        let mut expected: Vec<_> = rules.iter().map(|r| r.id).collect();
         expected.sort_by(|a, b| b.cmp(a));
+        expected.truncate(STANDING_LANE_CAP);
         assert_eq!(
             survivors, expected,
-            "the cap keeps the newest four in order"
+            "an equal-timestamp tie is broken by descending EntryId"
+        );
+
+        // Distinct timestamps: the newer rule wins over an older one even
+        // when the older one happens to carry a higher id (pin the timestamp
+        // key, not just the id tie-break).
+        let dir_ts = tempfile::tempdir().unwrap();
+        let store_ts = Store::open(dir_ts.path()).unwrap();
+        let mut older = Entry::new("a", EntryKind::Decision, "Always use the old layout");
+        older.timestamp = Utc::now() - chrono::Duration::days(10);
+        older.verify("review", None);
+        // Give the older rule the higher id so id-descending alone would
+        // rank it first; the timestamp key must overrule that.
+        let mut newer = Entry::new("a", EntryKind::Decision, "Always use the new layout");
+        newer.timestamp = Utc::now();
+        newer.verify("review", None);
+        if newer.id > older.id {
+            std::mem::swap(&mut older.id, &mut newer.id);
+        }
+        store_ts.create(&older).unwrap();
+        store_ts.create(&newer).unwrap();
+        let ts_out =
+            search_with_coverage(&store_ts, &Query::new("show me a login implementation", 10))
+                .unwrap();
+        assert_eq!(
+            ts_out.hits[0].entry.id, newer.id,
+            "newest by timestamp ranks first even with a lower id"
         );
 
         // A contradicted rule, even created later, must sort after the
