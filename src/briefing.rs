@@ -223,7 +223,10 @@ pub fn compile(input: BriefingInput) -> Briefing {
     if input.codex_coverage.verified == 0 && input.journal_coverage.verified == 0 {
         // Contradicted and hidden (superseded, rolled back) matches count:
         // the briefing lists them above, so "nothing matched" must not
-        // contradict its own output.
+        // contradict its own output. Standing-constraint lane hits are
+        // listed too; they carry score 0.0 (no lexical relevance) and do
+        // not count toward topic-matched coverage, but the briefing still
+        // shows them, so it must not claim the task matched nothing.
         let c = input.codex_coverage;
         let j = input.journal_coverage;
         let matched_any = c
@@ -236,10 +239,18 @@ pub fn compile(input: BriefingInput) -> Briefing {
             .saturating_add(j.hidden_superseded)
             .saturating_add(j.hidden_rolled_back)
             > 0;
+        let lane_hits = input
+            .codex_hits
+            .iter()
+            .chain(&input.journal_hits)
+            .filter(|h| h.score == 0.0)
+            .count();
         if matched_any {
             md.push_str(
                 "\nEntries matched this task but none are verified. Proceed with caution.\n",
             );
+        } else if lane_hits > 0 {
+            md.push_str("\nNo verified knowledge matched this task; standing constraints are listed above. Proceed with caution.\n");
         } else {
             md.push_str("\nNo knowledge matched this task. Proceed with caution.\n");
         }
@@ -302,6 +313,24 @@ mod tests {
         assert!(b.markdown.contains("nothing on file"));
         assert!(b.markdown.contains("no prior attempts"));
         assert!(b.markdown.contains("No knowledge matched this task"));
+    }
+
+    /// A briefing whose only hits come from the standing-constraint lane
+    /// (score 0.0, zero topic coverage) lists them above. Its verdict line
+    /// must not contradict that output by claiming nothing matched.
+    #[test]
+    fn lane_hits_do_not_trigger_a_no_knowledge_verdict() {
+        let mut i = input();
+        let e = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        i.codex_hits = vec![Hit {
+            entry: e,
+            state: StateAt::Unverified,
+            score: 0.0,
+        }];
+        let b = compile(i);
+        assert!(b.markdown.contains("Always syntax-highlight code"));
+        assert!(!b.markdown.contains("No knowledge matched this task"));
+        assert!(b.markdown.contains("standing constraints are listed above"));
     }
 
     #[test]

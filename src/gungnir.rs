@@ -1999,6 +1999,40 @@ mod tests {
         );
     }
 
+    /// A task briefing surfacing a standing rule through the lane lists it
+    /// above a verdict that would otherwise claim no knowledge matched.
+    #[test]
+    fn task_brief_lists_standing_constraints_without_a_no_knowledge_verdict() {
+        let (_d, g) = gng();
+        let codex = g.codex().unwrap();
+        let rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        codex.create(&rule).unwrap();
+
+        let b = g
+            .brief("builder", "show me a login implementation", 10)
+            .unwrap();
+        assert!(
+            b.codex_hits.iter().any(|h| h.entry.id == rule.id),
+            "{}",
+            b.markdown
+        );
+        assert!(
+            b.markdown.contains("Always syntax-highlight code"),
+            "{}",
+            b.markdown
+        );
+        assert!(
+            !b.markdown.contains("No knowledge matched this task"),
+            "{}",
+            b.markdown
+        );
+        assert!(
+            b.markdown.contains("standing constraints are listed above"),
+            "{}",
+            b.markdown
+        );
+    }
+
     #[test]
     fn supersede_links_and_locate_finds_layers() {
         let (_d, g) = gng();

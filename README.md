@@ -78,9 +78,12 @@ The lane is rebuilt from the markdown files on every query. Files stay the
 store of truth, no model decides what is standing, and a cue match never
 verifies an entry. **Fact-shaped queries do not get the lane** — temporal
 questions and `--current`/knowledge-update queries stay on keyword recall so
-generic rules cannot crowd their top-k. `--require-verified` is a strict
-provenance query and stays lexical. The lane is part of keyword and hybrid
-recall; `embed` stays opt-in.
+generic rules cannot crowd their top-k. Cues match whole words in either the
+summary or the body, never a phrase split across the two fields.
+`--require-verified` is a strict provenance query and stays lexical. Lane hits
+carry score 0.0 and do not count as topic-matched coverage, so a briefing that
+lists them says so plainly instead of claiming no knowledge matched. The lane
+is part of keyword and hybrid recall; `embed` stays opt-in.
 
 ## Semantic recall (opt-in)
 

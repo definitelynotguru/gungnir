@@ -167,9 +167,12 @@ unrecognized query shape defaults to fact-shaped.
 The lane **appends** into spare slots below `limit`, after the lexical hits
 are ordered. It never evicts or reorders a lexical hit; when lexical hits
 fill the limit the union is empty. Lane entries carry no lexical relevance
-(score 0.0). `require_verified` is a strict provenance query and stays purely
-lexical — it does not union standing constraints. The same lane applies to
-keyword and hybrid recall; `embed` stays opt-in.
+(score 0.0) and do not count as topic-matched coverage, so a briefing that
+lists standing constraints reports them instead of claiming no knowledge
+matched. Cues match whole words in either the summary or body, never a phrase
+assembled across the field boundary. `require_verified` is a strict provenance
+query and stays purely lexical — it does not union standing constraints. The
+same lane applies to keyword and hybrid recall; `embed` stays opt-in.
 
 ## Rollback (non-destructive)
 
