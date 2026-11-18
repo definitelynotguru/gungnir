@@ -116,6 +116,24 @@ sides. The printed numbers are empty-result counts, not judged-answer
 accuracy and not an LME/BEAM score. `src/recall.rs` pins the same behavior
 as unit tests, and `tests/audit.rs` pins the CLI contract.
 
+## In-text date fixture and LME adapter boundary
+
+`cargo run --example aev41_measurement` checks four targeted date retrieval
+cases and two controls. It covers absolute and relative forms in both
+questions and entries without topic-word overlap. Its parent-revision
+baseline is `date_recovered=0/4`, `wrong_date_empty=1/1`, and
+`lexical_fallback=1/1`. The required result after date selection is
+`date_recovered=4/4` with both controls unchanged at `1/1`. The fixture uses
+fixed UTC timestamps and explicit question times. It is not an LME or BEAM
+run, and it does not measure aggregate benchmark improvement.
+
+An LME adapter maps each question's `question_date` to `Query::question_time`.
+It must populate each canonical `Entry.timestamp` from the corresponding
+`haystack_dates` value. Entry-relative phrases use that timestamp as their
+anchor. `question_time` never replaces `as_of`, which continues to reconstruct
+learned-time history. Absolute ISO dates need no question clock. Omitting
+`question_time` leaves relative question phrases unresolved.
+
 ## Files
 
 - `corpus.yaml`: the world under test. Two agents, three sessions, a

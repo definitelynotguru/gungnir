@@ -100,6 +100,32 @@ feature ships one — bge-small-en-v1.5 quantized via fastembed/ONNX, ~100MB
 of weights downloaded on first use into `.cache/fastembed`. Without the
 feature, semantic requests error rather than silently degrading to keyword.
 
+**In-text date selection (both modes).** Keyword scoring cannot connect an
+absolute question date to a relative entry date when their topic words do not
+overlap. Recall now parses valid ISO `YYYY-MM-DD` dates and a narrow day and
+week `ago` grammar. Query-relative phrases require the explicit optional
+`Query::question_time`. Entry-relative phrases use their own
+`Entry.timestamp`. Summary and body parse separately. Unsupported and invalid
+forms produce no date signal.
+
+A per-query `HashMap<NaiveDate, Vec<EntryId>>` indexes the temporal candidate
+pool. The map lives only for that search and never becomes a source of truth.
+At the start of the shared `finish`, query dates with index hits replace the
+direct matched pool with their union. Each hit receives `1.0` plus its
+existing BM25 or RRF relevance. This keeps date-only hits in coverage and lets
+existing relevance break ties. No parsed dates or no hits leave the original
+matched pool untouched. Date selection is not a third RRF channel, and the
+remaining visibility, trust, recency, slot, provenance, answer-binding, and
+expansion rules run unchanged.
+
+The CLI and MCP adapters parse `question_time` as RFC3339. It is independent
+of `as_of` and defaults to no query-relative resolution rather than the wall
+clock. An LME adapter maps `question_date` to this input and must copy
+`haystack_dates` into canonical entry timestamps. After date selection,
+answer binding masks valid absolute ISO spans before numeric extraction so
+equivalent date forms do not create false numeric constraints. A date miss
+keeps the original numeric constraints on the fallback path.
+
 **Standing-constraint lane (both modes).** A deterministic cue tagger
 (`always`, `never`, `from now on`, `I prefer`, `don't`, and close cousins)
 marks entries as standing rules. Only verified entries are eligible, so
