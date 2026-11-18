@@ -948,3 +948,76 @@ fn mcp_semantic_true_reaches_hybrid_search() {
         assert!(text.contains(want), "{name}: {text}");
     }
 }
+
+#[test]
+fn mcp_recall_question_time_is_explicit_and_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = gungnir::Gungnir::open(dir.path()).unwrap();
+    let mut entry = gungnir::Entry::new("eval", gungnir::EntryKind::Session, "smoker purchase");
+    entry.timestamp = chrono::DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    entry.body = "Bought a smoker on 2026-11-08.".into();
+    g.codex().unwrap().create(&entry).unwrap();
+    drop(g);
+    let mut p = Proc::spawn(dir.path());
+
+    let tools = p.rpc(&msg(1, "tools/list", serde_json::json!({})));
+    let recall_schema = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "recall")
+        .unwrap();
+    assert_eq!(
+        recall_schema["inputSchema"]["properties"]["question_time"]["format"],
+        "date-time"
+    );
+
+    let call = |id, arguments| {
+        msg(
+            id,
+            "tools/call",
+            serde_json::json!({"name": "recall", "arguments": arguments}),
+        )
+    };
+    let unresolved = p.rpc(&call(
+        2,
+        serde_json::json!({"query": "Which appliance did I buy 10 days ago?"}),
+    ));
+    let unresolved_text = unresolved["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        unresolved_text.starts_with("no matches"),
+        "{unresolved_text}"
+    );
+
+    let resolved = p.rpc(&call(
+        3,
+        serde_json::json!({
+            "query": "Which appliance did I buy 10 days ago?",
+            "question_time": "2026-11-18T12:00:00Z"
+        }),
+    ));
+    assert_eq!(resolved["result"]["isError"], false, "{resolved}");
+    let resolved_text = resolved["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(resolved_text.contains("smoker purchase"), "{resolved_text}");
+
+    let invalid = p.rpc(&call(
+        4,
+        serde_json::json!({"query": "anything", "question_time": "not-a-timestamp"}),
+    ));
+    assert_eq!(invalid["result"]["isError"], true, "{invalid}");
+    let invalid_text = invalid["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(invalid_text.contains("bad question_time"), "{invalid_text}");
+
+    let wrong_type = p.rpc(&call(
+        5,
+        serde_json::json!({"query": "anything", "question_time": 7}),
+    ));
+    assert_eq!(wrong_type["result"]["isError"], true, "{wrong_type}");
+    let wrong_type_text = wrong_type["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        wrong_type_text.contains("question_time must be an RFC3339 string"),
+        "{wrong_type_text}"
+    );
+}

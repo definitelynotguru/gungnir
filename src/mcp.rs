@@ -248,7 +248,7 @@ impl Server {
             },
             {
                 "name": "recall",
-                "description": "Keyword search. layer: codex (default) or journal. Task-shaped queries also surface standing constraints that share no words with the question; fact/temporal queries do not. All but require_verified and require_evidence queries append a capped slice of verified entity and session neighbors, up to 6, below the ordered hits. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: only verified hits. require_evidence: only ordered hits whose summary and body carry the question's role/title words, digit-bearing tokens, and yes/no-question negation; excludes the standing and expansion lanes; open-class wording is left to ranking. It abstains when no hits remain at a nonzero limit. Provenance and answer binding compose. The result always ends with a machine-readable coverage JSON line including `abstained`. as_of: evaluate history at an RFC3339 instant.",
+                "description": "Keyword search. layer: codex (default) or journal. Task-shaped queries also surface standing constraints that share no words with the question; fact/temporal queries do not. All but require_verified and require_evidence queries append a capped slice of verified entity and session neighbors, up to 6, below the ordered hits. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: only verified hits. require_evidence: only ordered hits whose summary and body carry the question's role/title words, digit-bearing tokens, and yes/no-question negation; excludes the standing and expansion lanes; open-class wording is left to ranking. It abstains when no hits remain at a nonzero limit. Provenance and answer binding compose. The result always ends with a machine-readable coverage JSON line including `abstained`. as_of: evaluate history at an RFC3339 instant. question_time: independently resolve relative day/week dates in the question at an RFC3339 instant; omit it to leave them unresolved. Absolute YYYY-MM-DD dates need no anchor, and entry-relative dates use Entry.timestamp.",
                 "inputSchema": schema(json!({
                     "query": {"type": "string"},
                     "layer": {"type": "string", "enum": ["codex", "journal"]},
@@ -257,7 +257,8 @@ impl Server {
                     "semantic": {"type": "boolean"},
                     "require_verified": {"type": "boolean"},
                     "require_evidence": {"type": "boolean"},
-                    "as_of": {"type": "string"}
+                    "as_of": {"type": "string"},
+                    "question_time": {"type": "string", "format": "date-time"}
                 }), &["query"])
             },
             {
@@ -468,6 +469,15 @@ impl Server {
                         .map(|t| t.with_timezone(&chrono::Utc))
                         .map_err(|e| Error::Invalid(format!("bad as_of: {e}")))?;
                     q = q.as_of(t);
+                }
+                if let Some(value) = args.get("question_time") {
+                    let raw = value.as_str().ok_or_else(|| {
+                        Error::Invalid("question_time must be an RFC3339 string".into())
+                    })?;
+                    let t = chrono::DateTime::parse_from_rfc3339(raw)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                        .map_err(|e| Error::Invalid(format!("bad question_time: {e}")))?;
+                    q = q.question_time(t);
                 }
                 let layer = match parse_layer(arg("layer"))? {
                     LayerSel::Journal => crate::gungnir::Layer::Journal {

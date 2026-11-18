@@ -113,7 +113,9 @@ enum Cmd {
     /// share no words with the question; fact/temporal queries do not.
     /// `--require-verified` and `--require-evidence` exclude both derived
     /// lanes. Other queries append up to 6 verified entity and session
-    /// neighbors below the ordered hits.
+    /// neighbors below the ordered hits. Valid ISO dates and relative
+    /// day/week phrases in text can select entries directly. Entry-relative
+    /// phrases anchor to Entry.timestamp.
     Recall {
         query: String,
         #[arg(long, default_value = "codex")]
@@ -126,6 +128,10 @@ enum Cmd {
         /// Evaluate facts as they stood at this instant (RFC3339).
         #[arg(long)]
         as_of: Option<String>,
+        /// Resolve relative day/week dates in the question at this RFC3339
+        /// instant. Independent of --as-of. Omitted leaves them unresolved.
+        #[arg(long)]
+        question_time: Option<String>,
         /// Fuse in embedding-similarity ranking (requires the `embed`
         /// feature; downloads a ~100MB local model on first use).
         #[arg(long)]
@@ -763,6 +769,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             agent,
             current,
             as_of,
+            question_time,
             semantic,
             require_verified,
             require_evidence,
@@ -781,6 +788,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             if let Some(raw) = as_of {
                 q = q.as_of(parse_instant(&raw)?);
+            }
+            if let Some(raw) = question_time {
+                q = q.question_time(parse_instant(&raw)?);
             }
             let layer_sel = match layer_of(&layer)? {
                 crate::layout::CODEX => crate::gungnir::Layer::Codex,
