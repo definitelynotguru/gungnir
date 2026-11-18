@@ -2092,4 +2092,42 @@ mod tests {
         assert_eq!(current.hits[0].entry.id, v3.id);
         assert_eq!(current.coverage.hidden_superseded, 2);
     }
+
+    /// The `slot_stale` tie-break is global inside the verified bucket: a
+    /// stale tail loses to every non-stale verified hit, not just its own
+    /// slot head. An unrelated verified entry with a weaker BM25 score than
+    /// the tail must still rank above it.
+    #[test]
+    fn stale_slot_tail_ranks_below_every_non_stale_verified_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut stale = Entry::new("a", EntryKind::Decision, "12 commits merged into main");
+        stale.body = "12 commits merged into main total count".into();
+        stale.timestamp = Utc::now() - chrono::Duration::days(30);
+        stale.verify("archive", None);
+        store.create(&stale).unwrap();
+        let mut head = Entry::new("a", EntryKind::Decision, "main now has 19 commits");
+        head.body = "merge count updated".into();
+        head.timestamp = Utc::now() - chrono::Duration::days(1);
+        head.revises = Some(stale.id);
+        head.verify("archive", None);
+        store.create(&head).unwrap();
+        // Unrelated verified fact, same topic but a weaker lexical match
+        // than the stale tail. It has no slot, so it is not stale.
+        let mut other = Entry::new("a", EntryKind::Decision, "commits note");
+        other.verify("archive", None);
+        store.create(&other).unwrap();
+
+        let out =
+            search_with_coverage(&store, &Query::new("commits merged into main", 10)).unwrap();
+        let pos = |id| out.hits.iter().position(|h| h.entry.id == id).unwrap();
+        assert!(
+            pos(head.id) < pos(stale.id),
+            "the live head outranks the tail"
+        );
+        assert!(
+            pos(other.id) < pos(stale.id),
+            "an unrelated verified hit also outranks the stale tail"
+        );
+    }
 }
