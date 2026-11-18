@@ -893,4 +893,58 @@ mod tests {
         );
         assert!(!gated.abstained(&gated_query));
     }
+
+    #[test]
+    fn hybrid_date_only_hit_is_a_direct_match_with_a_fake_embedder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut entry = Entry::new("eval", EntryKind::Session, "smoker purchase");
+        entry.timestamp = chrono::DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        entry.body = "I bought a smoker ten days ago.".into();
+        store.create(&entry).unwrap();
+        let embedder = Fake {
+            calls: Mutex::new(0),
+        };
+        let query = Query::new("Which object is dated 2026-11-08?", 10);
+
+        let keyword = crate::recall::search_with_coverage(&store, &query).unwrap();
+        let hybrid = hybrid_search(&store, &query, &embedder).unwrap();
+        assert_eq!(hybrid.coverage, keyword.coverage);
+        assert_eq!(hybrid.hits.len(), 1);
+        assert_eq!(hybrid.hits[0].entry.id, entry.id);
+        assert!(hybrid.hits[0].score > 0.0);
+        assert_eq!(hybrid.coverage.unverified, 1);
+    }
+
+    #[test]
+    fn hybrid_date_hits_keep_rrf_relevance_as_a_tie_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut weaker = Entry::new("eval", EntryKind::Session, "postgres note");
+        weaker.timestamp = timestamp;
+        weaker.body = "Dated 2026-11-08.".into();
+        let mut stronger = Entry::new("eval", EntryKind::Session, "postgres checkout note");
+        stronger.timestamp = timestamp;
+        stronger.body = "Dated 2026-11-08.".into();
+        store.create(&weaker).unwrap();
+        store.create(&stronger).unwrap();
+        let embedder = Fake {
+            calls: Mutex::new(0),
+        };
+
+        let out = hybrid_search(
+            &store,
+            &Query::new("postgres checkout 2026-11-08", 10),
+            &embedder,
+        )
+        .unwrap();
+        assert_eq!(out.hits.len(), 2);
+        assert_eq!(out.hits[0].entry.id, stronger.id);
+        assert!(out.hits[0].score > out.hits[1].score);
+    }
 }

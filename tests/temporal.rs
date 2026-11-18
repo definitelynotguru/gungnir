@@ -17,6 +17,21 @@ fn h(n: i64) -> DateTime<Utc> {
     at(1_767_225_600 + n * 3600)
 }
 
+fn date_at(year: i32, month: u32, day: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(year, month, day, 12, 0, 0).unwrap()
+}
+
+fn dated_entry(summary: &str, body: &str, timestamp: DateTime<Utc>) -> Entry {
+    let mut entry = Entry::new("eval", EntryKind::Session, summary);
+    entry.timestamp = timestamp;
+    entry.body = body.into();
+    entry
+}
+
+fn codex_recall(g: &Gungnir, query: Query) -> gungnir::SearchOutcome {
+    g.search_layer(gungnir::Layer::Codex, &query).unwrap()
+}
+
 #[test]
 fn current_only_resolves_chains_to_heads() {
     let dir = tempfile::tempdir().unwrap();
@@ -488,4 +503,390 @@ fn require_verified_current_abstains_on_superseded_verified_tail() {
     assert!(out.hits.is_empty(), "{:?}", out.hits);
     assert_eq!(out.coverage.verified, 0);
     assert_eq!(out.coverage.hidden_superseded, 1);
+}
+
+#[test]
+fn absolute_date_retrieves_relative_entry_without_topic_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = dated_entry(
+        "smoker purchase",
+        "I bought a smoker ten days ago.",
+        date_at(2026, 11, 18),
+    );
+    g.codex().unwrap().create(&entry).unwrap();
+
+    let out = codex_recall(
+        &g,
+        Query::new("Which object is dated 2026-11-08?", 10).require_evidence(),
+    );
+    assert_eq!(out.hits.len(), 1);
+    assert_eq!(out.hits[0].entry.id, entry.id);
+    assert!(out.hits[0].score > 0.0);
+    assert_eq!(out.coverage.unverified, 1);
+}
+
+#[test]
+fn relative_query_resolves_against_explicit_question_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = dated_entry(
+        "smoker purchase",
+        "Bought a smoker on 2026-11-08.",
+        date_at(2026, 11, 18),
+    );
+    g.codex().unwrap().create(&entry).unwrap();
+
+    let out = codex_recall(
+        &g,
+        Query::new("Which kitchen appliance did I buy 10 days ago?", 10)
+            .question_time(date_at(2026, 11, 18)),
+    );
+    assert_eq!(out.hits.len(), 1);
+    assert_eq!(out.hits[0].entry.id, entry.id);
+}
+
+#[test]
+fn omitted_question_time_does_not_resolve_relative_dates_from_wall_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = dated_entry(
+        "smoker purchase",
+        "Bought a smoker on 2026-11-08.",
+        date_at(2026, 11, 18),
+    );
+    g.codex().unwrap().create(&entry).unwrap();
+    let text = "Which kitchen appliance did I buy 10 days ago?";
+
+    let unresolved = codex_recall(&g, Query::new(text, 10));
+    assert!(unresolved.hits.is_empty());
+    assert_eq!(unresolved.coverage.total_matched(), 0);
+
+    let resolved = codex_recall(
+        &g,
+        Query::new(text, 10).question_time(date_at(2026, 11, 18)),
+    );
+    assert_eq!(resolved.hits.len(), 1);
+}
+
+#[test]
+fn entry_relative_dates_use_each_entry_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let november = dated_entry(
+        "november purchase",
+        "I bought a smoker ten days ago.",
+        date_at(2026, 11, 18),
+    );
+    let october = dated_entry(
+        "october purchase",
+        "I bought a smoker ten days ago.",
+        date_at(2026, 10, 18),
+    );
+    let codex = g.codex().unwrap();
+    codex.create(&november).unwrap();
+    codex.create(&october).unwrap();
+
+    let out = codex_recall(&g, Query::new("Which object is dated 2026-11-08?", 10));
+    assert_eq!(out.hits.len(), 1);
+    assert_eq!(out.hits[0].entry.id, november.id);
+}
+
+#[test]
+fn wrong_date_has_no_hits_without_another_retrieval_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = dated_entry(
+        "smoker purchase",
+        "Bought a smoker on 2026-11-08.",
+        date_at(2026, 11, 18),
+    );
+    g.codex().unwrap().create(&entry).unwrap();
+
+    let out = codex_recall(
+        &g,
+        Query::new("Which kitchen appliance did I buy a week ago?", 10)
+            .question_time(date_at(2026, 11, 18)),
+    );
+    assert!(out.hits.is_empty());
+    assert_eq!(out.coverage.total_matched(), 0);
+}
+
+#[test]
+fn parsed_date_without_index_hits_preserves_lexical_fallback_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = dated_entry(
+        "smoker purchase",
+        "Bought a smoker on 2026-11-08.",
+        date_at(2026, 11, 18),
+    );
+    g.codex().unwrap().create(&entry).unwrap();
+    let text = "smoker purchase a week ago";
+
+    let ordinary = codex_recall(&g, Query::new(text, 10));
+    let fallback = codex_recall(
+        &g,
+        Query::new(text, 10).question_time(date_at(2026, 11, 18)),
+    );
+    assert_eq!(fallback.coverage, ordinary.coverage);
+    assert_eq!(fallback.hits.len(), ordinary.hits.len());
+    for (actual, expected) in fallback.hits.iter().zip(&ordinary.hits) {
+        assert_eq!(actual.entry.id, expected.entry.id);
+        assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+    }
+    assert_eq!(fallback.hits[0].entry.id, entry.id);
+}
+
+#[test]
+fn multiple_query_dates_union_without_duplicating_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let first = dated_entry("first object", "Recorded on 2026-11-08.", h(1));
+    let second = dated_entry("second object", "Recorded on 2026-11-11.", h(2));
+    let lexical_only = dated_entry("events notes", "No date in this entry.", h(3));
+    let codex = g.codex().unwrap();
+    for entry in [&first, &second, &lexical_only] {
+        codex.create(entry).unwrap();
+    }
+
+    let out = codex_recall(
+        &g,
+        Query::new("events on 2026-11-08 or 2026-11-11 and a week ago", 10)
+            .question_time(date_at(2026, 11, 18)),
+    );
+    assert_eq!(out.hits.len(), 2);
+    assert!(out.hits.iter().any(|hit| hit.entry.id == first.id));
+    assert!(out.hits.iter().any(|hit| hit.entry.id == second.id));
+    assert_eq!(out.coverage.total_matched(), 2);
+}
+
+#[test]
+fn date_queries_keep_as_of_admission_and_verification_history_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let mut counter = Entry::new("a", EntryKind::Observation, "counter evidence");
+    counter.timestamp = h(0);
+    codex.create(&counter).unwrap();
+    let mut entry = dated_entry("smoker purchase", "Bought a smoker on 2025-12-22.", h(10));
+    entry.verify("team", None);
+    entry.verification_log[0].timestamp = h(12);
+    entry.contradict(counter.id, "ops", None);
+    entry.verification_log[1].timestamp = h(20);
+    codex.create(&entry).unwrap();
+    let query = |cutoff| {
+        Query::new("Which appliance did I buy 10 days ago?", 10)
+            .question_time(h(10))
+            .as_of(cutoff)
+            .require_verified()
+    };
+
+    let before_entry = codex_recall(&g, query(h(9)));
+    assert!(before_entry.hits.is_empty());
+    assert_eq!(before_entry.coverage.total, 1);
+
+    let verified = codex_recall(&g, query(h(15)));
+    assert_eq!(verified.hits.len(), 1);
+    assert_eq!(verified.hits[0].state, gungnir::StateAt::Verified);
+
+    let contradicted = codex_recall(&g, query(h(25)));
+    assert!(contradicted.hits.is_empty());
+    assert_eq!(contradicted.coverage.verified, 0);
+    assert_eq!(contradicted.coverage.contradicted, 1);
+}
+
+#[test]
+fn date_hits_preserve_current_only_and_latest_slot_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let mut tail = dated_entry(
+        "smoker smoker smoker purchase",
+        "Bought on 2025-12-22.",
+        h(10),
+    );
+    tail.verify("team", None);
+    codex.create(&tail).unwrap();
+    let mut head = dated_entry("smoker purchase", "Bought on 2025-12-22.", h(11));
+    head.revises = Some(tail.id);
+    head.verify("team", None);
+    codex.create(&head).unwrap();
+    let query = || Query::new("smoker 10 days ago", 10).question_time(h(10));
+
+    let plain = codex_recall(&g, query());
+    assert_eq!(plain.hits.len(), 2);
+    assert_eq!(plain.hits[0].entry.id, head.id);
+
+    let current = codex_recall(&g, query().current());
+    assert_eq!(current.hits.len(), 1);
+    assert_eq!(current.hits[0].entry.id, head.id);
+    assert_eq!(current.coverage.hidden_superseded, 1);
+}
+
+#[test]
+fn strict_provenance_filters_date_hits_without_changing_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let unverified = dated_entry("unverified object", "Dated 2026-11-08.", h(1));
+    let mut verified = dated_entry("verified object", "Dated 2026-11-08.", h(2));
+    verified.verify("team", None);
+    codex.create(&unverified).unwrap();
+    codex.create(&verified).unwrap();
+
+    let out = codex_recall(
+        &g,
+        Query::new("Which object is dated 2026-11-08?", 10).require_verified(),
+    );
+    assert_eq!(out.hits.len(), 1);
+    assert_eq!(out.hits[0].entry.id, verified.id);
+    assert_eq!(out.coverage.verified, 1);
+    assert_eq!(out.coverage.unverified, 1);
+}
+
+#[test]
+fn date_masking_preserves_role_number_and_negation_answer_constraints() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let correct = dated_entry(
+        "release note",
+        "The senior engineer did not ship version 42 on 2026-11-08.",
+        h(1),
+    );
+    let wrong_role = dated_entry(
+        "junior note",
+        "The junior engineer did not ship version 42 on 2026-11-08.",
+        h(2),
+    );
+    let wrong_number = dated_entry(
+        "other version",
+        "The senior engineer did not ship version 43 on 2026-11-08.",
+        h(3),
+    );
+    let missing_negation = dated_entry(
+        "positive note",
+        "The senior engineer shipped version 42 on 2026-11-08.",
+        h(4),
+    );
+    for entry in [&correct, &wrong_role, &wrong_number, &missing_negation] {
+        codex.create(entry).unwrap();
+    }
+
+    let out = codex_recall(
+        &g,
+        Query::new(
+            "Did the senior engineer not ship version 42 on 2026-11-08?",
+            10,
+        )
+        .require_evidence(),
+    );
+    assert_eq!(out.hits.len(), 1, "{:?}", out.hits);
+    assert_eq!(out.hits[0].entry.id, correct.id);
+    assert_eq!(out.coverage.total_matched(), 4);
+}
+
+#[test]
+fn only_verified_date_hits_seed_verified_neighbor_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let mut verified_seed = dated_entry("verified seed", "Dated 2026-11-08.", h(1));
+    verified_seed.entities = vec!["shared".into()];
+    verified_seed.verify("team", None);
+    let mut unverified_seed = dated_entry("unverified seed", "Dated 2026-11-08.", h(2));
+    unverified_seed.entities = vec!["unverified".into()];
+    let mut verified_neighbor = dated_entry("verified neighbor", "No date here.", h(3));
+    verified_neighbor.entities = vec!["shared".into()];
+    verified_neighbor.verify("team", None);
+    let mut second_verified_neighbor = dated_entry("second neighbor", "No date here.", h(4));
+    second_verified_neighbor.entities = vec!["shared".into()];
+    second_verified_neighbor.verify("team", None);
+    let mut blocked_neighbor = dated_entry("blocked neighbor", "No date here.", h(5));
+    blocked_neighbor.entities = vec!["unverified".into()];
+    blocked_neighbor.verify("team", None);
+    for entry in [
+        &verified_seed,
+        &unverified_seed,
+        &verified_neighbor,
+        &second_verified_neighbor,
+        &blocked_neighbor,
+    ] {
+        codex.create(entry).unwrap();
+    }
+
+    let out = codex_recall(&g, Query::new("Which object is dated 2026-11-08?", 10));
+    let ids = out.hits.iter().map(|hit| hit.entry.id).collect::<Vec<_>>();
+    assert!(ids.contains(&verified_seed.id));
+    assert!(ids.contains(&unverified_seed.id));
+    assert!(ids.contains(&verified_neighbor.id));
+    assert!(ids.contains(&second_verified_neighbor.id));
+    assert!(!ids.contains(&blocked_neighbor.id));
+    assert_eq!(out.coverage.total_matched(), 2);
+}
+
+#[test]
+fn invalid_date_forms_leave_ordinary_lexical_results_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = dated_entry("smoker purchase", "No supported date here.", h(1));
+    g.codex().unwrap().create(&entry).unwrap();
+    let ordinary = codex_recall(&g, Query::new("smoker purchase", 10));
+
+    for form in [
+        "1 days ago",
+        "2 day ago",
+        "0 days ago",
+        "10 months ago",
+        "2026-02-30",
+        "2026-01-01T12:00:00Z",
+    ] {
+        let out = codex_recall(
+            &g,
+            Query::new(format!("smoker purchase {form}"), 10).question_time(date_at(2026, 11, 18)),
+        );
+        assert_eq!(out.hits.len(), 1, "{form}");
+        assert_eq!(out.hits[0].entry.id, entry.id, "{form}");
+        assert_eq!(
+            out.hits[0].score.to_bits(),
+            ordinary.hits[0].score.to_bits(),
+            "{form}"
+        );
+    }
+}
+
+#[test]
+fn date_miss_preserves_numeric_answer_constraints_on_lexical_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = dated_entry(
+        "smoker purchase",
+        "Bought a smoker on 2026-11-09.",
+        date_at(2026, 11, 18),
+    );
+    g.codex().unwrap().create(&entry).unwrap();
+
+    let query = Query::new("smoker purchase 2026-11-08", 10).require_evidence();
+    let out = codex_recall(&g, query.clone());
+    assert!(out.hits.is_empty());
+    assert_eq!(out.coverage.unverified, 1);
+    assert_eq!(out.evidence_filtered, 1);
+    assert!(out.abstained(&query));
+}
+
+#[test]
+fn date_hits_keep_existing_keyword_relevance_as_a_tie_break() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let weaker = dated_entry("smoker purchase", "Dated 2026-11-08.", h(1));
+    let stronger = dated_entry("smoker smoker purchase", "Dated 2026-11-08.", h(1));
+    codex.create(&weaker).unwrap();
+    codex.create(&stronger).unwrap();
+
+    let out = codex_recall(&g, Query::new("smoker 2026-11-08", 10));
+    assert_eq!(out.hits.len(), 2);
+    assert_eq!(out.hits[0].entry.id, stronger.id);
+    assert!(out.hits[0].score > out.hits[1].score);
 }
