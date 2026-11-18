@@ -8,6 +8,17 @@ All notable changes to Gungnir are documented here. The format follows
 
 ### Added
 
+- **In-text date retrieval.** Recall derives an in-memory date-to-entry index
+  from canonical summaries and bodies. Absolute ISO dates and narrow relative
+  day and week phrases can select direct matches in keyword and hybrid recall,
+  with `1.0` added to existing raw relevance. `Query::question_time`, CLI
+  `recall --question-time`, and MCP recall `question_time` explicitly anchor
+  relative question phrases. Omission leaves them unresolved rather than
+  reading the wall clock. Entry phrases use `Entry.timestamp`. Date hits keep
+  the existing temporal, provenance, coverage, answer-binding, standing-lane,
+  and verified-expansion rules. No index persists, no entry schema changes,
+  and no RRF channel is added. LME adapters must map `question_date` to
+  `question_time` and populate `Entry.timestamp` from `haystack_dates`.
 - **Entity and session expansion in recall.** Each query derives an adjacency
   map from canonical entries keyed by normalized `entity_mentions()` strings
   and `session_id`, with separate prefixes. Live verified lexical or vector

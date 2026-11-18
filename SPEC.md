@@ -126,6 +126,42 @@ Temporal modes:
   historical ordering is reconstructed from the pool at the cutoff, never
   from present-day slot state.
 
+**In-text date retrieval.** `Query::question_time` is an optional UTC instant.
+The CLI exposes it as `recall --question-time` and MCP recall as
+`question_time`, both parsed from RFC3339. It resolves relative dates in the
+question. `None` leaves those phrases unresolved and never reads the wall clock. This clock is independent
+of `as_of`, which still controls learned-time admission and verification
+history.
+
+Recall indexes dates from each temporal-pool entry's summary and body in
+memory on every query. Absolute ISO `YYYY-MM-DD` dates need no anchor. Entry
+phrases such as `10 days ago`, `a week ago`, and `four weeks ago` resolve
+against that entry's `timestamp`. The grammar accepts positive decimal counts,
+the words one through twelve, `a` or `an`, and singular or plural `day` and
+`week` with matching count agreement. Invalid calendar dates, unsupported
+units, disagreement, adjacent alphanumeric ISO text, and arithmetic overflow
+are non-matches. Summary and body phrases cannot span their boundary.
+
+Parsed query dates union their entry-id hits. When at least one hit exists,
+only those entries form the direct matched pool. Each receives `1.0` plus its
+existing keyword or hybrid relevance before the ordinary trust and recency
+calculation. Date-only hits therefore have positive score and coverage. No
+parsed dates or no index hits preserve ordinary keyword and hybrid behavior.
+The map is derived, is never persisted, and writes nothing. It adds no RRF
+channel and does not bypass rollback, current views, latest-slot resolution,
+strict provenance, answer binding, standing constraints, or verified-seed
+expansion. Unverified and contradicted date hits cannot seed expansion.
+
+When date selection finds an index hit, valid absolute ISO spans in the
+question are masked before generic numeric constraint extraction. Equivalent
+relative evidence can therefore bind an absolute question date. A date miss
+keeps the original numeric constraints on the lexical fallback path. Other
+role, number, and negation constraints are unchanged.
+
+An LME adapter maps `question_date` to `question_time`. It must populate
+`Entry.timestamp` from `haystack_dates` so entry-relative phrases have the
+correct anchor. Neither input changes `as_of`.
+
 Every search reports topic-scoped coverage counts (verified / unverified /
 contradicted, plus hidden superseded and rolled-back totals, plus the total
 entries in scope). Callers use coverage to abstain: when zero verified
@@ -176,7 +212,8 @@ carry every closed-class constraint extracted from the question.
   compact or spaced times bind their equivalents. "03", "3rd", and "3"
   bind, "3,000" binds "3000", and "3pm" binds "3 pm". Other digit-bearing
   tokens stay exact. Relative times such as "3 days ago" and list framing
-  such as "top 3" are not answer constraints.
+  such as "top 3" are not answer constraints. After date selection, a valid
+  absolute ISO date is not an additional answer constraint.
 - Negation in yes/no questions. A negated yes/no question requires negated
   evidence. Negated wh-questions and negation on the opening verb do not.
   `no`, `not`, `never`, `none`,

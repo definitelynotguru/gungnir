@@ -63,6 +63,36 @@ Point-in-time questions work too:
 gungnir recall "deploys" --as-of 2026-08-01T00:00:00Z
 ```
 
+## Dates written in questions and entries
+
+Recall matches valid absolute `YYYY-MM-DD` dates and relative day or week
+phrases written in summaries and bodies. Relative question phrases need an
+explicit reference instant:
+
+```bash
+gungnir recall "Which appliance did I buy 10 days ago?" \
+  --question-time 2026-11-18T12:00:00Z
+```
+
+MCP recall accepts the same value as `question_time`. Rust callers use
+`Query::new(text, limit).question_time(at)`. Without this option, relative
+question phrases stay unresolved. Recall never substitutes `as_of` or the wall
+clock. Absolute question dates work without `question_time`.
+
+Entry-relative phrases resolve against their own `Entry.timestamp`. The
+grammar supports positive decimal counts, the words one through twelve, `a`
+or `an`, and count-agreeing singular or plural `day` and `week`. Multiple query
+dates union their matches. Unsupported forms, invalid dates, and date misses
+fall back to ordinary retrieval. Date hits pass through the same coverage,
+trust, current-view, provenance, and expansion rules as other direct matches.
+The in-memory date index is rebuilt from canonical text on each query and
+never persists or writes data. Hybrid recall uses the same selection without
+another RRF channel.
+
+An LME adapter maps `question_date` to `question_time` and must populate
+`Entry.timestamp` from `haystack_dates`. `as_of` remains a separate
+learned-time history control.
+
 ## Standing constraints in recall
 
 A rule such as "always syntax-highlight code" shares no words with a later
@@ -194,8 +224,8 @@ gungnir brief --agent builder "postgres" --require-verified
 ```
 
 Exit codes: 0 success, 1 error, 2 abstention. On MCP, `recall` accepts
-`require_verified`, `require_evidence`, and `as_of` and always ends its
-result with a `coverage:` JSON line including `abstained`. `brief` accepts
+`require_verified`, `require_evidence`, `as_of`, and `question_time` and always
+ends its result with a `coverage:` JSON line including `abstained`. `brief` accepts
 `require_verified` and says "N unverified or contradicted match(es) exist,
 none verified" when the verdict fires.
 
@@ -223,6 +253,8 @@ checks them against each hit's summary and body:
   spaced times bind their equivalents. Thus "03", "3rd", and "3" bind,
   "3,000" binds "3000", and "3pm" binds "3 pm". Relative times such as "3
   days ago" and list framing such as "top 3" are not answer constraints.
+  When date selection matches an entry, a valid absolute ISO date is not an
+  additional answer constraint. Other numbers still bind normally.
 - **Negation in yes/no questions**: a negated yes/no question needs negated
   evidence. Negated wh-questions can have positive answers and do not get
   this constraint. Negation on the opening verb, as in "didn't I deploy",
