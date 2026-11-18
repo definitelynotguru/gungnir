@@ -85,9 +85,9 @@ Default mode: BM25-lite keyword scoring — `idf × tf` across `summary`
 vocabulary so inflections collapse ("migrating" matches "migration").
 Filtering happens before scoring. Sort key: `(verification_bucket,
 slot_stale, final_score)` where bucket orders verified > unverified >
-contradicted, `slot_stale` demotes non-winning members of a resolved slot
-below their slot's latest live verified member, and `final_score =
-relevance × trust × recency` — trust weights the bucket
+contradicted, `slot_stale` demotes a verified slot tail below every
+non-stale verified entry in that bucket (not just its own slot head), and
+`final_score = relevance × trust × recency` — trust weights the bucket
 (1.0 / 0.75 / 0.35) and recency decays at a 90-day half-life floored at
 0.25. Rolled-back entries are always hidden.
 
