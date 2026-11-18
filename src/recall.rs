@@ -70,10 +70,15 @@ use crate::id::EntryId;
 use crate::store::Skipped;
 use crate::{Result, Store};
 
+mod dates;
+
 #[derive(Clone, Debug)]
 pub struct Query {
     pub text: String,
     pub limit: usize,
+    /// Resolve relative dates in the question at this explicit instant.
+    /// None leaves relative query dates unresolved.
+    pub question_time: Option<DateTime<Utc>>,
     /// Evaluate candidates as they existed at an instant instead of now.
     pub as_of: Option<DateTime<Utc>>,
     /// Keep only revises-chain heads and drop contradicted facts.
@@ -95,11 +100,17 @@ impl Query {
         Self {
             text: text.into(),
             limit,
+            question_time: None,
             as_of: None,
             current_only: false,
             require_verified: false,
             require_evidence: false,
         }
+    }
+
+    pub fn question_time(mut self, at: DateTime<Utc>) -> Self {
+        self.question_time = Some(at);
+        self
     }
 
     pub fn as_of(mut self, at: DateTime<Utc>) -> Self {
@@ -1056,8 +1067,9 @@ struct AnswerConstraints {
 }
 
 impl AnswerConstraints {
-    fn parse(text: &str) -> Self {
-        let view = ConstraintView::of(&[text], true);
+    fn parse(text: &str, date_selected: bool) -> Self {
+        let masked = date_selected.then(|| dates::mask_absolute_dates(text));
+        let view = ConstraintView::of(&[masked.as_deref().unwrap_or(text)], true);
         Self {
             title_modifiers: TITLE_MODIFIERS
                 .iter()
@@ -1106,6 +1118,23 @@ pub(crate) fn finish(
     total: usize,
     skipped: Vec<Skipped>,
 ) -> SearchOutcome {
+    let date_matches = dates::select_date_matches(pool, query);
+    let date_selected = date_matches.is_some();
+    if let Some(date_ids) = date_matches {
+        let raw_by_id: HashMap<EntryId, f64> = matched
+            .into_iter()
+            .map(|(entry, _, relevance)| (entry.id, relevance))
+            .collect();
+        matched = pool
+            .iter()
+            .filter(|candidate| date_ids.contains(&candidate.entry.id))
+            .map(|candidate| {
+                let raw = raw_by_id.get(&candidate.entry.id).copied().unwrap_or(0.0);
+                (candidate.entry.clone(), candidate.state, 1.0 + raw)
+            })
+            .collect();
+    }
+
     let mut coverage = Coverage {
         total,
         ..Coverage::default()
@@ -1181,7 +1210,7 @@ pub(crate) fn finish(
 
     let binding = query
         .require_evidence
-        .then(|| AnswerConstraints::parse(&query.text));
+        .then(|| AnswerConstraints::parse(&query.text, date_selected));
 
     let mut evidence_filtered = 0;
     let hits = scored
