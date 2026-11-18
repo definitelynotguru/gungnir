@@ -102,11 +102,14 @@ feature, semantic requests error rather than silently degrading to keyword.
 
 **Standing-constraint lane (both modes).** A deterministic cue tagger
 (`always`, `never`, `from now on`, `I prefer`, `don't`, and close cousins)
-marks entries as standing rules. The lane is a derived view rebuilt from the
-canonical files on each query — no second store, no model on the write path,
-and a cue match never verifies an entry. A query-shape router unions a capped
-slice (at most 4) into **task-shaped** queries only: queries that ask the
-agent to produce or act, with no fact cue. Fact questions (temporal and
+marks entries as standing rules. Only verified entries are eligible, so
+unverified and contradicted content cannot steer a task briefing. The lane is
+a derived view rebuilt from the canonical files on each query — no second
+store, no model on the write path, and a cue match never verifies an entry.
+A query-shape router unions a capped slice (at most 4) into **task-shaped**
+queries only: queries that ask the agent to produce or act, with no fact cue.
+Single-word task cues stem their word ("building" meets "build"); phrase cues
+stay exact. Fact questions (temporal and
 knowledge-update included) and all `as_of`/`current_only` queries are
 fact-shaped and get no lane, so generic rules cannot crowd their top-k. The
 lane appends after the ordered lexical hits into spare slots below `limit`;
