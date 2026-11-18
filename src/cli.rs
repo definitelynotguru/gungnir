@@ -115,7 +115,8 @@ enum Cmd {
     /// lanes. Other queries append up to 6 verified entity and session
     /// neighbors below the ordered hits. Valid ISO dates and relative
     /// day/week phrases in text can select entries directly. Entry-relative
-    /// phrases anchor to Entry.timestamp.
+    /// phrases anchor to Entry.timestamp. Relative question phrases also
+    /// select timestamp dates within one calendar day, exact dates first.
     Recall {
         query: String,
         #[arg(long, default_value = "codex")]
@@ -129,7 +130,8 @@ enum Cmd {
         #[arg(long)]
         as_of: Option<String>,
         /// Resolve relative day/week dates in the question at this RFC3339
-        /// instant. Independent of --as-of. Omitted leaves them unresolved.
+        /// instant and select Entry.timestamp dates within one calendar day.
+        /// Independent of --as-of. Omitted leaves them unresolved.
         #[arg(long)]
         question_time: Option<String>,
         /// Fuse in embedding-similarity ranking (requires the `embed`

@@ -79,15 +79,22 @@ MCP recall accepts the same value as `question_time`. Rust callers use
 question phrases stay unresolved. Recall never substitutes `as_of` or the wall
 clock. Absolute question dates work without `question_time`.
 
-Entry-relative phrases resolve against their own `Entry.timestamp`. The
-grammar supports positive decimal counts, the words one through twelve, `a`
-or `an`, and count-agreeing singular or plural `day` and `week`. Multiple query
-dates union their matches. Unsupported forms, invalid dates, and date misses
-fall back to ordinary retrieval. Date hits pass through the same coverage,
-trust, current-view, provenance, and expansion rules as other direct matches.
-The in-memory date index is rebuilt from canonical text on each query and
-never persists or writes data. Hybrid recall uses the same selection without
-another RRF channel.
+Entry-relative phrases resolve against their own `Entry.timestamp`. Relative
+question phrases also match canonical timestamp dates directly, even when the
+entry has no date text. The target is the `question_time` calendar date minus
+the parsed interval. The inclusive window allows one calendar day on either
+side. Exact target-date hits rank before tolerance hits, and existing relevance
+breaks ties within each group. Absolute-date-only queries keep in-text matching
+without this timestamp window.
+
+The grammar supports positive decimal counts, the words one through twelve,
+`a` or `an`, and count-agreeing singular or plural `day` and `week`. Multiple
+query dates union their matches. Unsupported forms, invalid dates, and date
+misses fall back to ordinary retrieval. Date hits pass through the same
+coverage, trust, current-view, provenance, and expansion rules as other direct
+matches. The in-memory date indexes are rebuilt from canonical text and
+timestamps on each query. They never persist or write data. Hybrid recall uses
+the same selection without another RRF channel.
 
 An LME adapter maps `question_date` to `question_time` and must populate
 `Entry.timestamp` from `haystack_dates`. `as_of` remains a separate
