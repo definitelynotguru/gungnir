@@ -223,12 +223,12 @@ pub fn compile(input: BriefingInput) -> Briefing {
     if input.codex_coverage.verified == 0 && input.journal_coverage.verified == 0 {
         // Contradicted and hidden (superseded, rolled back) matches count:
         // the briefing lists them above, so "nothing matched" must not
-        // contradict its own output. Standing-constraint lane hits are
-        // listed too; they carry score 0.0 (no lexical relevance) and do
-        // not count toward topic-matched coverage, but the briefing still
-        // shows them, so it must not claim the task matched nothing. A
-        // listed verified lane hit must not be denied by a "none are
-        // verified" verdict either.
+        // contradict its own output. Appended lane hits are listed too;
+        // they carry score 0.0 (no lexical relevance) and do not count
+        // toward topic-matched coverage, but the briefing still shows
+        // them, so it must not claim the task matched nothing. A listed
+        // verified lane hit must not be denied by a "none are verified"
+        // verdict either.
         let c = input.codex_coverage;
         let j = input.journal_coverage;
         let matched_any = c
@@ -257,7 +257,7 @@ pub fn compile(input: BriefingInput) -> Briefing {
                 "\nEntries matched this task but none are verified. Proceed with caution.\n",
             );
         } else if lane_hits > 0 {
-            md.push_str("\nNo verified knowledge matched this task; standing constraints are listed above. Proceed with caution.\n");
+            md.push_str("\nNo verified knowledge matched this task; expanded recall hits are listed above. Proceed with caution.\n");
         } else {
             md.push_str("\nNo knowledge matched this task. Proceed with caution.\n");
         }
@@ -265,8 +265,8 @@ pub fn compile(input: BriefingInput) -> Briefing {
 
     // The warning names contradicted facts "above", so it counts only the
     // contradicted hits actually rendered, not the larger pre-truncation
-    // coverage pool. A contradicted lane hit has zero topic coverage but is
-    // still listed, so it earns the warning too.
+    // coverage pool. A contradicted appended hit has zero topic coverage but
+    // is still listed, so it earns the warning too.
     let contradicted = input
         .codex_hits
         .iter()
@@ -331,9 +331,9 @@ mod tests {
         assert!(b.markdown.contains("No knowledge matched this task"));
     }
 
-    /// A briefing whose only hits come from the standing-constraint lane
-    /// (score 0.0, zero topic coverage) lists them above. Its verdict line
-    /// must not contradict that output by claiming nothing matched.
+    /// A briefing whose only hits are appended lane hits (score 0.0, zero
+    /// topic coverage) lists them above. Its verdict line must not contradict
+    /// that output by claiming nothing matched.
     #[test]
     fn lane_hits_do_not_trigger_a_no_knowledge_verdict() {
         let mut i = input();
@@ -346,10 +346,10 @@ mod tests {
         let b = compile(i);
         assert!(b.markdown.contains("Always syntax-highlight code"));
         assert!(!b.markdown.contains("No knowledge matched this task"));
-        assert!(b.markdown.contains("standing constraints are listed above"));
+        assert!(b.markdown.contains("expanded recall hits are listed above"));
     }
 
-    /// A verified standing constraint listed beside an unverified topical
+    /// A verified appended lane hit listed beside an unverified topical
     /// match must not be denied by a "none are verified" verdict.
     #[test]
     fn verified_lane_hit_is_not_denied_when_unverified_matches_exist() {
@@ -376,7 +376,7 @@ mod tests {
         );
         assert!(!b.markdown.contains("none are verified"), "{}", b.markdown);
         assert!(
-            b.markdown.contains("standing constraints are listed above"),
+            b.markdown.contains("expanded recall hits are listed above"),
             "{}",
             b.markdown
         );

@@ -248,7 +248,7 @@ impl Server {
             },
             {
                 "name": "recall",
-                "description": "Keyword search. layer: codex (default) or journal. Task-shaped queries also surface standing constraints that share no words with the question; fact/temporal queries do not. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: only verified hits — the result always ends with a machine-readable coverage JSON line including `abstained`. as_of: evaluate history at an RFC3339 instant.",
+                "description": "Keyword search. layer: codex (default) or journal. Task-shaped queries also surface standing constraints that share no words with the question; fact/temporal queries do not. All but require_verified queries also append a capped slice of verified entity and session neighbors, up to 6, below the ordered hits. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: only verified hits. The result always ends with a machine-readable coverage JSON line including `abstained`. as_of: evaluate history at an RFC3339 instant.",
                 "inputSchema": schema(json!({
                     "query": {"type": "string"},
                     "layer": {"type": "string", "enum": ["codex", "journal"]},
@@ -261,7 +261,7 @@ impl Server {
             },
             {
                 "name": "brief",
-                "description": "Compile the pre-task briefing without opening a session. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: verified facts only; when none exist the briefing's abstention line fires.",
+                "description": "Compile the pre-task briefing without opening a session. Recall appends a capped slice of verified entity and session neighbors, up to 6, below the ordered hits; require_verified stays lexical. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: verified facts only; when none exist the briefing's abstention line fires.",
                 "inputSchema": schema(json!({
                     "agent": {"type": "string"},
                     "task": {"type": "string"},

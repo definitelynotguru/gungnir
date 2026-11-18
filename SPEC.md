@@ -206,6 +206,38 @@ or body, never a phrase assembled across the field boundary. `require_verified` 
 query and stays purely lexical — it does not union standing constraints. The
 same lane applies to keyword and hybrid recall; `embed` stays opt-in.
 
+### Entity and session expansion
+
+Summarization and event-ordering probes returned only the turns that shared
+question words (mean source coverage 0.09 and 0.06), so recall builds a
+derived adjacency lane on each query. Keys come from the normalized
+`entity_mentions()` strings (frontmatter `entities:` plus name-shaped
+`[[wikilinks]]`) and from `session_id`. The two namespaces use separate key
+prefixes so an entity string and a session id cannot collide. The map is
+derived from the canonical entries in the temporal candidate pool on every
+read. Nothing is persisted, and no parser, triple store, or model runs on the
+write path.
+
+Every ordered lexical or vector hit with positive relevance seeds one hop:
+entries that share a seed's entity string or session id become candidates.
+Only neighbors evaluated `Verified` at the query instant are eligible, so
+unverified, contradicted, and rolled-back neighbors never enter. Seeds and
+any id already in the hit set or the standing lane are excluded.
+`require_verified` stays purely lexical and returns no expansion. All other
+query shapes, including fact-shaped, `current_only`, and `as_of`, expand from
+their own temporal pool.
+
+At most `EXPANSION_LANE_CAP = 6` neighbors append after the ordered hits and
+the standing lane, under `limit`. This is a second, independent budget; the
+standing lane keeps its cap of 4. Expansion hits carry score 0.0 and do not
+change topic-matched coverage or abstention. Lexical hits keep their order
+and scores. The lane is deterministic: newest `timestamp` first, then
+descending `EntryId`, then the cap. `as_of`, `current_only`, rollback, and
+latest-slot resolution stay in force because the lane reads the same visible
+candidate pool. Both keyword and opt-in hybrid recall call the shared
+`finish`, so no second call site exists; `embed` stays opt-in and adds no
+embedder synonym seed.
+
 ## Rollback (non-destructive)
 
 No file is ever deleted.
