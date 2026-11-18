@@ -962,6 +962,47 @@ fn focused_value_swap_still_becomes_a_candidate() {
 }
 
 #[test]
+fn focused_gate_boundary_is_exactly_twelve_unique_stems() {
+    // The gate counts unique stemmed tokens through `recall::tokenize`
+    // (lowercase, stopwords stripped, stemmed), not characters. Pin the
+    // inclusive cutoff so an off-by-one (`<` instead of `<=`) cannot pass:
+    // a 12-stem focused value swap raises SharedFrame, and the same pair
+    // plus one extra stem (13) raises no candidate at all.
+    use gungnir::recall::tokenize;
+
+    let stems = |s: &str| {
+        tokenize(s)
+            .into_iter()
+            .collect::<std::collections::HashSet<String>>()
+            .len()
+    };
+    let frame = "checkout team lead sprint review deploy window policy audit roster quorum";
+    let old_12 = format!("{frame} priya");
+    let new_12 = format!("{frame} marcus");
+    let old_13 = format!("{frame} handoff priya");
+    let new_13 = format!("{frame} handoff marcus");
+    assert_eq!(stems(&old_12), 12);
+    assert_eq!(stems(&new_12), 12);
+    assert_eq!(stems(&old_13), 13);
+    assert_eq!(stems(&new_13), 13);
+
+    let (_d, g) = gng();
+    write_verified(&g, &old_12);
+    let out = add_entry(&g, &new_12);
+    assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
+    assert!(out.conflicts[0]
+        .signals
+        .contains(&gungnir::ConflictSignal::SharedFrame));
+
+    // One extra shared stem makes both sides 13: no lexical signal applies
+    // (no digits, no negation), so the pair must not be a candidate.
+    let (_d2, g2) = gng();
+    write_verified(&g2, &old_13);
+    let out = add_entry(&g2, &new_13);
+    assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+}
+
+#[test]
 fn unverified_old_fact_never_flags_even_with_shared_topical_tokens() {
     let (_d, g) = gng();
     let old = Entry::new("a", EntryKind::Decision, capped(EPISODE_A));
