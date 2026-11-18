@@ -239,6 +239,20 @@ build, `--semantic` adds `semantic_overlap` (cosine ≥ 0.70). Only live
 verified, claim-shaped entries are candidates; the new entry, its
 supersession parent, and its evidence refs are exempt.
 
+A candidate must be an actionable disagreement, not two claims about the
+same topic. `shared_frame` therefore requires both summaries to be
+*focused* (at most 12 unique stemmed tokens each) and to swap a value
+(each side carries a private token). A whole 200-char source-unit summary
+is not a focused claim, so two distinct episodes that merely share
+topical tokens do not raise `shared_frame`. Explicit value flips stay
+actionable on any length: `numeric_mismatch` (different digit-bearing
+tokens) and `negation_asymmetry` (one side negates) still qualify a long
+claim. On those long pairs `shared_frame` is absent, so a reviewer can see
+that the numeric or negation flip, not topical overlap, raised the
+candidate. The opt-in `semantic_overlap` channel is unchanged. Candidates
+remain advisory and unverified-by-birth; no `revises` link is written from
+a candidate until a logged `resolve --supersede` decision.
+
 Resolution reuses the trust verbs: `--supersede` links the new entry as
 revision of the conflicting one, `--contradict` marks the verified entry
 contradicted by the new claim, `--dismiss` closes the record. Briefings

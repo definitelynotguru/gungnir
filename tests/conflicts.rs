@@ -845,3 +845,143 @@ fn retried_end_rescans_promotions_the_crashed_end_landed() {
     assert!(g.open_conflicts().unwrap().is_empty());
     assert_eq!(g.all_conflicts().unwrap().len(), 1);
 }
+
+// AEV-44: whole 200-char source-unit summaries describe distinct episodes.
+// Two of them share topical stemmed tokens and carry many private tokens,
+// but they are not successive values of one fact. `shared_frame` used to
+// flag that topical overlap and bounded `resolve --supersede` joined the
+// episodes with false `revises` chains (GUNG-21, GUNG-22).
+const EPISODE_A: &str = "In Tuesday's planning call we walked through the checkout migration and Priya said the team would keep the mysql sessions for now while the cache rollout stayed on hold until the next sprint review and the deploy window was left as planned.";
+const EPISODE_B: &str = "Wednesday's retrospective covered the onboarding funnel instead, Marcus noted that mysql sessions stayed stable through the load test and the search index rebuild was deferred to the next sprint review after the staging outage, while Priya asked for a fresh cost estimate from the finance team before the deploy window changed again.";
+
+/// Persisted summaries are capped at 200 chars by `validate_entry`, the same
+/// way AEV-25's promotion-style ingest capped each source-unit summary.
+fn capped(s: &str) -> String {
+    s.chars().take(200).collect()
+}
+
+fn write_verified_long(g: &Gungnir, summary: &str) -> Entry {
+    write_verified(g, &capped(summary))
+}
+
+/// `detect_many` does not validate length, so a >200-char claim can be
+/// scanned against the canonical store directly. AEV-25 called it exactly
+/// this way over its promotion batch, with one whole-source-unit summary per
+/// entry. Caps the stored `old` claim; returns the raw candidate count.
+fn detect_verified_against(old_summary: &str, new_summary: &str) -> usize {
+    let (_d, g) = gng();
+    write_verified_long(&g, old_summary);
+    let codex = g.codex().unwrap();
+    let new = Entry::new("a", EntryKind::Decision, new_summary);
+    gungnir::conflicts::detect_many(&codex, "codex", std::slice::from_ref(&new), None)
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn distinct_episodes_with_shared_topical_tokens_do_not_become_candidates() {
+    // >200 chars, sharing many topical tokens (mysql, sessions, checkout,
+    // sprint, review, deploy, window) but describing a different episode.
+    assert!(EPISODE_B.chars().count() > 200);
+    assert_eq!(detect_verified_against(EPISODE_A, EPISODE_B), 0);
+
+    // The persisted 200-char shape must not flag either.
+    let (_d, g) = gng();
+    write_verified_long(&g, EPISODE_A);
+    let out = add_entry(&g, &capped(EPISODE_B));
+    assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+    assert!(g.open_conflicts().unwrap().is_empty());
+    // Advisory by birth: the write landed, nothing was resolved or linked.
+    assert!(g.codex().unwrap().exists(out.id).unwrap());
+    assert!(g
+        .codex()
+        .unwrap()
+        .require(out.id)
+        .unwrap()
+        .revises
+        .is_none());
+}
+
+#[test]
+fn unrelated_long_claims_on_one_topic_do_not_become_candidates() {
+    let old = "During the architecture sync the group reviewed the checkout service and agreed the mysql session store needed more capacity before the holiday traffic while the alerting dashboard stayed unchanged for another week.";
+    let new = "The Friday incident review looked at the same checkout service again and Priya confirmed mysql sessions held up under the spike but the retry policy for the payment worker was rewritten after the queue backed up and the alerting dashboard gained a new panel.";
+    assert!(new.chars().count() > 200);
+    assert_eq!(detect_verified_against(old, new), 0);
+    let (_d, g) = gng();
+    write_verified_long(&g, old);
+    let out = add_entry(&g, &capped(new));
+    assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+}
+
+#[test]
+fn numeric_change_on_a_long_claim_still_becomes_a_candidate() {
+    let (_d, g) = gng();
+    let old = "The checkout service timeout is 30s and the mysql session pool stays healthy through the sprint review, with the alerting dashboard unchanged for another week.";
+    let new = "The checkout service timeout is 60s and the mysql session pool stays healthy through the sprint review, with the alerting dashboard unchanged for another week.";
+    write_verified(&g, old);
+    let out = add_entry(&g, new);
+    assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
+    assert!(out.conflicts[0]
+        .signals
+        .contains(&gungnir::ConflictSignal::NumericMismatch));
+    // `shared_frame` is context only; it must not be the reason a long
+    // summary qualifies. The explicit numeric flip is the actionable signal.
+    assert!(!out.conflicts[0]
+        .signals
+        .contains(&gungnir::ConflictSignal::SharedFrame));
+}
+
+#[test]
+fn negation_change_on_a_long_claim_still_becomes_a_candidate() {
+    let (_d, g) = gng();
+    let old = "The checkout team will deploy on fridays after the sprint review, with mysql sessions staying healthy and the alerting dashboard unchanged for another week.";
+    let new = "The checkout team will never deploy on fridays after the sprint review, with mysql sessions staying healthy and the alerting dashboard unchanged for another week.";
+    write_verified(&g, old);
+    let out = add_entry(&g, new);
+    assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
+    assert!(out.conflicts[0]
+        .signals
+        .contains(&gungnir::ConflictSignal::NegationAsymmetry));
+    assert!(!out.conflicts[0]
+        .signals
+        .contains(&gungnir::ConflictSignal::SharedFrame));
+}
+
+#[test]
+fn focused_value_swap_still_becomes_a_candidate() {
+    // A focused claim (a handful of stemmed tokens) that changes one value
+    // is the update chain the conflict loop exists to surface.
+    let (_d, g) = gng();
+    write_verified(&g, "checkout team lead is Priya");
+    let out = add_entry(&g, "checkout lead now Marcus");
+    assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
+    assert!(out.conflicts[0]
+        .signals
+        .contains(&gungnir::ConflictSignal::SharedFrame));
+}
+
+#[test]
+fn unverified_old_fact_never_flags_even_with_shared_topical_tokens() {
+    let (_d, g) = gng();
+    let old = Entry::new("a", EntryKind::Decision, capped(EPISODE_A));
+    assert_eq!(old.verification, VerificationState::Unverified);
+    g.add(old, Layer::Codex).unwrap();
+    let out = add_entry(&g, &capped(EPISODE_B));
+    assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+    assert!(g.open_conflicts().unwrap().is_empty());
+}
+
+#[test]
+fn a_one_sided_addition_never_becomes_a_candidate() {
+    // Restating a long claim with one extra acknowledgment word is not a
+    // value swap: only one side carries a private token. This invariant held
+    // before AEV-44 and must survive the narrowing, which keeps the
+    // two-sided private-token requirement rather than widening it.
+    let (_d, g) = gng();
+    let base = "the checkout service kept mysql sessions healthy through the sprint review with the alerting dashboard unchanged for another week";
+    let old = format!("noted {base}");
+    write_verified(&g, &old);
+    let out = add_entry(&g, base);
+    assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+}

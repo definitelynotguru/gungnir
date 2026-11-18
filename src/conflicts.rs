@@ -7,23 +7,35 @@
 //! logged human/agent decision (`supersede`, `contradict`, `dismiss`).
 //! Nothing LLM-judged enters the write path.
 //!
-//! Detection is deliberately conservative on the trust side: it flags a new
-//! claim that shares a topic frame with a verified fact while asserting
-//! something different, and lets people dismiss the noise. A missed
-//! candidate is silent; a false positive costs one `resolve --dismiss`.
+//! Detection is conservative on the trust side and on claim shape: it flags
+//! a *focused* claim that changes the value of a live verified fact, or an
+//! explicit value flip (negation, number) on a longer claim. Two whole
+//! 200-char source-unit summaries share a topic but describe distinct
+//! episodes; flagging that topical overlap filled the queue with noise and
+//! let bounded resolution join unrelated facts with false `revises` chains
+//! (AEV-25: 1,098,466 LME candidates). A missed candidate is silent; a
+//! false positive costs one `resolve --dismiss`.
 //!
 //! The signals (all lexical, computed over stemmed summary tokens):
 //!
-//! - `shared_frame`: the claims share ≥2 content tokens (the topic) *and*
-//!   each carries private tokens (the claims diverge). "sessions use mysql"
-//!   vs "sessions use postgres" shares {session, use} and diverges on the
-//!   value. Near-duplicates are excluded because an identical token set
-//!   leaves nothing private.
+//! - `shared_frame`: both claims are focused — at most
+//!   `MAX_FOCUSED_CLAIM_TOKENS` unique stemmed tokens each — they share
+//!   ≥2 content tokens (the topic), and each carries private tokens (a
+//!   value swap). "sessions use mysql" vs "sessions use postgres" shares
+//!   {session, use} and diverges on the value. A whole 200-char transcript
+//!   summary is not a focused claim, so `shared_frame` does not fire on it.
+//!   Near-duplicates are excluded because an identical token set leaves
+//!   nothing private.
 //! - `negation_asymmetry`: shared topic, but exactly one side negates
 //!   ("don't use postgres" vs "use postgres"). Also catches
 //!   reworded-negation conflicts where the shared frame is thinner.
 //! - `numeric_mismatch`: shared topic, but the digit-bearing tokens differ
 //!   ("timeout is 30s" vs "timeout is 60s").
+//!
+//! Negation and numeric mismatch are explicit value flips, so they stay
+//! actionable on long summaries where `shared_frame` is not, and
+//! `shared_frame` can accompany them as context on a focused claim. The
+//! semantic channel below is unaffected by the claim-shape rule.
 //!
 //! Semantic mode (`embed` feature + an [`Embedder`]) adds a fourth channel:
 //! a verified live entry with cosine ≥ `SEMANTIC_CONFLICT_FLOOR` is a
@@ -68,6 +80,12 @@ pub(crate) const CANDIDATE_LIMIT: usize = 64;
 /// Higher than the recall match floor (0.45) because a conflict candidate
 /// must be about the *same* claim, not merely the same topic.
 const SEMANTIC_CONFLICT_FLOOR: f32 = 0.70;
+
+/// A `shared_frame` candidate must be a focused claim, not a whole
+/// source-unit summary. The 200-char summaries AEV-25 ingested carry dozens
+/// of unique stemmed tokens; a focused claim like "sessions use postgres"
+/// or "checkout team lead is Priya" carries only a handful.
+const MAX_FOCUSED_CLAIM_TOKENS: usize = 12;
 
 /// Raw (pre-stem) tokens that flip a claim's truth value. Matched before
 /// stemming because the stemmer collapses ordinary words into negations:
@@ -548,7 +566,9 @@ fn lexical_signals(new: &str, old: &str) -> Vec<ConflictSignal> {
     let mut signals = Vec::new();
     let new_private = new_t.difference(&old_t).next().is_some();
     let old_private = old_t.difference(&new_t).next().is_some();
-    if shared.len() >= 2 && new_private && old_private {
+    let focused =
+        new_t.len() <= MAX_FOCUSED_CLAIM_TOKENS && old_t.len() <= MAX_FOCUSED_CLAIM_TOKENS;
+    if shared.len() >= 2 && focused && new_private && old_private {
         signals.push(ConflictSignal::SharedFrame);
     }
     // Negation is decided on raw tokens: the stemmer turns "noted" into
