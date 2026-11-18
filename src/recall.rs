@@ -1118,16 +1118,22 @@ pub(crate) fn finish(
     total: usize,
     skipped: Vec<Skipped>,
 ) -> SearchOutcome {
-    let date_matches = dates::select_date_matches(pool, query);
-    let date_selected = date_matches.is_some();
-    if let Some(date_ids) = date_matches {
+    let date_selection = dates::select_date_matches(pool, query);
+    let date_selected = date_selection.is_some();
+    let mut exact_date_ids = HashSet::new();
+    if let Some(dates::DateSelection {
+        matched_ids,
+        exact_ids,
+    }) = date_selection
+    {
+        exact_date_ids = exact_ids;
         let raw_by_id: HashMap<EntryId, f64> = matched
             .into_iter()
             .map(|(entry, _, relevance)| (entry.id, relevance))
             .collect();
         matched = pool
             .iter()
-            .filter(|candidate| date_ids.contains(&candidate.entry.id))
+            .filter(|candidate| matched_ids.contains(&candidate.entry.id))
             .map(|candidate| {
                 let raw = raw_by_id.get(&candidate.entry.id).copied().unwrap_or(0.0);
                 (candidate.entry.clone(), candidate.state, 1.0 + raw)
@@ -1175,6 +1181,7 @@ pub(crate) fn finish(
         HashSet::new()
     };
     let slot_stale = |e: &Entry| u8::from(stale_slots.contains(&e.id));
+    let date_exact = |e: &Entry| u8::from(exact_date_ids.contains(&e.id));
 
     let now = query.as_of.unwrap_or_else(Utc::now);
     let mut scored: Vec<(Entry, StateAt, f64)> = matched
@@ -1192,6 +1199,7 @@ pub(crate) fn finish(
         bucket_at(&b.0, query.as_of)
             .cmp(&bucket_at(&a.0, query.as_of))
             .then(slot_stale(&a.0).cmp(&slot_stale(&b.0)))
+            .then(date_exact(&b.0).cmp(&date_exact(&a.0)))
             .then(b.2.total_cmp(&a.2))
             .then(a.0.id.cmp(&b.0.id))
     });

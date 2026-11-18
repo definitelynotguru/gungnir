@@ -890,3 +890,210 @@ fn date_hits_keep_existing_keyword_relevance_as_a_tie_break() {
     assert_eq!(out.hits[0].entry.id, stronger.id);
     assert!(out.hits[0].score > out.hits[1].score);
 }
+
+#[test]
+fn relative_timestamp_window_accepts_exact_and_adjacent_days_without_text_dates() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let previous = dated_entry(
+        "previous purchase",
+        "No calendar date in this note.",
+        date_at(2025, 12, 31),
+    );
+    let exact = dated_entry(
+        "exact purchase",
+        "No calendar date in this note.",
+        date_at(2026, 1, 1),
+    );
+    let next = dated_entry(
+        "next purchase",
+        "No calendar date in this note.",
+        date_at(2026, 1, 2),
+    );
+    for entry in [&previous, &exact, &next] {
+        codex.create(entry).unwrap();
+    }
+
+    let out = codex_recall(
+        &g,
+        Query::new("Which appliance did I buy 10 days ago?", 10)
+            .question_time(date_at(2026, 1, 11)),
+    );
+    assert_eq!(out.hits.len(), 3);
+    assert_eq!(out.coverage.total_matched(), 3);
+    for id in [previous.id, exact.id, next.id] {
+        assert!(out.hits.iter().any(|hit| hit.entry.id == id));
+    }
+}
+
+#[test]
+fn relative_timestamp_window_rejects_entries_two_days_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    for timestamp in [date_at(2025, 12, 30), date_at(2026, 1, 3)] {
+        let entry = dated_entry(
+            "smoker purchase",
+            "No calendar date in this note.",
+            timestamp,
+        );
+        codex.create(&entry).unwrap();
+    }
+
+    let out = codex_recall(
+        &g,
+        Query::new("Which appliance did I buy 10 days ago?", 10)
+            .question_time(date_at(2026, 1, 11)),
+    );
+    assert!(out.hits.is_empty());
+    assert_eq!(out.coverage.total_matched(), 0);
+}
+
+#[test]
+fn relative_timestamp_window_unions_existing_in_text_date_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let timestamp = dated_entry(
+        "timestamp purchase",
+        "No calendar date in this note.",
+        date_at(2026, 1, 1),
+    );
+    let in_text = dated_entry(
+        "in-text purchase",
+        "Bought on 2026-01-01.",
+        date_at(2026, 1, 10),
+    );
+    codex.create(&timestamp).unwrap();
+    codex.create(&in_text).unwrap();
+
+    let out = codex_recall(
+        &g,
+        Query::new("Which appliance did I buy 10 days ago?", 10)
+            .question_time(date_at(2026, 1, 11)),
+    );
+    assert_eq!(out.hits.len(), 2);
+    assert!(out.hits.iter().any(|hit| hit.entry.id == timestamp.id));
+    assert!(out.hits.iter().any(|hit| hit.entry.id == in_text.id));
+}
+
+#[test]
+fn relative_timestamp_window_accepts_singular_and_plural_day_week_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let entry = dated_entry(
+        "smoker purchase",
+        "No calendar date in this note.",
+        date_at(2026, 1, 1),
+    );
+    g.codex().unwrap().create(&entry).unwrap();
+
+    for (phrase, question_time) in [
+        ("1 day ago", date_at(2026, 1, 2)),
+        ("2 days ago", date_at(2026, 1, 3)),
+        ("1 week ago", date_at(2026, 1, 8)),
+        ("2 weeks ago", date_at(2026, 1, 15)),
+    ] {
+        let out = codex_recall(
+            &g,
+            Query::new(format!("Which appliance did I buy {phrase}?"), 10)
+                .question_time(question_time),
+        );
+        assert_eq!(out.hits.len(), 1, "{phrase}");
+        assert_eq!(out.hits[0].entry.id, entry.id, "{phrase}");
+    }
+}
+
+#[test]
+fn relative_timestamp_hits_keep_as_of_admission_and_verification_history_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let mut counter = Entry::new("a", EntryKind::Observation, "counter evidence");
+    counter.timestamp = h(0);
+    codex.create(&counter).unwrap();
+    let mut entry = dated_entry("smoker purchase", "No calendar date in this note.", h(10));
+    entry.verify("team", None);
+    entry.verification_log[0].timestamp = h(12);
+    entry.contradict(counter.id, "ops", None);
+    entry.verification_log[1].timestamp = h(20);
+    codex.create(&entry).unwrap();
+    let query = |cutoff| {
+        Query::new("Which appliance did I buy 10 days ago?", 10)
+            .question_time(h(250))
+            .as_of(cutoff)
+            .require_verified()
+    };
+
+    let before_entry = codex_recall(&g, query(h(9)));
+    assert!(before_entry.hits.is_empty());
+    assert_eq!(before_entry.coverage.total, 1);
+
+    let verified = codex_recall(&g, query(h(15)));
+    assert_eq!(verified.hits.len(), 1);
+    assert_eq!(verified.hits[0].entry.id, entry.id);
+    assert_eq!(verified.hits[0].state, gungnir::StateAt::Verified);
+
+    let contradicted = codex_recall(&g, query(h(25)));
+    assert!(contradicted.hits.is_empty());
+    assert_eq!(contradicted.coverage.verified, 0);
+    assert_eq!(contradicted.coverage.contradicted, 1);
+}
+
+#[test]
+fn non_temporal_queries_preserve_order_and_scores_with_question_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let weaker = dated_entry("smoker purchase", "No calendar date in this note.", h(1));
+    let stronger = dated_entry(
+        "smoker smoker purchase",
+        "No calendar date in this note.",
+        h(1),
+    );
+    codex.create(&weaker).unwrap();
+    codex.create(&stronger).unwrap();
+    let ordinary = codex_recall(&g, Query::new("smoker purchase", 10));
+    let anchored = codex_recall(
+        &g,
+        Query::new("smoker purchase", 10).question_time(date_at(2026, 1, 11)),
+    );
+
+    assert_eq!(anchored.coverage, ordinary.coverage);
+    assert_eq!(anchored.hits.len(), ordinary.hits.len());
+    for (actual, expected) in anchored.hits.iter().zip(&ordinary.hits) {
+        assert_eq!(actual.entry.id, expected.entry.id);
+        assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+    }
+    assert_eq!(ordinary.hits[0].entry.id, stronger.id);
+    assert!(ordinary.hits[0].score > ordinary.hits[1].score);
+}
+
+#[test]
+fn exact_timestamp_dates_outrank_stronger_lexical_tolerance_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let exact = dated_entry(
+        "smoker purchase",
+        "No calendar date in this note.",
+        date_at(2026, 1, 1),
+    );
+    let tolerance = dated_entry(
+        "smoker smoker smoker purchase",
+        "No calendar date in this note.",
+        date_at(2026, 1, 2),
+    );
+    codex.create(&exact).unwrap();
+    codex.create(&tolerance).unwrap();
+
+    let out = codex_recall(
+        &g,
+        Query::new("smoker 10 days ago", 10).question_time(date_at(2026, 1, 11)),
+    );
+    assert_eq!(out.hits.len(), 2);
+    assert_eq!(out.hits[0].entry.id, exact.id);
+    assert_eq!(out.hits[1].entry.id, tolerance.id);
+    assert!(out.hits[1].score > out.hits[0].score);
+}

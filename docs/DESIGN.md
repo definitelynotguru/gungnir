@@ -108,15 +108,23 @@ week `ago` grammar. Query-relative phrases require the explicit optional
 `Entry.timestamp`. Summary and body parse separately. Unsupported and invalid
 forms produce no date signal.
 
-A per-query `HashMap<NaiveDate, Vec<EntryId>>` indexes the temporal candidate
-pool. The map lives only for that search and never becomes a source of truth.
+Per-query `HashMap<NaiveDate, Vec<EntryId>>` maps index in-text dates and
+canonical timestamp dates in the temporal candidate pool. The maps live only
+for that search and never become a source of truth. Relative query dates also
+select `Entry.timestamp` dates in an inclusive window of one calendar day on
+either side of the target. This path uses the entry's UTC timestamp date, not
+its body text or verification log. It requires `question_time` and does not
+apply to absolute-date-only queries.
+
 At the start of the shared `finish`, query dates with index hits replace the
 direct matched pool with their union. Each hit receives `1.0` plus its
-existing BM25 or RRF relevance. This keeps date-only hits in coverage and lets
-existing relevance break ties. No parsed dates or no hits leave the original
-matched pool untouched. Date selection is not a third RRF channel, and the
-remaining visibility, trust, recency, slot, provenance, answer-binding, and
-expansion rules run unchanged.
+existing BM25 or RRF relevance. This keeps date-only hits in coverage. Exact
+target-date hits sort before one-day tolerance hits, after verification bucket
+and latest-slot staleness and before final score. Existing relevance breaks
+ties within each group. No parsed dates or no hits leave the original matched
+pool untouched. Date selection is not a third RRF channel, and the remaining
+visibility, trust, recency, slot, provenance, answer-binding, and expansion
+rules run unchanged.
 
 The CLI and MCP adapters parse `question_time` as RFC3339. It is independent
 of `as_of` and defaults to no query-relative resolution rather than the wall

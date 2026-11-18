@@ -142,15 +142,25 @@ the words one through twelve, `a` or `an`, and singular or plural `day` and
 units, disagreement, adjacent alphanumeric ISO text, and arithmetic overflow
 are non-matches. Summary and body phrases cannot span their boundary.
 
-Parsed query dates union their entry-id hits. When at least one hit exists,
-only those entries form the direct matched pool. Each receives `1.0` plus its
-existing keyword or hybrid relevance before the ordinary trust and recency
-calculation. Date-only hits therefore have positive score and coverage. No
-parsed dates or no index hits preserve ordinary keyword and hybrid behavior.
-The map is derived, is never persisted, and writes nothing. It adds no RRF
-channel and does not bypass rollback, current views, latest-slot resolution,
-strict provenance, answer binding, standing constraints, or verified-seed
-expansion. Unverified and contradicted date hits cannot seed expansion.
+Parsed query dates union their entry-id hits. For a relative day or week
+query with explicit `question_time`, recall also matches the UTC calendar date
+of each canonical `Entry.timestamp`. The target date is the `question_time`
+date minus the parsed interval. The inclusive window extends one calendar day
+before and after the target. These timestamp matches need no date text in the
+entry. Absolute-date-only queries do not match timestamps this way.
+
+When at least one hit exists, only those entries form the direct matched pool.
+Each receives `1.0` plus its existing keyword or hybrid relevance before the
+ordinary trust and recency calculation. Date-only hits therefore have positive
+score and coverage. Exact target-date hits rank before one-day tolerance hits,
+after verification bucket and latest-slot staleness and before final score.
+Existing relevance breaks ties within each group. No parsed dates or no index
+hits preserve ordinary keyword and hybrid behavior. The maps are derived, are
+never persisted, and write nothing. They add no RRF channel and do not bypass
+rollback, current views, latest-slot resolution, strict provenance, answer
+binding, standing constraints, or verified-seed expansion. Unverified and
+contradicted date hits cannot seed expansion. Timestamp selection reads neither
+verification-log ingest time nor the wall clock, and it does not change `as_of`.
 
 When date selection finds an index hit, valid absolute ISO spans in the
 question are masked before generic numeric constraint extraction. Equivalent

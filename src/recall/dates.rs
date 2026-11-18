@@ -5,14 +5,25 @@ use std::ops::Range;
 use super::{Candidate, Query};
 use crate::EntryId;
 
+pub(super) struct DateSelection {
+    pub(super) matched_ids: HashSet<EntryId>,
+    pub(super) exact_ids: HashSet<EntryId>,
+}
+
 struct DateIndex {
     by_date: HashMap<NaiveDate, Vec<EntryId>>,
+    by_timestamp_date: HashMap<NaiveDate, Vec<EntryId>>,
 }
 
 impl DateIndex {
     fn build(pool: &[Candidate]) -> Self {
         let mut by_date: HashMap<NaiveDate, Vec<EntryId>> = HashMap::new();
+        let mut by_timestamp_date: HashMap<NaiveDate, Vec<EntryId>> = HashMap::new();
         for candidate in pool {
+            by_timestamp_date
+                .entry(candidate.entry.timestamp.date_naive())
+                .or_default()
+                .push(candidate.entry.id);
             for text in [&candidate.entry.summary, &candidate.entry.body] {
                 for date in dates_in_text(text, Some(candidate.entry.timestamp)) {
                     let ids = by_date.entry(date).or_default();
@@ -22,13 +33,25 @@ impl DateIndex {
                 }
             }
         }
-        Self { by_date }
+        Self {
+            by_date,
+            by_timestamp_date,
+        }
     }
 
     fn matches(&self, requested: &BTreeSet<NaiveDate>) -> HashSet<EntryId> {
         requested
             .iter()
             .filter_map(|date| self.by_date.get(date))
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    fn timestamp_matches(&self, requested: &BTreeSet<NaiveDate>) -> HashSet<EntryId> {
+        requested
+            .iter()
+            .filter_map(|date| self.by_timestamp_date.get(date))
             .flatten()
             .copied()
             .collect()
@@ -131,13 +154,33 @@ fn relative_count(word: &str) -> Option<i64> {
     }
 }
 
-pub(super) fn select_date_matches(pool: &[Candidate], query: &Query) -> Option<HashSet<EntryId>> {
+pub(super) fn select_date_matches(pool: &[Candidate], query: &Query) -> Option<DateSelection> {
     let requested = dates_in_text(&query.text, query.question_time);
     if requested.is_empty() {
         return None;
     }
-    let matched = DateIndex::build(pool).matches(&requested);
-    (!matched.is_empty()).then_some(matched)
+    let index = DateIndex::build(pool);
+    let mut exact_ids = index.matches(&requested);
+    let mut matched_ids = exact_ids.clone();
+    if let Some(question_time) = query.question_time {
+        let relative_requested = relative_dates(&query.text, question_time.date_naive());
+        let exact_timestamp_ids = index.timestamp_matches(&relative_requested);
+        matched_ids.extend(exact_timestamp_ids.iter().copied());
+        exact_ids.extend(exact_timestamp_ids);
+        let timestamp_requested = relative_requested
+            .into_iter()
+            .flat_map(|date| {
+                [-1, 0, 1]
+                    .into_iter()
+                    .filter_map(move |days| date.checked_add_signed(Duration::days(days)))
+            })
+            .collect::<BTreeSet<_>>();
+        matched_ids.extend(index.timestamp_matches(&timestamp_requested));
+    }
+    (!matched_ids.is_empty()).then_some(DateSelection {
+        matched_ids,
+        exact_ids,
+    })
 }
 
 pub(super) fn mask_absolute_dates(text: &str) -> String {
