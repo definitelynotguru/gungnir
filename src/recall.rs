@@ -762,19 +762,6 @@ const TITLE_FRAMES: &[&str] = &[
     "president",
 ];
 
-const PLURAL_TITLE_MODIFIERS: &[&str] = &[
-    "senior",
-    "junior",
-    "manager",
-    "principal",
-    "director",
-    "chief",
-    "intern",
-    "assistant",
-    "vp",
-    "president",
-];
-
 const NEGATION_WORDS: &[&str] = &[
     "no", "not", "never", "none", "nobody", "nothing", "neither", "nor", "without", "cannot",
     "cant", "dont", "wont", "isnt", "arent", "wasnt", "werent", "didnt", "doesnt", "couldnt",
@@ -824,7 +811,11 @@ fn is_title_frame(token: &str) -> bool {
             .is_some_and(|singular| TITLE_FRAMES.contains(&singular))
 }
 
-fn is_role_modifier(tokens: &[String], index: usize) -> bool {
+fn modifier_form(token: &str) -> &str {
+    token.strip_suffix('s').unwrap_or(token)
+}
+
+fn is_role_modifier(tokens: &[String], index: usize, modifier: &str) -> bool {
     const QUALIFIERS: &[&str] = &[
         "software",
         "hardware",
@@ -848,6 +839,13 @@ fn is_role_modifier(tokens: &[String], index: usize) -> bool {
     ];
 
     let token = &tokens[index];
+    if token != modifier
+        && modifier_form(token) == modifier
+        && index > 0
+        && matches!(tokens[index - 1].as_str(), "which" | "what" | "the")
+    {
+        return true;
+    }
     if token == "president" {
         return true;
     }
@@ -874,12 +872,12 @@ fn is_role_modifier(tokens: &[String], index: usize) -> bool {
 }
 
 fn binds_title_modifier(tokens: &[String], modifier: &str) -> bool {
-    tokens.iter().any(|token| {
-        token == modifier
-            || (PLURAL_TITLE_MODIFIERS.contains(&modifier)
-                && token
-                    .strip_suffix('s')
-                    .is_some_and(|singular| singular == modifier))
+    tokens.iter().enumerate().any(|(index, token)| {
+        modifier_form(token) == modifier
+            && !(token != modifier
+                && ["lead", "staff", "associate"].contains(&modifier)
+                && index > 0
+                && is_title_frame(&tokens[index - 1]))
     })
 }
 
@@ -971,17 +969,56 @@ fn numeric_tokens(tokens: &[String], question_framing: bool) -> HashSet<String> 
                 i += 1;
                 continue;
             }
+            let compact_minute = tokens.get(i + 1).and_then(|next| {
+                ["am", "pm"].iter().find_map(|suffix| {
+                    next.strip_suffix(suffix)
+                        .filter(|minute| {
+                            minute.len() == 2 && minute.chars().all(|c| c.is_ascii_digit())
+                        })
+                        .map(|minute| (minute, suffix))
+                })
+            });
+            if let Some((minute, suffix)) = compact_minute {
+                numbers.insert(format!("{}:{}{}", canonical_number(token), minute, suffix));
+                i += 2;
+                continue;
+            }
             if tokens
                 .get(i + 1)
                 .is_some_and(|suffix| suffix == "am" || suffix == "pm")
             {
-                numbers.insert(format!("{}{}", canonical_number(token), tokens[i + 1]));
+                numbers.insert(format!("{}:00{}", canonical_number(token), tokens[i + 1]));
                 i += 2;
+                continue;
+            }
+            if tokens.get(i + 1).is_some_and(|minute| {
+                minute.len() == 2 && minute.chars().all(|c| c.is_ascii_digit())
+            }) && tokens
+                .get(i + 2)
+                .is_some_and(|suffix| suffix == "am" || suffix == "pm")
+            {
+                numbers.insert(format!(
+                    "{}:{}{}",
+                    canonical_number(token),
+                    tokens[i + 1],
+                    tokens[i + 2]
+                ));
+                i += 3;
                 continue;
             }
             numbers.insert(canonical_number(token));
             i += 1;
             continue;
+        }
+        let meridiem = ["am", "pm"]
+            .iter()
+            .find_map(|suffix| token.strip_suffix(suffix).map(|hour| (hour, suffix)));
+        if let Some((hour, suffix)) = meridiem {
+            if hour.chars().all(|c| c.is_ascii_digit()) {
+                numbers.insert(format!("{}:00{}", canonical_number(hour), suffix));
+                i += 1;
+                continue;
+            }
         }
         numbers.insert(canonical_number(token));
         i += 1;
@@ -1026,10 +1063,10 @@ impl AnswerConstraints {
                 .iter()
                 .copied()
                 .filter(|modifier| {
-                    view.tokens
-                        .iter()
-                        .enumerate()
-                        .any(|(i, token)| token == modifier && is_role_modifier(&view.tokens, i))
+                    view.tokens.iter().enumerate().any(|(i, token)| {
+                        modifier_form(token) == *modifier
+                            && is_role_modifier(&view.tokens, i, modifier)
+                    })
                 })
                 .collect(),
             numbers: view.numbers,
@@ -3264,8 +3301,11 @@ mod tests {
         appliance.verify("review", None);
         let mut price = Entry::new("a", EntryKind::Observation, "I paid $3,000 for the smoker");
         price.verify("review", None);
-        let mut meeting = Entry::new("a", EntryKind::Observation, "the review starts at 3 pm");
+        let mut meeting = Entry::new("a", EntryKind::Observation, "the review starts at 3:00 pm");
         meeting.verify("review", None);
+        let mut compact_meeting =
+            Entry::new("a", EntryKind::Observation, "the review starts at 3pm");
+        compact_meeting.verify("review", None);
         let mut features = Entry::new(
             "a",
             EntryKind::Decision,
@@ -3288,6 +3328,7 @@ mod tests {
             appliance.clone(),
             price.clone(),
             meeting.clone(),
+            compact_meeting.clone(),
             features.clone(),
             attendance.clone(),
             pages.clone(),
@@ -3297,6 +3338,7 @@ mod tests {
             ("what did I buy for cooking 3 days ago", appliance.id),
             ("did I pay 3000 dollars for the smoker", price.id),
             ("did the review start at 3pm", meeting.id),
+            ("did the review start at 3:00pm", compact_meeting.id),
             ("did we ship 3 features in the release", features.id),
             ("did 100 people join the beta in 2024", attendance.id),
             ("did I read pages 10 to 200 of the spec", pages.id),
@@ -3309,20 +3351,69 @@ mod tests {
             );
             assert!(!out.abstained(&q), "{asked}");
         }
+
+        let q = Query::new("did the review start at 4pm", 10).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert!(out.hits.is_empty());
+        assert!(out.abstained(&q));
     }
 
     #[test]
-    fn answer_gate_binds_plural_modifiers() {
-        let mut plural = Entry::new("a", EntryKind::Decision, "managers own the checkout cache");
-        plural.verify("review", None);
-        let (_dir, store) = store_with(vec![plural.clone()]);
+    fn answer_gate_collects_plural_role_questions() {
+        for (asked, summary) in [
+            (
+                "which managers own the checkout cache",
+                "manager owns the checkout cache",
+            ),
+            (
+                "which leads own the checkout cache",
+                "lead owns the checkout cache",
+            ),
+        ] {
+            let mut entry = Entry::new("a", EntryKind::Decision, summary);
+            entry.verify("review", None);
+            let (_dir, store) = store_with(vec![entry.clone()]);
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert_eq!(out.hits.len(), 1, "{asked}");
+            assert_eq!(out.hits[0].entry.id, entry.id);
+            assert!(!out.abstained(&q), "{asked}");
+        }
+    }
 
-        let q = Query::new("which manager of engineering owns the checkout cache", 10)
-            .require_evidence();
-        let out = search_with_coverage(&store, &q).unwrap();
-        assert_eq!(out.hits.len(), 1);
-        assert_eq!(out.hits[0].entry.id, plural.id);
-        assert!(!out.abstained(&q));
+    #[test]
+    fn answer_gate_binds_plural_role_evidence() {
+        for (asked, summary) in [
+            (
+                "which manager of engineering owns the checkout cache",
+                "managers own the checkout cache",
+            ),
+            (
+                "which lead engineer owns the checkout cache",
+                "the leads own the checkout cache",
+            ),
+            (
+                "which staff engineer reviews checkout",
+                "the staffs review checkout",
+            ),
+            (
+                "which associate engineer reviews checkout",
+                "the associates review checkout",
+            ),
+            (
+                "which distinguished engineer reviews checkout",
+                "the distinguished engineer reviews checkout",
+            ),
+        ] {
+            let mut entry = Entry::new("a", EntryKind::Decision, summary);
+            entry.verify("review", None);
+            let (_dir, store) = store_with(vec![entry.clone()]);
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert_eq!(out.hits.len(), 1, "{asked}");
+            assert_eq!(out.hits[0].entry.id, entry.id);
+            assert!(!out.abstained(&q), "{asked}");
+        }
     }
 
     #[test]

@@ -773,6 +773,45 @@ fn mcp_recall_require_evidence_abstains_on_unbound_evidence() {
 }
 
 #[test]
+fn mcp_recall_require_evidence_binds_equivalent_clock_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = gungnir::Gungnir::open(dir.path()).unwrap();
+    let mut meeting = gungnir::Entry::new(
+        "a",
+        gungnir::EntryKind::Observation,
+        "the review starts at 3:00pm",
+    );
+    meeting.verify("review", None);
+    g.codex().unwrap().create(&meeting).unwrap();
+    drop(g);
+
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+    let r = p.rpc(&msg(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "recall",
+            "arguments": {
+                "query": "did the review start at 3pm",
+                "require_evidence": true
+            }
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains(&meeting.id.to_string()), "{text}");
+    let cov: serde_json::Value = serde_json::from_str(
+        text.lines()
+            .last()
+            .unwrap()
+            .trim_start_matches("coverage: "),
+    )
+    .unwrap();
+    assert_eq!(cov["abstained"], false, "{text}");
+}
+
+#[test]
 fn mcp_brief_require_verified_hides_unverified_hits() {
     let dir = tempfile::tempdir().unwrap();
     let g = gungnir::Gungnir::open(dir.path()).unwrap();
