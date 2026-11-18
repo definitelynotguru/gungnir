@@ -2003,4 +2003,93 @@ mod tests {
         assert_eq!(out.coverage.hidden_superseded, 1);
         assert!(!out.hits.iter().any(|h| h.entry.id == stale_id));
     }
+
+    /// A plain query with limit 1 must still return the live head: the slot
+    /// tie-break runs in `sort_by` before `.take(limit)`, so an early
+    /// truncation that kept the stale tail's higher BM25 score is caught.
+    #[test]
+    fn plain_slot_query_with_limit_one_returns_the_live_head() {
+        let (_d, store, _stale_id, head_id) = verified_slot_pair();
+        let out = search_with_coverage(&store, &Query::new("commits merged into main", 1)).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.id, head_id);
+    }
+
+    /// An `as_of` cutoff after both members exist keeps historical order:
+    /// both entries are in scope, but a point-in-time read never applies the
+    /// present-day slot demotion, so the tail's BM25 advantage stands. A
+    /// plain present-time query over the same store ranks the head first.
+    #[test]
+    fn as_of_covering_the_full_chain_keeps_historical_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let t0 = Utc::now() - chrono::Duration::days(30);
+        let t1 = Utc::now() - chrono::Duration::days(10);
+        let mut stale = Entry::new("a", EntryKind::Decision, "12 commits merged into main");
+        stale.body = "12 commits merged into main total count".into();
+        stale.timestamp = t0;
+        stale.verify("archive", None);
+        store.create(&stale).unwrap();
+        let mut head = Entry::new("a", EntryKind::Decision, "main now has 19 commits");
+        head.body = "merge count updated".into();
+        head.timestamp = t1;
+        head.revises = Some(stale.id);
+        head.verify("archive", None);
+        store.create(&head).unwrap();
+
+        let cutoff = t1 + chrono::Duration::days(1);
+        let past = search_with_coverage(
+            &store,
+            &Query::new("commits merged into main", 10).as_of(cutoff),
+        )
+        .unwrap();
+        assert_eq!(past.hits.len(), 2, "both generations are in scope");
+        assert_eq!(past.hits[0].entry.id, stale.id, "history keeps BM25 order");
+
+        let now =
+            search_with_coverage(&store, &Query::new("commits merged into main", 10)).unwrap();
+        assert_eq!(
+            now.hits[0].entry.id, head.id,
+            "present time promotes the head"
+        );
+    }
+
+    /// A three-member verified chain A<-B<-C is one slot. The oldest tail
+    /// owns the rare query token, so BM25 would rank a tail first; a plain
+    /// query must demote both tails below the live head, and `--current`
+    /// must hide both.
+    #[test]
+    fn plain_and_current_views_demote_both_tails_in_a_three_member_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut v1 = Entry::new("a", EntryKind::Decision, "sessions use mysql zephyr");
+        v1.body = "sessions use mysql zephyr sessions use mysql zephyr".into();
+        v1.timestamp = Utc::now() - chrono::Duration::days(30);
+        v1.verify("archive", None);
+        store.create(&v1).unwrap();
+        let mut v2 = Entry::new("a", EntryKind::Decision, "sessions use postgres");
+        v2.timestamp = Utc::now() - chrono::Duration::days(10);
+        v2.revises = Some(v1.id);
+        v2.verify("archive", None);
+        store.create(&v2).unwrap();
+        let mut v3 = Entry::new("a", EntryKind::Decision, "sessions use cockroach");
+        v3.timestamp = Utc::now() - chrono::Duration::days(1);
+        v3.revises = Some(v2.id);
+        v3.verify("archive", None);
+        store.create(&v3).unwrap();
+
+        let plain = search_with_coverage(&store, &Query::new("sessions use zephyr", 10)).unwrap();
+        assert_eq!(plain.hits[0].entry.id, v3.id, "the live head ranks first");
+        let head_pos = plain.hits.iter().position(|h| h.entry.id == v3.id).unwrap();
+        for tail in [v1.id, v2.id] {
+            let pos = plain.hits.iter().position(|h| h.entry.id == tail).unwrap();
+            assert!(pos > head_pos, "tail {tail} is demoted below the head");
+        }
+
+        let current =
+            search_with_coverage(&store, &Query::new("sessions use zephyr", 10).current()).unwrap();
+        assert_eq!(current.hits.len(), 1);
+        assert_eq!(current.hits[0].entry.id, v3.id);
+        assert_eq!(current.coverage.hidden_superseded, 2);
+    }
 }
