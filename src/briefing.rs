@@ -256,7 +256,20 @@ pub fn compile(input: BriefingInput) -> Briefing {
         }
     }
 
-    let contradicted = input.codex_coverage.contradicted + input.journal_coverage.contradicted;
+    // Coverage counts topic-matched contradicted facts, but a hit listed
+    // above with zero coverage (a lane hit) would otherwise get no warning.
+    // Drive the count from the hits actually shown too, so "fact(s) above"
+    // stays true of the rendered output. max() keeps the existing count when
+    // coverage is higher, e.g. a truncated result limit.
+    let coverage_contradicted =
+        input.codex_coverage.contradicted + input.journal_coverage.contradicted;
+    let listed_contradicted = input
+        .codex_hits
+        .iter()
+        .chain(&input.journal_hits)
+        .filter(|h| h.state == recall::StateAt::Contradicted)
+        .count();
+    let contradicted = coverage_contradicted.max(listed_contradicted);
     if contradicted > 0 {
         md.push_str(&format!(
             "\nWarning: {contradicted} contradicted fact(s) above. Do not rely on them.\n"
@@ -324,13 +337,30 @@ mod tests {
         let e = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
         i.codex_hits = vec![Hit {
             entry: e,
-            state: StateAt::Unverified,
+            state: StateAt::Verified,
             score: 0.0,
         }];
         let b = compile(i);
         assert!(b.markdown.contains("Always syntax-highlight code"));
         assert!(!b.markdown.contains("No knowledge matched this task"));
         assert!(b.markdown.contains("standing constraints are listed above"));
+    }
+
+    /// A contradicted hit listed above with no topic coverage still earns the
+    /// do-not-rely warning. Coverage counters alone would stay silent.
+    #[test]
+    fn contradicted_lane_hit_still_warns_without_coverage() {
+        let mut i = input();
+        let mut e = Entry::new("a", EntryKind::Decision, "Never deploy on Fridays");
+        e.contradict(EntryId::generate(), "reviewer", None);
+        i.codex_hits = vec![Hit {
+            entry: e,
+            state: StateAt::Contradicted,
+            score: 0.0,
+        }];
+        let b = compile(i);
+        assert!(b.markdown.contains("CONTRADICTED"), "{}", b.markdown);
+        assert!(b.markdown.contains("Do not rely on them"), "{}", b.markdown);
     }
 
     #[test]

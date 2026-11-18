@@ -1986,7 +1986,8 @@ mod tests {
     fn task_brief_lists_standing_constraints_without_a_no_knowledge_verdict() {
         let (_d, g) = gng();
         let codex = g.codex().unwrap();
-        let rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        rule.verify("review", None);
         codex.create(&rule).unwrap();
 
         let b = g

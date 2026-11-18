@@ -155,18 +155,22 @@ never writes, never verifies, and uses no model. The lane is a derived view
 rebuilt from the canonical files on every query — markdown stays the store of
 truth, and no second store is introduced.
 
-A query-shape router unions a capped slice of the lane (at most 4 entries)
-into **task-shaped** queries only. A query is task-shaped when it asks the
-agent to produce or act (`show me`, `write`, `how do I`, `please`, and
-similar), with no fact cue. Fact questions — especially temporal and
+Only **verified** entries are eligible: unverified and contradicted content
+must not steer a task briefing (EXTRACTION-THREAT-MODEL.md). This is a read
+filter, not a verification step. A query-shape router unions a capped slice of
+the lane (at most 4 entries) into **task-shaped** queries only. A query is
+task-shaped when it asks the agent to produce or act (`show me`, `write`,
+`how do I`, `please`, and similar, including common single-word inflections
+like `building`), with no fact cue. Fact questions — especially temporal and
 knowledge-update queries (`when`, `did`, `current`, `moved to`, `no
 longer`) — and every `as_of`/`current_only` query are fact-shaped and never
-receive the lane, so generic rules cannot drop temporal hit@10. An
-unrecognized query shape defaults to fact-shaped.
+receive the lane, so generic rules cannot drop temporal hit@10. A fact cue
+wins when both shapes appear; an unrecognized query shape defaults to
+fact-shaped.
 
 The lane **appends** into spare slots below `limit`, after the lexical hits
-are ordered. When the cap binds, the slice is verified-first, then newest by
-the entry timestamp, then descending EntryId as a deterministic tie-break
+are ordered. When the cap binds, the slice is newest by the entry timestamp,
+then descending EntryId as a deterministic tie-break
 (ULIDs carry only millisecond time plus 80 random bits, so same-millisecond
 entries are not ordered by creation). It never evicts or reorders a lexical
 hit; when lexical hits fill the limit the union is empty. Lane entries carry

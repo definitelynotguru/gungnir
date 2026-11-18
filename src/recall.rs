@@ -29,7 +29,7 @@
 //!
 //! Standing constraints: a deterministic cue tagger marks rules and
 //! preferences, and task-shaped queries union a capped, appended slice of
-//! those entries into spare result slots. The lane is derived from the
+//! verified entries into spare result slots. The lane is derived from the
 //! canonical files on every query; it writes nothing, verifies nothing, and
 //! fact-shaped (including temporal) queries never receive it.
 
@@ -484,6 +484,27 @@ fn has_cue(words: &[String], cues: &[&str]) -> bool {
     })
 }
 
+/// Single-word task cues also match common inflections by stemming the
+/// word ("building" meets "build", "writing" meets "write"). Multi-word cues
+/// stay exact, so stemming cannot invent a phrase or loosen the fact and
+/// standing cue matchers, which remain whole-word.
+fn has_task_cue(words: &[String]) -> bool {
+    TASK_CUES.iter().any(|cue| {
+        let phrase: Vec<&str> = cue.split_whitespace().collect();
+        if phrase.len() == 1 {
+            let key = stem(phrase[0]);
+            words.iter().any(|w| stem(w) == key)
+        } else {
+            phrase.len() <= words.len()
+                && words.windows(phrase.len()).any(|w| {
+                    w.iter()
+                        .zip(phrase.iter().copied())
+                        .all(|(a, b)| a.as_str() == b)
+                })
+        }
+    })
+}
+
 /// Route by query shape, not topic words. `require_verified` is a strict
 /// provenance query — it asks for verified facts on the topic and abstains
 /// otherwise — so standing constraints (off-topic guidance, a different
@@ -499,7 +520,7 @@ fn query_shape(query: &Query) -> QueryShape {
     if has_cue(&words, FACT_CUES) {
         return QueryShape::Fact;
     }
-    if has_cue(&words, TASK_CUES) {
+    if has_task_cue(&words) {
         return QueryShape::Task;
     }
     QueryShape::Fact
@@ -515,12 +536,15 @@ fn is_standing_constraint(entry: &Entry) -> bool {
         || has_cue(&normalized(&entry.body), STANDING_CUES)
 }
 
-/// The capped standing-constraint slice for a task-shaped query. Drawn from
+/// The capped standing-constraint slice for a task-shaped query. Only
+/// verified entries qualify: unverified and contradicted journal content
+/// must not steer a task briefing (EXTRACTION-THREAT-MODEL.md). Drawn from
 /// the same visible candidate pool as the lexical hits, so `as_of`,
-/// `current_only`, rollback, and `require_verified` apply. Rebuilt each
-/// time (a derived access view): verified-first, then newest-first by the
-/// entry's own timestamp, with the EntryId as a deterministic tie-break
-/// when timestamps are equal. The slice stays stable when the cap binds.
+/// `current_only`, rollback, and `require_verified` apply through the
+/// normal live-entry rules. Rebuilt each time (a derived access view):
+/// newest-first by the entry's own timestamp, with the EntryId as a
+/// deterministic tie-break when timestamps are equal. The slice stays
+/// stable when the cap binds.
 fn standing_lane(
     pool: &[Candidate],
     revised: &HashSet<EntryId>,
@@ -533,15 +557,12 @@ fn standing_lane(
     let mut lane: Vec<(Entry, StateAt, f64)> = visible_indices(pool, revised, query)
         .into_iter()
         .map(|i| (pool[i].entry.clone(), pool[i].state))
-        .filter(|(e, _)| is_standing_constraint(e) && !lexical_ids.contains(&e.id))
+        .filter(|(e, st)| {
+            *st == StateAt::Verified && is_standing_constraint(e) && !lexical_ids.contains(&e.id)
+        })
         .map(|(e, st)| (e, st, 0.0))
         .collect();
-    lane.sort_by(|a, b| {
-        bucket_at(&b.0, query.as_of)
-            .cmp(&bucket_at(&a.0, query.as_of))
-            .then(b.0.timestamp.cmp(&a.0.timestamp))
-            .then(b.0.id.cmp(&a.0.id))
-    });
+    lane.sort_by(|a, b| b.0.timestamp.cmp(&a.0.timestamp).then(b.0.id.cmp(&a.0.id)));
     lane.truncate(STANDING_LANE_CAP);
     lane
 }
@@ -1217,6 +1238,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
         rule.body = "Applies to every snippet the agent returns.".into();
+        rule.verify("review", None);
         store.create(&rule).unwrap();
         // A plain fact in the same store, so fact recall has a real answer.
         let fact_entry = Entry::new("a", EntryKind::Decision, "deployment schedule runs Friday");
@@ -1374,22 +1396,22 @@ mod tests {
         }
     }
 
-    /// The lane is a derived read view. It never verifies a cue-matched
-    /// entry: an unverified rule stays unverified when it surfaces.
+    /// Unverified standing rules must not steer a task briefing, and a cue
+    /// match must never verify an entry by birth. The file on disk is
+    /// unchanged after a task query.
     #[test]
-    fn standing_lane_never_verifies_an_entry_by_birth() {
+    fn unverified_standing_rules_never_steer_task_recall_and_are_not_verified() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
         store.create(&rule).unwrap();
-        assert_eq!(rule.verification, VerificationState::Unverified);
 
         let task = Query::new("show me a login implementation", 10);
         let out = search_with_coverage(&store, &task).unwrap();
-        let hit = out.hits.iter().find(|h| h.entry.id == rule.id).unwrap();
-        assert_eq!(hit.entry.verification, VerificationState::Unverified);
-        assert_eq!(hit.state, StateAt::Unverified);
-        // The file on disk is unchanged — no verification record was written.
+        assert!(
+            out.hits.iter().all(|h| h.entry.id != rule.id),
+            "unverified guidance must not enter the lane"
+        );
         let on_disk = store.require(rule.id).unwrap();
         assert_eq!(on_disk.verification, VerificationState::Unverified);
         assert!(on_disk.verification_log.is_empty());
@@ -1458,7 +1480,8 @@ mod tests {
     fn standing_cues_match_whole_words_not_substrings() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let e = Entry::new("a", EntryKind::Decision, "nevertheless the plan proceeded");
+        let mut e = Entry::new("a", EntryKind::Decision, "nevertheless the plan proceeded");
+        e.verify("review", None);
         store.create(&e).unwrap();
 
         let out = search_with_coverage(&store, &Query::new("show me a login implementation", 10))
@@ -1477,6 +1500,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let mut e = Entry::new("a", EntryKind::Decision, "remember from now");
         e.body = "on we review the deploy log".into();
+        e.verify("review", None);
         store.create(&e).unwrap();
         // "from now" is not itself a cue; "from now on" is. Splitting the
         // phrase across the two fields must not fabricate the cue.
@@ -1548,8 +1572,8 @@ mod tests {
             "newest by timestamp ranks first even with a lower id"
         );
 
-        // A contradicted rule, even created later, must sort after the
-        // verified ones in the lane.
+        // A contradicted rule must not reach the lane at all; only the
+        // verified rule is guidance.
         let dir2 = tempfile::tempdir().unwrap();
         let store2 = Store::open(dir2.path()).unwrap();
         let mut verified = Entry::new("a", EntryKind::Decision, "Always use dark mode");
@@ -1571,8 +1595,77 @@ mod tests {
             .collect();
         assert_eq!(
             lane,
-            vec![verified.id, contradicted.id],
-            "verified guidance precedes contradicted guidance"
+            vec![verified.id],
+            "only verified guidance is in the lane"
         );
+    }
+
+    /// A standing rule that also matches the task lexically appears once, as
+    /// a scored hit, not twice (once scored and once as a 0.0 lane hit).
+    #[test]
+    fn lexical_standing_match_appears_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always use login layout");
+        rule.verify("review", None);
+        store.create(&rule).unwrap();
+
+        let out = search_with_coverage(&store, &Query::new("show me login layout", 10)).unwrap();
+        let appearances: Vec<_> = out.hits.iter().filter(|h| h.entry.id == rule.id).collect();
+        assert_eq!(appearances.len(), 1, "the rule must not be duplicated");
+        assert!(
+            appearances[0].score > 0.0,
+            "the lexical hit keeps its score"
+        );
+    }
+
+    /// A fact cue wins over a task cue, so a mixed query gets no lane while
+    /// the same store's pure task query does.
+    #[test]
+    fn fact_cue_wins_over_task_cue_in_mixed_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        rule.verify("review", None);
+        store.create(&rule).unwrap();
+        let fact = Entry::new("a", EntryKind::Decision, "decision log about login");
+        store.create(&fact).unwrap();
+
+        let mixed = Query::new("please write up what was decided about login", 10);
+        let mixed_out = search_with_coverage(&store, &mixed).unwrap();
+        assert!(
+            mixed_out.hits.iter().all(|h| h.entry.id != rule.id),
+            "a fact cue must keep the lane out of a mixed query"
+        );
+
+        let pure = Query::new("show me a login implementation", 10);
+        let pure_out = search_with_coverage(&store, &pure).unwrap();
+        assert!(
+            pure_out.hits.iter().any(|h| h.entry.id == rule.id),
+            "the pure task query still gets the lane"
+        );
+    }
+
+    /// Single-word task verbs match common inflections. Multi-word cues stay
+    /// exact, so "building" reaches the lane without loosening phrase cues.
+    #[test]
+    fn inflected_task_verbs_reach_the_standing_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rule = Entry::new("a", EntryKind::Decision, "Always syntax-highlight code");
+        rule.verify("review", None);
+        store.create(&rule).unwrap();
+
+        for text in [
+            "building a login page",
+            "writing a login page",
+            "creating a login page",
+        ] {
+            let out = search_with_coverage(&store, &Query::new(text, 10)).unwrap();
+            assert!(
+                out.hits.iter().any(|h| h.entry.id == rule.id),
+                "{text:?} must be task-shaped"
+            );
+        }
     }
 }

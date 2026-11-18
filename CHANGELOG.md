@@ -15,8 +15,10 @@ All notable changes to Gungnir are documented here. The format follows
   `--limit`) into task-shaped queries only. So "always syntax-highlight
   code" surfaces for "show me a login implementation" despite sharing no
   content words, while fact/temporal/knowledge-update queries never get
-  the lane. The lane is a derived view rebuilt from the canonical files;
-  nothing verifies an entry for matching a cue, and `embed` stays opt-in.
+  the lane. Only verified entries are eligible, so unverified and
+  contradicted content cannot steer a briefing. The lane is a derived view
+  rebuilt from the canonical files; nothing verifies an entry for matching a
+  cue, and `embed` stays opt-in.
 - **Gated auto-extraction** (`gungnir extract`, MCP `extract`, Rust
   `Gungnir::extract`): a configured backend — `GUNGNIR_EXTRACTOR` naming a
   command honoring a JSON stdin/stdout contract, or the shipped
