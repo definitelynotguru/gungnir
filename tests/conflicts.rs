@@ -1003,6 +1003,44 @@ fn focused_gate_boundary_is_exactly_twelve_unique_stems() {
 }
 
 #[test]
+fn mixed_focused_and_long_claims_do_not_become_candidates_in_either_direction() {
+    // The gate requires *both* sides focused. No other test mixes lengths:
+    // a regression weakening `&&` to `||` would let every focused write
+    // against a long stored summary raise SharedFrame, reintroducing the
+    // AEV-25 noise. Derive the stem counts through `recall::tokenize` and
+    // assert the fixture really straddles the boundary with shared topic
+    // tokens and private tokens on both sides.
+    use gungnir::recall::tokenize;
+
+    let stems = |s: &str| {
+        tokenize(s)
+            .into_iter()
+            .collect::<std::collections::HashSet<String>>()
+    };
+    let long = "During the architecture sync the group reviewed the checkout service and agreed the mysql session store needed more capacity before the holiday traffic while the alerting dashboard stayed unchanged for another week";
+    let focused = "checkout service uses postgres now";
+    let long_t = stems(&capped(long));
+    let focused_t = stems(focused);
+    assert!(long_t.len() > 12);
+    assert!(focused_t.len() <= 12);
+    assert!(long_t.intersection(&focused_t).count() >= 2);
+    assert!(focused_t.difference(&long_t).next().is_some());
+    assert!(long_t.difference(&focused_t).next().is_some());
+
+    // Forward: a long verified fact, then a focused new claim through the
+    // ordinary write path.
+    let (_d, g) = gng();
+    write_verified_long(&g, long);
+    let out = add_entry(&g, focused);
+    assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+
+    // Reverse: a focused verified fact, then a long new claim. `detect_many`
+    // does not validate the new claim's length, so the long text reaches
+    // `lexical_signals` directly, as AEV-25 called it over its batch.
+    assert_eq!(detect_verified_against(focused, long), 0);
+}
+
+#[test]
 fn unverified_old_fact_never_flags_even_with_shared_topical_tokens() {
     let (_d, g) = gng();
     let old = Entry::new("a", EntryKind::Decision, capped(EPISODE_A));
