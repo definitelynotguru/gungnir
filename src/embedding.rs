@@ -823,4 +823,33 @@ mod tests {
         assert_eq!(out.hits[0].entry.id, head.id);
         assert_eq!(out.hits[1].entry.id, stale.id);
     }
+
+    /// Hybrid recall shares the expansion lane through `finish`. A verified
+    /// neighbor with no keyword overlap and no vector signal still appends
+    /// when it shares an entity with a positive lexical seed.
+    #[test]
+    fn hybrid_recall_expands_verified_entity_neighbors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut seed = Entry::new("a", EntryKind::Decision, "postgres index tuning");
+        seed.entities = vec!["Harbor Trip".into()];
+        seed.verify("review", None);
+        store.create(&seed).unwrap();
+        let mut neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        neighbor.entities = vec!["Harbor Trip".into()];
+        neighbor.verify("review", None);
+        store.create(&neighbor).unwrap();
+
+        let embedder = CachedEmbedder::new(
+            Fake {
+                calls: Mutex::new(0),
+            },
+            dir.path(),
+        );
+        let out = hybrid_search(&store, &Query::new("postgres index", 10), &embedder).unwrap();
+        let hit = out.hits.iter().find(|h| h.entry.id == neighbor.id).unwrap();
+        assert_eq!(hit.score, 0.0, "an expansion hit carries no relevance");
+        assert_eq!(hit.state, recall::StateAt::Verified);
+        assert_eq!(out.hits[0].entry.id, seed.id);
+    }
 }

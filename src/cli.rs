@@ -110,7 +110,9 @@ enum Cmd {
 
     /// Keyword recall within a layer. Task-shaped queries also surface
     /// standing constraints (e.g. "always syntax-highlight") even when they
-    /// share no words with the question; fact/temporal queries do not.
+    /// share no words with the question; fact/temporal queries do not. All
+    /// but `--require-verified` queries also append a capped slice of verified
+    /// entity and session neighbors, up to 6, below the ordered hits.
     Recall {
         query: String,
         #[arg(long, default_value = "codex")]
@@ -224,7 +226,9 @@ enum Cmd {
         cmd: Option<ConflictsCmd>,
     },
 
-    /// Compile the pre-task briefing for an agent.
+    /// Compile the pre-task briefing for an agent. Recall appends a capped
+    /// slice of verified entity and session neighbors, up to 6, below the
+    /// ordered hits; `--require-verified` stays lexical.
     Brief {
         #[arg(long)]
         agent: String,

@@ -87,6 +87,28 @@ carry score 0.0 and do not count as topic-matched coverage, so a briefing that
 lists them says so plainly instead of claiming no knowledge matched. The lane
 is part of keyword and hybrid recall; `embed` stays opt-in.
 
+## Entity and session expansion in recall
+
+Summarization and event-ordering probes returned only the turns that shared
+question words (mean source coverage 0.09 and 0.06). Recall now builds a
+derived adjacency map on each query from the canonical entries. Keys come from
+normalized `entity_mentions()` strings (frontmatter `entities:` plus
+name-shaped `[[wikilinks]]`) and from `session_id`, with separate prefixes so
+the two cannot collide. Nothing is persisted, and files stay the store of
+truth.
+
+Every ordered hit with positive lexical or vector relevance seeds one hop to
+verified neighbors that share its entity string or session id. Unverified,
+contradicted, and rolled-back neighbors never enter, and seeds plus existing
+hit ids are excluded. `require_verified` stays lexical and returns no
+expansion. At most `EXPANSION_LANE_CAP = 6` neighbors append after the ordered
+hits and the standing lane, under `--limit`. This is a second, independent
+budget; the standing lane keeps its cap of 4. Expansion hits carry score 0.0
+and do not change coverage or abstention. The lane is deterministic: newest
+`timestamp` first, then descending `EntryId`. `as_of`, `--current`, rollback,
+and latest-slot resolution stay in force. Keyword and opt-in hybrid recall
+share the same `finish`, and `embed` stays opt-in.
+
 ## Latest-slot resolution in recall
 
 An explicit `revises` chain is one **slot**: "12 commits merged into main"
@@ -233,8 +255,10 @@ Key behaviors:
   history from the verification log, no schema change required. Every search
   reports coverage, and briefings say plainly when no verified knowledge
   covers a task. Task-shaped queries also surface standing constraints that
-  share no words with the question — see
-  [Standing constraints in recall](#standing-constraints-in-recall).
+  share no words with the question, and all but `--require-verified` queries
+  append verified entity and session neighbors. See
+  [Standing constraints in recall](#standing-constraints-in-recall) and
+  [Entity and session expansion in recall](#entity-and-session-expansion-in-recall).
   Plain current queries resolve `revises` chains as slots so the latest
   verified fact outranks a stale wording — see
   [Latest-slot resolution in recall](#latest-slot-resolution-in-recall).

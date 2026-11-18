@@ -120,6 +120,26 @@ them reports them instead of claiming no knowledge matched.
 `require_verified` stays purely lexical, so strict provenance queries never
 union standing guidance.
 
+**Entity and session expansion (both modes).** BM25 returned only the turns
+that shared question words (mean source coverage 0.09 and 0.06 on
+summarization and event-ordering probes). Recall now derives one adjacency
+map per query from the temporal candidate pool: keys are normalized
+`entity_mentions()` strings (frontmatter `entities:` plus name-shaped
+`[[wikilinks]]`) and `session_id`, under separate prefixes so the namespaces
+cannot collide. Every ordered hit with positive lexical or vector relevance
+seeds one hop to verified neighbors sharing a key, so expansion follows
+topical relevance rather than standing cues. Seeds and existing hit ids are
+excluded; unverified, contradicted, and rolled-back neighbors never enter.
+`require_verified` stays lexical. At most `EXPANSION_LANE_CAP = 6` neighbors
+append after the ordered hits and the standing lane, under `limit`, with
+score 0.0 and no coverage change. The slice is deterministic (newest
+`timestamp`, then descending `EntryId`). `as_of`, `current_only`, rollback,
+and latest-slot resolution stay in force because the lane reads the same
+visible pool. Keyword and hybrid recall share `finish`, and `embed` stays
+opt-in with no embedder synonym seed. This is a read-path derived walk over
+canonical entries; the deliberate refusal of a persisted graph and OpenIE
+still stands.
+
 **Latest-slot resolution (both modes).** An explicit `revises` chain is one
 slot. The head is the member no live `revises` link points at, computed once
 in `temporal_pool` as the link-target set. `current_only` hides that set; a
@@ -252,8 +272,10 @@ what "superseded" means.
 
 Entities stay entity-lite on purpose: frontmatter `entities:` names plus
 `[[name]]` body mentions merge into the index, and `[[id]]` wikilinks are
-validated at write time exactly like evidence refs. That is walkable
-structure without a graph — the roadmap's deliberate refusal.
+validated at write time exactly like evidence refs. Recall derives a one-hop
+read-path walk from these names and `session_id` on each query (see
+"Entity and session expansion"), but the store keeps no persisted graph and
+does not run OpenIE. That refusal still stands.
 
 Abstention is a first-class output, not a prose aside. `require_verified`
 filters hits to verified entries while coverage keeps counting the full

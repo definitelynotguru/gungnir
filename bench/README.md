@@ -82,6 +82,19 @@ and mechanical to reproduce against anything else, but it is not LongMemEval
 and it is not a claim about real-world recall. Treat cross-store numbers as
 "does the store express these abilities at all," not leaderboard ranking.
 
+## Entity and session expansion fixture
+
+`cargo run --example gung23_measurement` is a small before/after fixture for
+recall expansion, not part of this benchmark and not a full eval. Its eight
+cases link a verified neighbor to a lexical seed by an entity string or a
+session id, with zero stemmed token overlap between the neighbor and the
+query. The baseline is `0/N` because keyword recall cannot recover those
+neighbors without expansion. The post-change expectation is `N/N` on the
+`current` arm. The example also prints a `require_verified` arm, which stays
+lexical by design, so it measures the explicit `0/N` before baseline with a
+different semantic role. This is not a benchmark baseline for the same query
+semantics.
+
 ## Files
 
 - `corpus.yaml`: the world under test. Two agents, three sessions, a

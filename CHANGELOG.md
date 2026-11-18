@@ -8,6 +8,17 @@ All notable changes to Gungnir are documented here. The format follows
 
 ### Added
 
+- **Entity and session expansion in recall.** Each query derives an adjacency
+  map from canonical entries keyed by normalized `entity_mentions()` strings
+  and `session_id`, with separate prefixes. Positive lexical or vector hits
+  seed one hop to verified neighbors sharing a key. At most
+  `EXPANSION_LANE_CAP = 6` neighbors append after the ordered hits and the
+  standing lane under `limit`, with score 0.0 and no coverage change.
+  `require_verified` stays lexical, `as_of`/`current_only`/rollback and
+  latest-slot resolution stay in force, and `embed` stays opt-in. Keyword and
+  hybrid recall share the same `finish`. This raises source coverage on
+  summarization and event-ordering probes, which previously returned only
+  the turns sharing question words.
 - **Standing-constraint lane in recall.** A deterministic cue tagger
   (`always`, `never`, `from now on`, `I prefer`, `don't`, and close
   cousins) marks standing rules/preferences, and a query-shape router

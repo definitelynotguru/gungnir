@@ -1999,8 +1999,8 @@ mod tests {
         );
     }
 
-    /// A task briefing surfacing a standing rule through the lane lists it
-    /// above a verdict that would otherwise claim no knowledge matched.
+    /// A task briefing surfacing an appended lane hit lists it above a
+    /// verdict that would otherwise claim no knowledge matched.
     #[test]
     fn task_brief_lists_standing_constraints_without_a_no_knowledge_verdict() {
         let (_d, g) = gng();
@@ -2028,7 +2028,37 @@ mod tests {
             b.markdown
         );
         assert!(
-            b.markdown.contains("standing constraints are listed above"),
+            b.markdown.contains("expanded recall hits are listed above"),
+            "{}",
+            b.markdown
+        );
+    }
+
+    /// A verified session neighbor with no query-token overlap reaches the
+    /// briefing through the expansion lane, and the verdict does not claim
+    /// no knowledge matched.
+    #[test]
+    fn brief_lists_a_verified_session_neighbor_without_a_no_knowledge_verdict() {
+        let (_d, g) = gng();
+        let codex = g.codex().unwrap();
+        let mut seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        seed.session_id = Some("session-harbor".into());
+        seed.verify("review", None);
+        codex.create(&seed).unwrap();
+        let mut neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        neighbor.session_id = Some("session-harbor".into());
+        neighbor.verify("review", None);
+        codex.create(&neighbor).unwrap();
+
+        let b = g.brief("builder", "zephyr release", 10).unwrap();
+        assert!(
+            b.codex_hits.iter().any(|h| h.entry.id == neighbor.id),
+            "{}",
+            b.markdown
+        );
+        assert!(b.markdown.contains("quartz ledger"), "{}", b.markdown);
+        assert!(
+            !b.markdown.contains("No knowledge matched this task"),
             "{}",
             b.markdown
         );

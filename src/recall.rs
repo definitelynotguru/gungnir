@@ -33,6 +33,14 @@
 //! canonical files on every query; it writes nothing, verifies nothing, and
 //! fact-shaped (including temporal) queries never receive it.
 //!
+//! Entity and session expansion builds a derived adjacency map on each query
+//! from the temporal pool. Keys come from normalized `entity_mentions()` and
+//! `session_id`, with separate prefixes so the two cannot collide. Positive
+//! lexical or vector hits seed one hop to verified neighbors that share a
+//! key. At most `EXPANSION_LANE_CAP` neighbors append after the ordered hits
+//! and the standing lane, under `limit`, with score 0.0 and no coverage
+//! change. The map is read-only and never persisted.
+//!
 //! Slot resolution: an explicit `revises` chain is one slot, and its head is
 //! the member no live `revises` link points at. `current_only` hides the
 //! link targets; a plain present-time query instead ranks those verified
@@ -395,6 +403,10 @@ const STANDING_CUES: &[&str] = &[
 /// spare slots below `limit`; it never evicts or reorders a lexical hit.
 const STANDING_LANE_CAP: usize = 4;
 
+/// Max entity or session neighbors appended by expansion. This is a second,
+/// independent budget: it does not change `STANDING_LANE_CAP`.
+pub(crate) const EXPANSION_LANE_CAP: usize = 6;
+
 /// Fact-shaped queries ask about stored knowledge. A generic standing rule
 /// in a temporal or knowledge-update top-k is a false hit, so these cues
 /// take precedence over task cues and keep the lane out entirely.
@@ -598,10 +610,81 @@ fn standing_lane(
     lane
 }
 
+/// The capped entity and session expansion slice. One derived adjacency map
+/// per query holds the index of every pool entry under each normalized
+/// `entity_mentions()` string and `session_id`; prefixes keep the two key
+/// namespaces separate. Every positive-relevance hit in `scored` seeds one
+/// hop to neighbors sharing a key, so the lane follows topical relevance
+/// rather than the standing-constraint cues. Only verified, visible neighbors
+/// qualify, and `existing_ids` keeps seeds and standing-lane hits out. The
+/// slice is a read-only view over the same temporal pool, so `as_of`,
+/// `current_only`, rollback, and latest-slot resolution stay in force.
+fn expansion_lane(
+    pool: &[Candidate],
+    revised: &HashSet<EntryId>,
+    query: &Query,
+    scored: &[(Entry, StateAt, f64)],
+    existing_ids: &HashSet<EntryId>,
+) -> Vec<(Entry, StateAt, f64)> {
+    if query.require_verified {
+        return Vec::new();
+    }
+
+    let mut adjacency: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, c) in pool.iter().enumerate() {
+        for name in c.entry.entity_mentions() {
+            adjacency
+                .entry(format!("entity:{name}"))
+                .or_default()
+                .push(i);
+        }
+        if let Some(session) = c.entry.session_id.as_deref() {
+            adjacency
+                .entry(format!("session:{session}"))
+                .or_default()
+                .push(i);
+        }
+    }
+
+    let visible: HashSet<usize> = visible_indices(pool, revised, query).into_iter().collect();
+    let mut lane: Vec<(Entry, StateAt, f64)> = Vec::new();
+    let mut chosen: HashSet<usize> = HashSet::new();
+    for (seed, _, relevance) in scored {
+        if *relevance <= 0.0 {
+            continue;
+        }
+        let keys = seed
+            .entity_mentions()
+            .into_iter()
+            .map(|name| format!("entity:{name}"))
+            .chain(seed.session_id.as_deref().map(|s| format!("session:{s}")));
+        for key in keys {
+            let Some(indices) = adjacency.get(&key) else {
+                continue;
+            };
+            for &i in indices {
+                let c = &pool[i];
+                if !visible.contains(&i)
+                    || c.state != StateAt::Verified
+                    || existing_ids.contains(&c.entry.id)
+                    || !chosen.insert(i)
+                {
+                    continue;
+                }
+                lane.push((c.entry.clone(), c.state, 0.0));
+            }
+        }
+    }
+
+    lane.sort_by(|a, b| b.0.timestamp.cmp(&a.0.timestamp).then(b.0.id.cmp(&a.0.id)));
+    lane.truncate(EXPANSION_LANE_CAP);
+    lane
+}
+
 /// Shared tail of every search: coverage accounting, trust×recency
-/// weighting, bucket-first ordering, truncation. Task-shaped queries also
-/// union a capped standing-constraint slice, appended after the lexical
-/// hits; coverage counts only the topic-matched lexical pool.
+/// weighting, bucket-first ordering, truncation. Standing and expansion
+/// slices append after the lexical hits under their own caps; coverage
+/// counts only the topic-matched lexical pool.
 ///
 /// `matched` holds topic-matched candidates with their raw relevance
 /// (BM25-lite or RRF). Coverage counts run over that pool before
@@ -676,16 +759,22 @@ pub(crate) fn finish(
             .then(a.0.id.cmp(&b.0.id))
     });
 
-    // The lane appends into spare slots below `limit`, after the lexical
+    // The lanes append into spare slots below `limit`, after the lexical
     // hits are already ordered. Lexical hits keep their order and scores;
     // when they fill the limit the union is empty, so the result is exactly
     // the keyword result. Lane hits carry no lexical relevance (score 0.0).
+    // Standing and expansion draw from independent caps, and expansion
+    // dedupes against both the lexical hits and the standing lane.
     let lexical_ids: HashSet<EntryId> = scored.iter().map(|(e, _, _)| e.id).collect();
-    let lane = standing_lane(pool, revised, query, &lexical_ids);
+    let standing = standing_lane(pool, revised, query, &lexical_ids);
+    let mut existing_ids = lexical_ids;
+    existing_ids.extend(standing.iter().map(|(e, _, _)| e.id));
+    let expansion = expansion_lane(pool, revised, query, &scored, &existing_ids);
 
     let hits = scored
         .into_iter()
-        .chain(lane)
+        .chain(standing)
+        .chain(expansion)
         .filter(|(_, st, _)| !query.require_verified || *st == StateAt::Verified)
         .take(query.limit)
         .map(|(entry, state, score)| Hit {
@@ -2129,5 +2218,271 @@ mod tests {
             pos(other.id) < pos(stale.id),
             "an unrelated verified hit also outranks the stale tail"
         );
+    }
+
+    /// A verified neighbor with no query-token overlap becomes a hit only
+    /// when it shares an entity string with a positive lexical seed. The
+    /// separate store keeps the same seed but puts the neighbor off-key, so
+    /// the key is the only thing that recovers it.
+    #[test]
+    fn entity_neighbor_without_query_token_overlap_is_recovered_as_a_verified_expansion_hit() {
+        let mut seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        seed.entities = vec!["Harbor Trip".into()];
+        seed.verify("review", None);
+
+        let mut neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        neighbor.body = "[[Harbor Trip]] crossed the quay".into();
+        neighbor.verify("review", None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.create(&seed).unwrap();
+        store.create(&neighbor).unwrap();
+
+        let query = Query::new("zephyr release", 10);
+        let out = search_with_coverage(&store, &query).unwrap();
+        let hit = out.hits.iter().find(|h| h.entry.id == neighbor.id).unwrap();
+        assert_eq!(hit.score, 0.0, "an expansion hit carries no relevance");
+        assert_eq!(hit.state, StateAt::Verified);
+        assert_eq!(out.hits[0].entry.id, seed.id, "the seed keeps the top rank");
+        assert_eq!(out.coverage.verified, 1, "the seed alone is topic-matched");
+
+        let off_key_dir = tempfile::tempdir().unwrap();
+        let off_key_store = Store::open(off_key_dir.path()).unwrap();
+        let mut off_key = neighbor.clone();
+        off_key.id = EntryId::generate();
+        off_key.entities = vec!["Different Marina".into()];
+        off_key.body = "quartz ledger".into();
+        off_key_store.create(&seed).unwrap();
+        off_key_store.create(&off_key).unwrap();
+        let off_key_out = search_with_coverage(&off_key_store, &query).unwrap();
+        assert!(
+            off_key_out.hits.iter().all(|h| h.entry.id != off_key.id),
+            "a neighbor sharing no key stays invisible"
+        );
+    }
+
+    /// A verified neighbor sharing `session_id` with a positive seed is
+    /// recovered under `current()`, the GUNG-21 harness shape, even with no
+    /// query-token overlap.
+    #[test]
+    fn session_neighbors_without_query_token_overlap_are_recovered_after_a_lexical_seed() {
+        let mut seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        seed.session_id = Some("session-harbor".into());
+        seed.verify("review", None);
+        let mut neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        neighbor.session_id = Some("session-harbor".into());
+        neighbor.verify("review", None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.create(&seed).unwrap();
+        store.create(&neighbor).unwrap();
+
+        let out =
+            search_with_coverage(&store, &Query::new("zephyr release", 10).current()).unwrap();
+        let hit = out.hits.iter().find(|h| h.entry.id == neighbor.id).unwrap();
+        assert_eq!(hit.score, 0.0);
+        assert_eq!(hit.state, StateAt::Verified);
+        assert_eq!(
+            out.coverage.verified, 1,
+            "the neighbor is not topic-matched"
+        );
+        assert_eq!(out.coverage.total_matched(), 1);
+    }
+
+    /// The second cap holds at six, expansion never displaces a lexical hit,
+    /// and the surviving slice is deterministic under an equal-timestamp tie.
+    #[test]
+    fn expansion_lane_is_capped_at_six_and_never_displaces_lexical_hits() {
+        assert_eq!(EXPANSION_LANE_CAP, 6, "the cap named in the PR must hold");
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let mut seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        seed.session_id = Some("session-harbor".into());
+        seed.verify("review", None);
+        store.create(&seed).unwrap();
+
+        let tied = Utc::now() - chrono::Duration::days(1);
+        let mut neighbors = Vec::new();
+        for i in 0..8 {
+            let mut n = Entry::new("a", EntryKind::Decision, format!("quartz ledger {i}"));
+            n.session_id = Some("session-harbor".into());
+            n.timestamp = tied;
+            n.verify("review", None);
+            store.create(&n).unwrap();
+            neighbors.push(n);
+        }
+
+        let wide = search_with_coverage(&store, &Query::new("zephyr release", 20)).unwrap();
+        let appended: Vec<_> = wide
+            .hits
+            .iter()
+            .filter(|h| h.score == 0.0)
+            .map(|h| h.entry.id)
+            .collect();
+        assert_eq!(appended.len(), EXPANSION_LANE_CAP);
+        assert_eq!(wide.hits[0].entry.id, seed.id, "lexical hits come first");
+        assert!(
+            wide.hits
+                .iter()
+                .take_while(|h| h.score > 0.0)
+                .any(|h| h.entry.id == seed.id),
+            "every lexical hit precedes the appended hits"
+        );
+        let mut expected: Vec<_> = neighbors.iter().map(|n| n.id).collect();
+        expected.sort_by(|a, b| b.cmp(a));
+        expected.truncate(EXPANSION_LANE_CAP);
+        assert_eq!(appended, expected, "descending EntryId breaks the tie");
+
+        let narrow = search_with_coverage(&store, &Query::new("zephyr release", 1)).unwrap();
+        assert_eq!(narrow.hits.len(), 1);
+        assert_eq!(narrow.hits[0].entry.id, seed.id);
+    }
+
+    /// Unverified and contradicted neighbors share the seed's key but never
+    /// enter the hit set, and the canonical files keep their state.
+    #[test]
+    fn unverified_and_contradicted_neighbors_do_not_steer_briefings() {
+        let mut seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        seed.session_id = Some("session-harbor".into());
+        seed.verify("review", None);
+
+        let mut unverified = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        unverified.session_id = Some("session-harbor".into());
+
+        let counter = Entry::new("a", EntryKind::Observation, "counter evidence");
+        let mut contradicted = Entry::new("a", EntryKind::Decision, "onyx register");
+        contradicted.session_id = Some("session-harbor".into());
+        contradicted.contradict(counter.id, "ops", None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.create(&seed).unwrap();
+        store.create(&unverified).unwrap();
+        store.create(&counter).unwrap();
+        store.create(&contradicted).unwrap();
+
+        let out = search_with_coverage(&store, &Query::new("zephyr release", 10)).unwrap();
+        assert!(out.hits.iter().all(|h| h.entry.id != unverified.id));
+        assert!(out.hits.iter().all(|h| h.entry.id != contradicted.id));
+        assert_eq!(
+            store.require(unverified.id).unwrap().verification,
+            VerificationState::Unverified
+        );
+        assert!(matches!(
+            store.require(contradicted.id).unwrap().verification,
+            VerificationState::Contradicted { .. }
+        ));
+    }
+
+    /// Expansion appends after the ordered lexical hits, so it cannot reorder
+    /// latest-slot resolution. A stale tail sharing more query tokens stays
+    /// behind the head on a plain read, `current()` hides the tails while a
+    /// verified off-topic neighbor still appends, `as_of` keeps the
+    /// historical order, and `require_verified` stays purely lexical.
+    #[test]
+    fn fact_current_only_and_as_of_queries_keep_latest_slot_order_with_expansion() {
+        let t0 = Utc::now() - chrono::Duration::days(30);
+        let t1 = Utc::now() - chrono::Duration::days(10);
+        let t2 = Utc::now() - chrono::Duration::days(1);
+
+        let mut v1 = Entry::new("a", EntryKind::Decision, "zephyr release zephyr");
+        v1.body = "zephyr release zephyr release".into();
+        v1.timestamp = t0;
+        v1.session_id = Some("session-harbor".into());
+        v1.verify("archive", None);
+        v1.verification_log[0].timestamp = t0;
+        let mut v2 = Entry::new("a", EntryKind::Decision, "zephyr release");
+        v2.timestamp = t1;
+        v2.revises = Some(v1.id);
+        v2.session_id = Some("session-harbor".into());
+        v2.verify("archive", None);
+        v2.verification_log[0].timestamp = t1;
+        let mut v3 = Entry::new("a", EntryKind::Decision, "zephyr release schedule");
+        v3.timestamp = t2;
+        v3.revises = Some(v2.id);
+        v3.session_id = Some("session-harbor".into());
+        v3.verify("archive", None);
+        v3.verification_log[0].timestamp = t2;
+        let mut neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        neighbor.session_id = Some("session-harbor".into());
+        neighbor.verify("review", None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.create(&v1).unwrap();
+        store.create(&v2).unwrap();
+        store.create(&v3).unwrap();
+        store.create(&neighbor).unwrap();
+
+        let plain = search_with_coverage(&store, &Query::new("zephyr release", 10)).unwrap();
+        assert_eq!(plain.hits[0].entry.id, v3.id, "the live head ranks first");
+        let head_pos = plain.hits.iter().position(|h| h.entry.id == v3.id).unwrap();
+        for tail in [v1.id, v2.id] {
+            let pos = plain.hits.iter().position(|h| h.entry.id == tail).unwrap();
+            assert!(pos > head_pos, "tail {tail} stays behind the head");
+        }
+
+        let current =
+            search_with_coverage(&store, &Query::new("zephyr release", 10).current()).unwrap();
+        assert_eq!(current.hits.len(), 2, "head plus the off-topic neighbor");
+        assert_eq!(current.hits[0].entry.id, v3.id);
+        assert_eq!(current.hits[1].entry.id, neighbor.id);
+        assert_eq!(current.coverage.hidden_superseded, 2);
+
+        let as_of = search_with_coverage(
+            &store,
+            &Query::new("zephyr release", 10).as_of(t1 + chrono::Duration::seconds(1)),
+        )
+        .unwrap();
+        assert!(
+            as_of.hits.iter().any(|h| h.entry.id == v1.id)
+                && as_of.hits.iter().any(|h| h.entry.id == v2.id),
+            "as_of keeps both members that existed before the latest revision"
+        );
+        assert!(
+            !as_of.hits.iter().any(|h| h.entry.id == v3.id),
+            "the latest revision did not exist at this cutoff"
+        );
+        assert!(
+            !as_of.hits.iter().any(|h| h.entry.id == neighbor.id),
+            "the neighbor is not yet verified at this cutoff"
+        );
+
+        let gated =
+            search_with_coverage(&store, &Query::new("zephyr release", 10).require_verified())
+                .unwrap();
+        assert!(
+            gated.hits.iter().all(|h| h.entry.id != neighbor.id),
+            "a strict provenance query adds no off-topic neighbors"
+        );
+    }
+
+    /// Lane hits never count as topic-matched coverage, and a zero limit
+    /// leaves no spare slot for any lane.
+    #[test]
+    fn expansion_lane_hits_leave_coverage_unchanged_and_limit_zero_returns_nothing() {
+        let mut seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        seed.session_id = Some("session-harbor".into());
+        seed.verify("review", None);
+        let mut neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        neighbor.session_id = Some("session-harbor".into());
+        neighbor.verify("review", None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.create(&seed).unwrap();
+        store.create(&neighbor).unwrap();
+
+        let wide = search_with_coverage(&store, &Query::new("zephyr release", 10)).unwrap();
+        assert_eq!(wide.hits.len(), 2);
+        assert_eq!(wide.coverage.verified, 1, "only the seed matched the topic");
+        assert_eq!(wide.coverage.total_matched(), 1);
+        assert_eq!(wide.coverage.total, 2);
+
+        let zero = search_with_coverage(&store, &Query::new("zephyr release", 0)).unwrap();
+        assert!(zero.hits.is_empty(), "limit 0 returns no hits");
     }
 }
