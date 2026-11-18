@@ -131,6 +131,19 @@ All notable changes to Gungnir are documented here. The format follows
   every MCP recall, and a briefing line that states verified-vs-matching
   precisely.
 
+### Changed
+
+- **Conflict candidates are now actionable contradictions, not shared
+  topics.** `shared_frame` requires both summaries to be focused (at most
+  12 unique stemmed tokens each) and to swap a value. Two whole 200-char
+  source-unit summaries that share topical tokens but describe distinct
+  episodes no longer produce candidates; AEV-25 measured 1,098,466 LME
+  candidates from that overlap, and bounded `resolve --supersede` turned
+  them into false `revises` chains (GUNG-21, GUNG-22). Explicit
+  `numeric_mismatch` and `negation_asymmetry` flips stay actionable on long
+  claims, and the opt-in `semantic_overlap` channel is unchanged. No
+  candidate ever writes a `revises` link on its own.
+
 ### Changed (breaking)
 
 - **`Gungnir::start_session` returns `Result<Session>`** instead of

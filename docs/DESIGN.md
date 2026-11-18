@@ -194,18 +194,31 @@ working memory, not claims — and neither do `Session` archives or
 `Rollback` records.
 
 **The signals are deterministic and documented on the record.** Over
-stemmed summary tokens: `shared_frame` (≥2 shared topic tokens and private
-content on both sides — "sessions use mysql" vs "sessions use postgres"),
+stemmed summary tokens: `shared_frame` (≥2 shared topic tokens, private
+content on both sides, and *both claims focused* — at most 12 unique
+stemmed tokens each — "sessions use mysql" vs "sessions use postgres"),
 `negation_asymmetry` (one side negates), and `numeric_mismatch` (different
 digit-bearing tokens). Each record carries the signal that raised it, so a
-reviewer sees *why* the candidate exists. The trade is deliberate: flag the
-same-frame divergence and let people dismiss the noise, rather than miss a
-real contradiction. Near-duplicates never flag — an identical token set is
+reviewer sees *why* the candidate exists.
+
+The claim-shape rule is the fix for AEV-25's topical noise. Whole 200-char
+source-unit summaries share a topic but describe distinct episodes; the old
+`shared_frame` rule flagged that overlap (1,098,466 LME candidates), and
+bounded `resolve --supersede` joined unrelated facts with false `revises`
+chains (GUNG-21, GUNG-22). `shared_frame` now fires only on a focused value
+swap, so shared topic alone is never an actionable contradiction. Explicit
+flips stay actionable at any length: a numeric change or a negation on a
+long claim still raises `numeric_mismatch` / `negation_asymmetry`, with
+`shared_frame` absent from the record so the explicit flip is visible as
+the reason. Near-duplicates never flag — an identical token set is
 corroboration (the semantic channel judges it over the full claim text,
 summary and body, so same-summary writes with disagreeing bodies still
 flag). With the `embed` build, `--semantic` on `add`/`supersede`/
 `promote` adds a fourth signal, `semantic_overlap` (cosine ≥ 0.70), which
-catches paraphrased contradictions at a higher false-positive cost.
+catches paraphrased contradictions at a higher false-positive cost and is
+unaffected by the claim-shape rule. Candidates stay advisory and
+unverified-by-birth: no `revises` link is written from a candidate without
+a logged resolution decision.
 
 **Resolution is the trust model's existing vocabulary, not a new state.**
 `gungnir conflicts resolve <id> --supersede|--contradict|--dismiss`:

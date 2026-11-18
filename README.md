@@ -209,7 +209,10 @@ Key behaviors:
   journal. Topic existence does leak; see docs/PROVENANCE.md.
 - **Conflicts surface, not hide.** A write that disagrees with a live
   verified fact still lands, and records a conflict candidate in
-  `.conflicts/`. `gungnir conflicts` lists them;
+  `.conflicts/`. Only an actionable disagreement qualifies: a focused
+  claim that swaps a value, an explicit numeric change, or a negation.
+  Two long summaries that merely share a topic (distinct episodes) do not
+  raise a candidate. `gungnir conflicts` lists them;
   `gungnir conflicts resolve <id> --supersede|--contradict|--dismiss`
   closes the loop through the same logged verbs. Briefings warn while a
   candidate on the topic stays open. Over MCP, `conflicts` and
