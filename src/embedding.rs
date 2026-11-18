@@ -852,4 +852,45 @@ mod tests {
         assert_eq!(hit.state, recall::StateAt::Verified);
         assert_eq!(out.hits[0].entry.id, seed.id);
     }
+
+    #[test]
+    fn hybrid_recall_drops_hits_that_do_not_bind_the_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut junior = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "junior engineer owns the checkout index",
+        );
+        junior.verify("review", None);
+        store.create(&junior).unwrap();
+        let mut senior = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "senior engineer owns the checkout index",
+        );
+        senior.verify("review", None);
+        store.create(&senior).unwrap();
+
+        let embedder = CachedEmbedder::new(
+            Fake {
+                calls: Mutex::new(0),
+            },
+            dir.path(),
+        );
+        let asked = "which senior engineer owns the checkout index";
+        let ungated = hybrid_search(&store, &Query::new(asked, 10), &embedder).unwrap();
+        assert_eq!(ungated.hits.len(), 2, "premise: fusion returns both");
+        assert!(!ungated.abstained(&Query::new(asked, 10)));
+
+        let gated_query = Query::new(asked, 10).require_evidence();
+        let gated = hybrid_search(&store, &gated_query, &embedder).unwrap();
+        assert_eq!(gated.hits.len(), 1);
+        assert_eq!(gated.hits[0].entry.id, senior.id);
+        assert_eq!(
+            gated.coverage, ungated.coverage,
+            "the gate leaves coverage alone on the semantic path too"
+        );
+        assert!(!gated.abstained(&gated_query));
+    }
 }

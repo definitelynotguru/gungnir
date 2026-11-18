@@ -49,6 +49,18 @@
 //! `temporal_pool`, so they never disagree. The chain is derived from
 //! canonical files on every query; nothing is written, no verification
 //! state changes, and `as_of` reads keep historical semantics.
+//!
+//! Answer binding: `require_evidence` adds a deterministic gate over the
+//! closed-class parts of a question. These are curated role/title modifiers,
+//! digit-bearing tokens, and negation presence. It drops every hit whose
+//! summary and body do not carry them. It answers "does the returned
+//! evidence bind the question", which `require_verified` cannot: a verified
+//! junior engineer is not an answer to a question about a senior one. The
+//! gate never reorders, rescans, or re-scores. It filters ordered hits in
+//! `finish` after the provenance filter and excludes the standing and
+//! expansion lanes so off-topic entries cannot satisfy a constraint. Scores
+//! and coverage stay unchanged. Open-class terms are left to ranking on
+//! purpose, so paraphrase still matches. No model judges eligibility.
 
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -69,6 +81,13 @@ pub struct Query {
     /// Return only verified hits. Coverage still counts the whole matched
     /// pool, so a caller can abstain explicitly when verified is zero.
     pub require_verified: bool,
+    /// Return only hits whose evidence binds the closed-class constraints
+    /// the question states: curated role/title modifiers, digit-bearing
+    /// tokens, and negation in yes/no questions. Provenance is untouched. This asks
+    /// whether a hit *answers* the question, not whether it is verified,
+    /// and open-class wording is left to ranking so paraphrase still
+    /// matches. Coverage and scores are unchanged.
+    pub require_evidence: bool,
 }
 
 impl Query {
@@ -79,6 +98,7 @@ impl Query {
             as_of: None,
             current_only: false,
             require_verified: false,
+            require_evidence: false,
         }
     }
 
@@ -94,6 +114,11 @@ impl Query {
 
     pub fn require_verified(mut self) -> Self {
         self.require_verified = true;
+        self
+    }
+
+    pub fn require_evidence(mut self) -> Self {
+        self.require_evidence = true;
         self
     }
 }
@@ -141,6 +166,24 @@ pub struct SearchOutcome {
     pub coverage: Coverage,
     /// ULID-named files that failed to parse and were skipped.
     pub skipped: Vec<Skipped>,
+    #[serde(skip)]
+    pub evidence_filtered: usize,
+}
+
+impl SearchOutcome {
+    /// Whether this result should be reported as an explicit refusal. One
+    /// decision for every surface, so CLI prose, `--json`, and MCP cannot
+    /// disagree about what counts as abstaining.
+    ///
+    /// Provenance abstention fires when `require_verified` found no verified
+    /// knowledge on the topic. This is a claim about coverage, not output
+    /// size. Answer binding fires when `require_evidence` leaves no returned
+    /// evidence at a nonzero limit. An empty page at `limit: 0` is the
+    /// caller's own choice, so it never counts as an answer-binding miss.
+    pub fn abstained(&self, query: &Query) -> bool {
+        (query.require_verified && self.coverage.verified == 0)
+            || (query.require_evidence && query.limit > 0 && self.hits.is_empty())
+    }
 }
 
 const STOPWORDS: &[&str] = &[
@@ -549,14 +592,17 @@ fn has_task_cue(words: &[String]) -> bool {
 }
 
 /// Route by query shape, not topic words. `require_verified` is a strict
-/// provenance query — it asks for verified facts on the topic and abstains
-/// otherwise — so standing constraints (off-topic guidance, a different
-/// kind of hit) stay out. Temporal and current-view queries are fact-shaped
-/// outright, independent of their wording. Fact cues win over task cues, and
-/// an unrecognized query defaults to fact-shaped — the conservative
-/// direction that keeps generic rules out of fact top-k.
+/// provenance query and `require_evidence` is a strict answer query, so
+/// standing constraints stay out of both. Temporal and current-view queries
+/// are fact-shaped outright, independent of their wording. Fact cues win
+/// over task cues. An unrecognized query defaults to fact-shaped, the
+/// conservative direction that keeps generic rules out of fact top-k.
 fn query_shape(query: &Query) -> QueryShape {
-    if query.require_verified || query.as_of.is_some() || query.current_only {
+    if query.require_verified
+        || query.require_evidence
+        || query.as_of.is_some()
+        || query.current_only
+    {
         return QueryShape::Fact;
     }
     let words = normalized(&query.text);
@@ -583,8 +629,8 @@ fn is_standing_constraint(entry: &Entry) -> bool {
 /// verified entries qualify: unverified and contradicted journal content
 /// must not steer a task briefing (EXTRACTION-THREAT-MODEL.md). Drawn from
 /// the same visible candidate pool as the lexical hits, so `as_of`,
-/// `current_only`, rollback, and `require_verified` apply through the
-/// normal live-entry rules. Rebuilt each time (a derived access view):
+/// `current_only`, rollback, and strict query flags apply through the normal
+/// live-entry rules. Rebuilt each time (a derived access view):
 /// newest-first by the entry's own timestamp, with the EntryId as a
 /// deterministic tie-break when timestamps are equal. The slice stays
 /// stable when the cap binds.
@@ -626,7 +672,7 @@ fn expansion_lane(
     scored: &[(Entry, StateAt, f64)],
     existing_ids: &HashSet<EntryId>,
 ) -> Vec<(Entry, StateAt, f64)> {
-    if query.require_verified {
+    if query.require_verified || query.require_evidence {
         return Vec::new();
     }
 
@@ -681,6 +727,326 @@ fn expansion_lane(
     lane
 }
 
+const TITLE_MODIFIERS: &[&str] = &[
+    "senior",
+    "junior",
+    "manager",
+    "lead",
+    "principal",
+    "staff",
+    "director",
+    "chief",
+    "intern",
+    "associate",
+    "assistant",
+    "vp",
+    "president",
+    "distinguished",
+];
+
+const TITLE_FRAMES: &[&str] = &[
+    "engineer",
+    "engineering",
+    "developer",
+    "programmer",
+    "designer",
+    "architect",
+    "scientist",
+    "analyst",
+    "consultant",
+    "officer",
+    "administrator",
+    "specialist",
+    "coordinator",
+    "executive",
+    "president",
+];
+
+const PLURAL_TITLE_MODIFIERS: &[&str] = &[
+    "senior",
+    "junior",
+    "manager",
+    "principal",
+    "director",
+    "chief",
+    "intern",
+    "assistant",
+    "vp",
+    "president",
+];
+
+const NEGATION_WORDS: &[&str] = &[
+    "no", "not", "never", "none", "nobody", "nothing", "neither", "nor", "without", "cannot",
+    "cant", "dont", "wont", "isnt", "arent", "wasnt", "werent", "didnt", "doesnt", "couldnt",
+    "shouldnt", "mustnt", "neednt", "hasnt", "hadnt", "aint", "shant",
+];
+
+const NEGATION_CONTRACTIONS: &[&str] = &[
+    "don", "won", "isn", "aren", "wasn", "weren", "didn", "doesn", "couldn", "shouldn", "mustn",
+    "needn", "hasn", "hadn", "ain", "shan",
+];
+
+const YES_NO_STARTERS: &[&str] = &[
+    "am", "are", "is", "was", "were", "do", "does", "did", "can", "could", "will", "would",
+    "shall", "should", "may", "might", "must", "have", "has", "had",
+];
+
+fn negates(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(i, token)| {
+        NEGATION_WORDS.iter().any(|n| n == token)
+            && !(token == "no" && tokens.get(i + 1).is_some_and(|next| next == "longer"))
+    }) || tokens
+        .windows(2)
+        .any(|pair| pair[1] == "t" && NEGATION_CONTRACTIONS.iter().any(|n| *n == pair[0]))
+}
+
+fn answer_negated(tokens: &[String]) -> bool {
+    let yes_no = tokens.first().is_some_and(|first| {
+        YES_NO_STARTERS.contains(&first.as_str()) || NEGATION_CONTRACTIONS.contains(&first.as_str())
+    });
+    yes_no
+        && tokens.iter().enumerate().any(|(i, token)| {
+            i > 2
+                && NEGATION_WORDS.iter().any(|n| n == token)
+                && !(token == "no" && tokens.get(i + 1).is_some_and(|next| next == "longer"))
+        })
+        || (yes_no
+            && tokens.windows(2).enumerate().any(|(i, pair)| {
+                i > 2 && pair[1] == "t" && NEGATION_CONTRACTIONS.iter().any(|n| *n == pair[0])
+            }))
+}
+
+fn is_title_frame(token: &str) -> bool {
+    TITLE_FRAMES.contains(&token)
+        || token == "manager"
+        || token
+            .strip_suffix('s')
+            .is_some_and(|singular| TITLE_FRAMES.contains(&singular))
+}
+
+fn is_role_modifier(tokens: &[String], index: usize) -> bool {
+    const QUALIFIERS: &[&str] = &[
+        "software",
+        "hardware",
+        "system",
+        "systems",
+        "technology",
+        "technical",
+        "platform",
+        "product",
+        "security",
+        "data",
+        "machine",
+        "learning",
+        "site",
+        "reliability",
+        "devops",
+        "design",
+        "frontend",
+        "backend",
+        "test",
+    ];
+
+    let token = &tokens[index];
+    if token == "president" {
+        return true;
+    }
+    if token == "manager"
+        && (index > 0
+            && (is_title_frame(&tokens[index - 1])
+                || TITLE_MODIFIERS.contains(&tokens[index - 1].as_str()))
+            || tokens.get(index + 1).is_some_and(|next| next == "of")
+                && tokens
+                    .get(index + 2)
+                    .is_some_and(|next| is_title_frame(next)))
+    {
+        return true;
+    }
+    tokens
+        .get(index + 1)
+        .is_some_and(|next| is_title_frame(next))
+        || (tokens
+            .get(index + 1)
+            .is_some_and(|next| QUALIFIERS.contains(&next.as_str()))
+            && tokens
+                .get(index + 2)
+                .is_some_and(|next| is_title_frame(next)))
+}
+
+fn binds_title_modifier(tokens: &[String], modifier: &str) -> bool {
+    tokens.iter().any(|token| {
+        token == modifier
+            || (PLURAL_TITLE_MODIFIERS.contains(&modifier)
+                && token
+                    .strip_suffix('s')
+                    .is_some_and(|singular| singular == modifier))
+    })
+}
+
+fn canonical_number(token: &str) -> String {
+    let digits = ["st", "nd", "rd", "th"]
+        .iter()
+        .find_map(|suffix| token.strip_suffix(suffix))
+        .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(token);
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return token.to_string();
+    }
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_comma_groups(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        let first_end = i;
+        let mut end = first_end;
+        if first_end - start <= 3 {
+            while end < chars.len()
+                && chars[end] == ','
+                && end + 3 < chars.len()
+                && chars[end + 1..end + 4].iter().all(|c| c.is_ascii_digit())
+                && chars.get(end + 4).is_none_or(|c| !c.is_ascii_digit())
+            {
+                end += 4;
+            }
+        }
+        if end > first_end {
+            for c in &chars[start..first_end] {
+                out.push(*c);
+            }
+            let mut group = first_end;
+            while group < end {
+                group += 1;
+                for c in &chars[group..group + 3] {
+                    out.push(*c);
+                }
+                group += 3;
+            }
+        } else {
+            for c in &chars[start..first_end] {
+                out.push(*c);
+            }
+        }
+    }
+    out
+}
+
+fn numeric_tokens(tokens: &[String], question_framing: bool) -> HashSet<String> {
+    const TIME_UNITS: &[&str] = &[
+        "second", "seconds", "minute", "minutes", "hour", "hours", "day", "days", "week", "weeks",
+        "month", "months", "year", "years",
+    ];
+
+    let mut numbers = HashSet::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if !token.chars().any(|c| c.is_ascii_digit()) {
+            i += 1;
+            continue;
+        }
+        if token.chars().all(|c| c.is_ascii_digit()) {
+            let relative_time = tokens
+                .get(i + 1)
+                .is_some_and(|unit| TIME_UNITS.contains(&unit.as_str()))
+                && tokens.get(i + 2).is_some_and(|word| word == "ago");
+            let list_size = i > 0 && tokens[i - 1] == "top";
+            if question_framing && (relative_time || list_size) {
+                i += 1;
+                continue;
+            }
+            if tokens
+                .get(i + 1)
+                .is_some_and(|suffix| suffix == "am" || suffix == "pm")
+            {
+                numbers.insert(format!("{}{}", canonical_number(token), tokens[i + 1]));
+                i += 2;
+                continue;
+            }
+            numbers.insert(canonical_number(token));
+            i += 1;
+            continue;
+        }
+        numbers.insert(canonical_number(token));
+        i += 1;
+    }
+    numbers
+}
+
+#[derive(Debug, Default)]
+struct ConstraintView {
+    tokens: Vec<String>,
+    numbers: HashSet<String>,
+    negated: bool,
+}
+
+impl ConstraintView {
+    fn of(parts: &[&str], question_framing: bool) -> Self {
+        let tokens: Vec<String> = parts.iter().flat_map(|part| normalized(part)).collect();
+        let numeric_text: Vec<String> = parts
+            .iter()
+            .flat_map(|part| normalized(&normalize_comma_groups(part)))
+            .collect();
+        Self {
+            numbers: numeric_tokens(&numeric_text, question_framing),
+            negated: negates(&tokens),
+            tokens,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AnswerConstraints {
+    title_modifiers: Vec<&'static str>,
+    numbers: HashSet<String>,
+    negated: bool,
+}
+
+impl AnswerConstraints {
+    fn parse(text: &str) -> Self {
+        let view = ConstraintView::of(&[text], true);
+        Self {
+            title_modifiers: TITLE_MODIFIERS
+                .iter()
+                .copied()
+                .filter(|modifier| {
+                    view.tokens
+                        .iter()
+                        .enumerate()
+                        .any(|(i, token)| token == modifier && is_role_modifier(&view.tokens, i))
+                })
+                .collect(),
+            numbers: view.numbers,
+            negated: answer_negated(&view.tokens),
+        }
+    }
+
+    fn permits(&self, entry: &Entry) -> bool {
+        let view = ConstraintView::of(&[&entry.summary, &entry.body], false);
+        self.title_modifiers
+            .iter()
+            .all(|modifier| binds_title_modifier(&view.tokens, modifier))
+            && self.numbers.iter().all(|n| view.numbers.contains(n))
+            && (!self.negated || view.negated)
+    }
+}
+
 /// Shared tail of every search: coverage accounting, trust×recency
 /// weighting, bucket-first ordering, truncation. Standing and expansion
 /// slices append after the lexical hits under their own caps; coverage
@@ -690,6 +1056,11 @@ fn expansion_lane(
 /// (BM25-lite or RRF). Coverage counts run over that pool before
 /// truncation, so callers can say "no verified knowledge covers this task"
 /// even when hits exist.
+///
+/// `require_evidence` filters ordered hits after the provenance filter and
+/// before truncation. Strict answer queries exclude both derived lanes, so
+/// only topical evidence can satisfy the question. Scores and coverage stay
+/// unchanged.
 pub(crate) fn finish(
     mut matched: Vec<(Entry, StateAt, f64)>,
     pool: &[Candidate],
@@ -771,11 +1142,23 @@ pub(crate) fn finish(
     existing_ids.extend(standing.iter().map(|(e, _, _)| e.id));
     let expansion = expansion_lane(pool, revised, query, &scored, &existing_ids);
 
+    let binding = query
+        .require_evidence
+        .then(|| AnswerConstraints::parse(&query.text));
+
+    let mut evidence_filtered = 0;
     let hits = scored
         .into_iter()
         .chain(standing)
         .chain(expansion)
         .filter(|(_, st, _)| !query.require_verified || *st == StateAt::Verified)
+        .filter(|(e, _, _)| {
+            let rejected = binding
+                .as_ref()
+                .is_some_and(|constraints| !constraints.permits(e));
+            evidence_filtered += usize::from(rejected);
+            !rejected
+        })
         .take(query.limit)
         .map(|(entry, state, score)| Hit {
             entry,
@@ -788,6 +1171,7 @@ pub(crate) fn finish(
         hits,
         coverage,
         skipped,
+        evidence_filtered,
     }
 }
 
@@ -2644,5 +3028,526 @@ mod tests {
             out.hits.iter().any(|h| h.score > 0.0),
             "lexical hits keep their scores"
         );
+    }
+
+    #[test]
+    fn answer_gate_rejects_role_modifier_mismatch() {
+        let mut junior = Entry::new("a", EntryKind::Decision, "junior engineer reviews checkout");
+        junior.verify("review", None);
+        let mut senior = Entry::new("a", EntryKind::Decision, "senior engineer reviews checkout");
+        senior.verify("review", None);
+        let (_dir, store) = store_with(vec![junior.clone(), senior.clone()]);
+
+        let asked = "which senior engineer reviews checkout";
+        let ungated = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+        let ids: Vec<_> = ungated.hits.iter().map(|h| h.entry.id).collect();
+        assert!(
+            ids.contains(&junior.id) && ids.contains(&senior.id),
+            "premise: ranking returns both candidates"
+        );
+
+        let gated =
+            search_with_coverage(&store, &Query::new(asked, 10).require_evidence()).unwrap();
+        assert_eq!(gated.hits.len(), 1);
+        assert_eq!(gated.hits[0].entry.id, senior.id);
+        assert_eq!(
+            gated.coverage, ungated.coverage,
+            "the gate never changes coverage"
+        );
+        assert!(!gated.abstained(&Query::new(asked, 10).require_evidence()));
+    }
+
+    #[test]
+    fn answer_gate_rejects_numeric_mismatch() {
+        let mut wrong = Entry::new("a", EntryKind::Observation, "I adopted 4 cats");
+        wrong.verify("review", None);
+        let mut right = Entry::new("a", EntryKind::Observation, "I adopted 3 cats");
+        right.verify("review", None);
+        let asked = "did I adopt 3 cats";
+
+        let (_dir, both) = store_with(vec![wrong.clone(), right.clone()]);
+        let gated = search_with_coverage(&both, &Query::new(asked, 10).require_evidence()).unwrap();
+        assert_eq!(gated.hits.len(), 1, "only the 3-cat entry binds");
+        assert_eq!(gated.hits[0].entry.id, right.id);
+
+        let (_dir2, only_wrong) = store_with(vec![wrong]);
+        let out =
+            search_with_coverage(&only_wrong, &Query::new(asked, 10).require_evidence()).unwrap();
+        assert!(out.hits.is_empty(), "4 cats cannot answer a 3-cat question");
+        assert_eq!(out.coverage.verified, 1, "coverage still reports the miss");
+        assert!(
+            out.abstained(&Query::new(asked, 10).require_evidence()),
+            "an emptied hit set is an explicit abstention"
+        );
+        assert!(
+            !out.abstained(&Query::new(asked, 10)),
+            "gate off does not abstain"
+        );
+    }
+
+    #[test]
+    fn answer_gate_rejects_negation_mismatch() {
+        let mut positive = Entry::new("a", EntryKind::Observation, "I said I like sushi");
+        positive.verify("review", None);
+        let mut negative = Entry::new("a", EntryKind::Observation, "I said I do not like sushi");
+        negative.verify("review", None);
+
+        let (_dir, store) = store_with(vec![positive.clone(), negative.clone()]);
+        let asked = "did I say I do not like sushi";
+        let gated =
+            search_with_coverage(&store, &Query::new(asked, 10).require_evidence()).unwrap();
+        assert_eq!(gated.hits.len(), 1);
+        assert_eq!(gated.hits[0].entry.id, negative.id);
+
+        let (_dir2, only_positive) = store_with(vec![positive.clone()]);
+        let out = search_with_coverage(&only_positive, &Query::new(asked, 10).require_evidence())
+            .unwrap();
+        assert!(out.hits.is_empty(), "unnegated evidence cannot answer it");
+
+        let flat = "did I say I like sushi";
+        let (_dir3, both) = store_with(vec![positive.clone(), negative.clone()]);
+        let out = search_with_coverage(&both, &Query::new(flat, 10).require_evidence()).unwrap();
+        assert_eq!(
+            out.hits.len(),
+            2,
+            "a question without negation does not reject negated evidence"
+        );
+    }
+
+    #[test]
+    fn answer_gate_allows_positive_latest_answer_for_no_longer_update() {
+        let mut current = Entry::new("a", EntryKind::Decision, "the database is postgres now");
+        current.verify("review", None);
+        let (_dir, store) = store_with(vec![current.clone()]);
+
+        let q = Query::new(
+            "did I replace mysql with postgres, no longer using mysql",
+            10,
+        )
+        .require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.id, current.id);
+        assert!(!out.abstained(&q));
+    }
+
+    #[test]
+    fn answer_gate_allows_open_class_paraphrase() {
+        let mut bought = Entry::new("a", EntryKind::Observation, "I bought a smoker for cooking");
+        bought.verify("review", None);
+        let (_dir, store) = store_with(vec![bought.clone()]);
+
+        let asked = "which kitchen appliance did I buy for cooking";
+        let gated =
+            search_with_coverage(&store, &Query::new(asked, 10).require_evidence()).unwrap();
+        assert_eq!(gated.hits.len(), 1, "no closed-class constraint to bind");
+        assert_eq!(gated.hits[0].entry.id, bought.id);
+    }
+
+    #[test]
+    fn answer_gate_does_not_read_bare_won_or_don_as_negation() {
+        let mut award = Entry::new("a", EntryKind::Observation, "we won the latency hackathon");
+        award.verify("review", None);
+        let mut review = Entry::new("a", EntryKind::Decision, "Don reviewed the checkout design");
+        review.verify("review", None);
+        let (_dir, store) = store_with(vec![award.clone(), review.clone()]);
+
+        for (asked, expected) in [
+            ("did we won the latency hackathon", award.id),
+            ("did Don review the checkout design", review.id),
+        ] {
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert_eq!(out.hits.len(), 1, "{asked} must stay answerable");
+            assert_eq!(out.hits[0].entry.id, expected);
+            assert!(!out.abstained(&q), "{asked}");
+        }
+    }
+
+    #[test]
+    fn answer_gate_reads_contractions_as_negation() {
+        let mut positive = Entry::new("a", EntryKind::Observation, "I deploy on fridays");
+        positive.verify("review", None);
+        let mut negative = Entry::new("a", EntryKind::Observation, "I don't deploy on fridays");
+        negative.verify("review", None);
+        let (_dir, store) = store_with(vec![positive.clone(), negative.clone()]);
+
+        let asked = "did I say I don't deploy on fridays";
+        let out = search_with_coverage(&store, &Query::new(asked, 10).require_evidence()).unwrap();
+        assert_eq!(out.hits.len(), 1, "only the negated claim binds");
+        assert_eq!(out.hits[0].entry.id, negative.id);
+
+        let (_dir2, only_positive) = store_with(vec![positive]);
+        let out = search_with_coverage(&only_positive, &Query::new(asked, 10).require_evidence())
+            .unwrap();
+        assert!(out.hits.is_empty(), "unnegated evidence cannot answer it");
+    }
+
+    #[test]
+    fn answer_gate_allows_positive_answer_to_opening_negation() {
+        let mut positive = Entry::new("a", EntryKind::Observation, "I deploy on fridays");
+        positive.verify("review", None);
+        let (_dir, store) = store_with(vec![positive.clone()]);
+
+        for asked in ["didn't I deploy on fridays", "did I not deploy on fridays"] {
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert_eq!(out.hits.len(), 1, "{asked}");
+            assert_eq!(out.hits[0].entry.id, positive.id);
+            assert!(!out.abstained(&q), "{asked}");
+        }
+    }
+
+    #[test]
+    fn answer_gate_allows_answers_to_negated_wh_questions() {
+        let mut cause = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "the checkout deploy failed because the migration timed out",
+        );
+        cause.verify("review", None);
+        let mut tests = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "none of the flaky tests are quarantined",
+        );
+        tests.verify("review", None);
+        let (_dir, store) = store_with(vec![cause.clone(), tests.clone()]);
+
+        for (asked, expected) in [
+            ("why didn't the checkout deploy succeed", cause.id),
+            ("which flaky tests are not quarantined", tests.id),
+        ] {
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert!(
+                out.hits.iter().any(|hit| hit.entry.id == expected),
+                "{asked}"
+            );
+            assert!(!out.abstained(&q), "{asked}");
+        }
+    }
+
+    #[test]
+    fn answer_gate_binds_padded_and_ordinal_numbers() {
+        let mut padded = Entry::new("a", EntryKind::Observation, "I adopted 03 cats");
+        padded.verify("review", None);
+        let mut ordinal = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "sprint 3 review moved the release",
+        );
+        ordinal.verify("review", None);
+        let (_dir, store) = store_with(vec![padded.clone(), ordinal.clone()]);
+
+        for (asked, expected) in [
+            ("did I adopt 3 cats", padded.id),
+            (
+                "where did the 3rd sprint review move the release",
+                ordinal.id,
+            ),
+        ] {
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert!(
+                out.hits.iter().any(|h| h.entry.id == expected),
+                "{asked} must keep the entry that carries the quantity"
+            );
+            assert!(!out.abstained(&q), "{asked}");
+        }
+    }
+
+    #[test]
+    fn answer_gate_binds_number_formatting_and_ignores_relative_time() {
+        let mut appliance =
+            Entry::new("a", EntryKind::Observation, "I bought a smoker for cooking");
+        appliance.verify("review", None);
+        let mut price = Entry::new("a", EntryKind::Observation, "I paid $3,000 for the smoker");
+        price.verify("review", None);
+        let mut meeting = Entry::new("a", EntryKind::Observation, "the review starts at 3 pm");
+        meeting.verify("review", None);
+        let mut features = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "we shipped the top 3 features in the release",
+        );
+        features.verify("review", None);
+        let mut attendance = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "In 2024, 100 people joined the beta",
+        );
+        attendance.verify("review", None);
+        let mut pages = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "I read pages 10-200 of the spec",
+        );
+        pages.verify("review", None);
+        let (_dir, store) = store_with(vec![
+            appliance.clone(),
+            price.clone(),
+            meeting.clone(),
+            features.clone(),
+            attendance.clone(),
+            pages.clone(),
+        ]);
+
+        for (asked, expected) in [
+            ("what did I buy for cooking 3 days ago", appliance.id),
+            ("did I pay 3000 dollars for the smoker", price.id),
+            ("did the review start at 3pm", meeting.id),
+            ("did we ship 3 features in the release", features.id),
+            ("did 100 people join the beta in 2024", attendance.id),
+            ("did I read pages 10 to 200 of the spec", pages.id),
+        ] {
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert!(
+                out.hits.iter().any(|hit| hit.entry.id == expected),
+                "{asked}"
+            );
+            assert!(!out.abstained(&q), "{asked}");
+        }
+    }
+
+    #[test]
+    fn answer_gate_binds_plural_modifiers() {
+        let mut plural = Entry::new("a", EntryKind::Decision, "managers own the checkout cache");
+        plural.verify("review", None);
+        let (_dir, store) = store_with(vec![plural.clone()]);
+
+        let q = Query::new("which manager of engineering owns the checkout cache", 10)
+            .require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.id, plural.id);
+        assert!(!out.abstained(&q));
+    }
+
+    #[test]
+    fn answer_gate_ignores_title_words_outside_role_context() {
+        let mut package = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "the frontend installs dependencies with pnpm",
+        );
+        package.verify("review", None);
+        let mut advice = Entry::new("a", EntryKind::Decision, "use redis for checkout caching");
+        advice.verify("review", None);
+        let mut timing = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "checkout releases ship two weeks after code freeze",
+        );
+        timing.verify("review", None);
+        let mut leader = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "the senior engineer led the checkout migration",
+        );
+        leader.verify("review", None);
+        let (_dir, store) = store_with(vec![
+            package.clone(),
+            advice.clone(),
+            timing.clone(),
+            leader.clone(),
+        ]);
+
+        for (asked, expected) in [
+            ("which package manager does the frontend use", package.id),
+            ("what did the assistant recommend for caching", advice.id),
+            (
+                "what did the assistant tell the developer about caching",
+                advice.id,
+            ),
+            ("what is the lead time for checkout releases", timing.id),
+            (
+                "did the senior engineer lead the checkout migration",
+                leader.id,
+            ),
+        ] {
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert!(
+                out.hits.iter().any(|hit| hit.entry.id == expected),
+                "{asked}"
+            );
+            assert!(!out.abstained(&q), "{asked}");
+        }
+    }
+
+    #[test]
+    fn answer_gate_rejects_verb_instead_of_role_modifier() {
+        let mut junior = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "junior engineer leads checkout reviews",
+        );
+        junior.verify("review", None);
+        let (_dir, store) = store_with(vec![junior]);
+
+        let q = Query::new("which lead engineer reviews checkout", 10).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert!(out.hits.is_empty());
+        assert!(out.abstained(&q));
+    }
+
+    #[test]
+    fn answer_gate_keeps_digit_bearing_identifiers_exact() {
+        let mut build = Entry::new("a", EntryKind::Decision, "build 001abc moved the release");
+        build.verify("review", None);
+        let (_dir, store) = store_with(vec![build]);
+
+        let q = Query::new("which build 1abc moved the release", 10).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert!(out.hits.is_empty());
+        assert!(out.abstained(&q));
+    }
+
+    #[test]
+    fn answer_gate_does_not_treat_verb_inflections_as_title_modifiers() {
+        let mut owner = Entry::new(
+            "a",
+            EntryKind::Decision,
+            "Priya owns the checkout migration",
+        );
+        owner.verify("review", None);
+        let (_dir, store) = store_with(vec![owner.clone()]);
+
+        let q = Query::new("who leads the checkout migration", 10).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.id, owner.id);
+        assert!(!out.abstained(&q));
+    }
+
+    #[test]
+    fn answer_gate_leaves_verified_provenance_unchanged() {
+        let mut verified_near_miss =
+            Entry::new("a", EntryKind::Decision, "junior engineer reviews checkout");
+        verified_near_miss.verify("review", None);
+        let unverified_answer =
+            Entry::new("a", EntryKind::Decision, "senior engineer reviews billing");
+        let (_dir, store) = store_with(vec![verified_near_miss.clone(), unverified_answer.clone()]);
+
+        let asked = "which senior engineer reviews";
+        let provenance_query = Query::new(asked, 10).require_verified();
+        let provenance = search_with_coverage(&store, &provenance_query).unwrap();
+        assert_eq!(provenance.hits.len(), 1);
+        assert_eq!(provenance.hits[0].entry.id, verified_near_miss.id);
+        assert!(!provenance.abstained(&provenance_query));
+
+        let combined_query = Query::new(asked, 10).require_verified().require_evidence();
+        let combined = search_with_coverage(&store, &combined_query).unwrap();
+        assert_eq!(combined.coverage, provenance.coverage);
+        assert!(combined.hits.is_empty());
+        assert!(combined.abstained(&combined_query));
+    }
+
+    #[test]
+    fn answer_gate_abstains_on_mismatch_and_missing_evidence() {
+        let mut junior = Entry::new("a", EntryKind::Decision, "junior engineer reviews checkout");
+        junior.verify("review", None);
+        let (_dir, store) = store_with(vec![junior]);
+
+        let mismatch = Query::new("which senior engineer reviews checkout", 10).require_evidence();
+        let out = search_with_coverage(&store, &mismatch).unwrap();
+        assert!(out.coverage.verified > 0, "knowledge exists on the topic");
+        assert!(
+            out.abstained(&mismatch),
+            "matched knowledge that fails the constraints is a refusal"
+        );
+
+        let missing = Query::new("which principal astronaut pilots zephyr", 10).require_evidence();
+        let out = search_with_coverage(&store, &missing).unwrap();
+        assert!(out.hits.is_empty());
+        assert_eq!(out.coverage.total_matched(), 0);
+        assert!(out.abstained(&missing));
+
+        let answerable =
+            Query::new("which junior engineer reviews checkout", 10).require_evidence();
+        let out = search_with_coverage(&store, &answerable).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert!(
+            !out.abstained(&answerable),
+            "an answerable question answers"
+        );
+    }
+
+    #[test]
+    fn answer_gate_limit_zero_does_not_abstain() {
+        let mut junior = Entry::new("a", EntryKind::Decision, "junior engineer reviews checkout");
+        junior.verify("review", None);
+        let (_dir, store) = store_with(vec![junior]);
+
+        let zero = Query::new("which senior engineer reviews checkout", 0).require_evidence();
+        let out = search_with_coverage(&store, &zero).unwrap();
+        assert!(out.hits.is_empty());
+        assert!(
+            !out.abstained(&zero),
+            "a zero-limit page is the caller's choice, not a miss"
+        );
+    }
+
+    #[test]
+    fn answer_gate_without_constraints_leaves_results_identical() {
+        let mut junior = Entry::new("a", EntryKind::Decision, "junior engineer reviews checkout");
+        junior.verify("review", None);
+        let mut senior = Entry::new("a", EntryKind::Decision, "senior engineer reviews checkout");
+        senior.verify("review", None);
+        let (_dir, store) = store_with(vec![junior, senior]);
+
+        let asked = "who reviews checkout";
+        let plain = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+        let gated_query = Query::new(asked, 10).require_evidence();
+        let gated = search_with_coverage(&store, &gated_query).unwrap();
+        let shape = |out: &SearchOutcome| {
+            out.hits
+                .iter()
+                .map(|hit| (hit.entry.id, hit.score))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&gated), shape(&plain));
+        assert_eq!(gated.coverage, plain.coverage);
+        assert!(!gated.abstained(&gated_query));
+    }
+
+    #[test]
+    fn answer_gate_excludes_standing_lane() {
+        let mut seed = Entry::new("a", EntryKind::Decision, "write zephyr briefs carefully");
+        seed.verify("review", None);
+        let mut standing = Entry::new("a", EntryKind::Decision, "Always highlight snippets");
+        standing.verify("review", None);
+        let (_dir, store) = store_with(vec![seed.clone(), standing.clone()]);
+
+        let asked = "how do i write zephyr briefs";
+        let wide = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+        assert!(wide.hits.iter().any(|hit| hit.entry.id == standing.id));
+
+        let q = Query::new(asked, 10).require_evidence();
+        let gated = search_with_coverage(&store, &q).unwrap();
+        assert_eq!(gated.hits.len(), 1);
+        assert_eq!(gated.hits[0].entry.id, seed.id);
+    }
+
+    #[test]
+    fn answer_gate_excludes_expansion_lane() {
+        let mut seed = Entry::new("a", EntryKind::Observation, "I said I like sushi");
+        seed.session_id = Some("session-harbor".into());
+        seed.verify("review", None);
+        let mut neighbor = Entry::new("a", EntryKind::Observation, "I never eat after 9pm");
+        neighbor.session_id = Some("session-harbor".into());
+        neighbor.verify("review", None);
+        let (_dir, store) = store_with(vec![seed.clone(), neighbor.clone()]);
+
+        let asked = "did I say I do not like sushi";
+        let wide = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+        assert!(wide.hits.iter().any(|hit| hit.entry.id == neighbor.id));
+
+        let q = Query::new(asked, 10).require_evidence();
+        let gated = search_with_coverage(&store, &q).unwrap();
+        assert!(gated.hits.is_empty());
+        assert!(gated.abstained(&q));
     }
 }

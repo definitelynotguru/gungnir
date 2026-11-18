@@ -117,8 +117,8 @@ it never evicts or reorders a lexical hit, and lane entries carry score 0.0.
 Cues match whole words in either field, never across the summary/body
 boundary. Lane hits are not topic-matched coverage, so a briefing that lists
 them reports them instead of claiming no knowledge matched.
-`require_verified` stays purely lexical, so strict provenance queries never
-union standing guidance.
+`require_verified` stays purely lexical. Strict provenance and answer-binding
+queries never union standing guidance.
 
 **Entity and session expansion (both modes).** BM25 returned only the turns
 that shared question words (mean source coverage 0.09 and 0.06 on
@@ -131,9 +131,10 @@ and has positive lexical or vector relevance seeds one hop to verified
 neighbors sharing a key, so expansion follows topical relevance rather than
 standing cues. Existing hit ids are excluded; unverified, contradicted, and
 rolled-back entries neither seed expansion nor enter the lane.
-`require_verified` stays lexical. At most `EXPANSION_LANE_CAP = 6` neighbors
-append after the ordered hits and the standing lane, under `limit`, with
-score 0.0 and no coverage change. The slice is deterministic (newest
+`require_verified` stays lexical. `require_evidence` also disables expansion
+so an off-topic neighbor cannot satisfy the answer gate. At most
+`EXPANSION_LANE_CAP = 6` neighbors append after the ordered hits and the
+standing lane, under `limit`, with score 0.0 and no coverage change. The slice is deterministic (newest
 `timestamp`, then descending `EntryId`). `as_of`, `current_only`, rollback,
 and latest-slot resolution stay in force because the lane reads the same
 visible pool. Keyword and hybrid recall share `finish`, and `embed` stays
@@ -284,6 +285,35 @@ matched pool, so "nothing verified" and "nothing exists" never collapse. The
 CLI turns it into an exit code (2) plus an explicit verdict line; `recall
 --json` and the MCP `coverage:` line carry `abstained` for callers that
 branch on it programmatically.
+
+**Answer binding.** Provenance answers "is this vouched for", not "does this
+answer the question". A verified junior engineer is a true fact and a wrong
+answer to a question about a senior one. `require_evidence` adds a
+deterministic, closed-class constraint check parsed once from the question
+text. Role modifiers count only in title patterns such as "lead engineer",
+"senior software engineer", and "engineering manager", so "package manager"
+and "lead time" stay open-class wording. Evidence uses exact modifiers or common
+plural nouns, so the verb "leads" cannot satisfy the title "lead". Numeric
+comparison handles leading zeros, numeric ordinals, comma groups, and compact
+or spaced times. Relative times and "top N" framing are not answer
+constraints. Negation binding applies to yes/no questions, not wh-questions
+or negation on the opening verb. Positive causes and positive answers remain
+eligible. "No longer" remains an update
+cue. Open-class words are excluded because ranking already handles them and
+requiring them would reject paraphrases.
+
+The check lives in `recall::finish` after the provenance filter and before
+truncation. Strict answer queries exclude standing and expansion lanes. This
+prevents an off-topic rule or neighbor from satisfying a negation or modifier
+when the topical hit fails. Ordinary recall keeps both lanes, and keyword
+and hybrid ordered hits share the same gate. Coverage and scores do not
+change. `SearchOutcome::abstained` keeps CLI prose, `--json`, and MCP on one
+decision: zero verified coverage under `require_verified`, or an empty hit
+set under `require_evidence` at a nonzero limit. A zero limit is a caller
+asking for an empty page. The CLI prints a constraint verdict only when the
+gate filtered a hit, so contradicted-only and zero-match results keep their
+actual causes. Negation is presence, not scope or coreference. No model
+judges eligibility.
 
 ## Concurrency and durability
 

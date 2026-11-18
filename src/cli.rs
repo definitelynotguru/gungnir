@@ -110,9 +110,10 @@ enum Cmd {
 
     /// Keyword recall within a layer. Task-shaped queries also surface
     /// standing constraints (e.g. "always syntax-highlight") even when they
-    /// share no words with the question; fact/temporal queries do not. All
-    /// but `--require-verified` queries also append a capped slice of verified
-    /// entity and session neighbors, up to 6, below the ordered hits.
+    /// share no words with the question; fact/temporal queries do not.
+    /// `--require-verified` and `--require-evidence` exclude both derived
+    /// lanes. Other queries append up to 6 verified entity and session
+    /// neighbors below the ordered hits.
     Recall {
         query: String,
         #[arg(long, default_value = "codex")]
@@ -133,6 +134,14 @@ enum Cmd {
         /// empty verdict and exits 2 — a machine-checkable abstention.
         #[arg(long)]
         require_verified: bool,
+        /// Return only hits whose summary and body carry the question's
+        /// closed-class constraints: role/title words, digit-bearing tokens,
+        /// and negation. Open-class wording is left to ranking so a
+        /// paraphrase still matches. Composes with `--require-verified`.
+        /// When no hits remain at a nonzero limit, exits 2. Coverage and
+        /// scores are unchanged.
+        #[arg(long)]
+        require_evidence: bool,
         /// Emit JSON: {hits, coverage, abstained}.
         #[arg(long)]
         json: bool,
@@ -756,6 +765,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             as_of,
             semantic,
             require_verified,
+            require_evidence,
             json,
             limit,
         } => {
@@ -765,6 +775,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             if require_verified {
                 q = q.require_verified();
+            }
+            if require_evidence {
+                q = q.require_evidence();
             }
             if let Some(raw) = as_of {
                 q = q.as_of(parse_instant(&raw)?);
@@ -791,7 +804,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             } else {
                 g.search_layer(layer_sel, &q)?
             };
-            let abstained = require_verified && out.coverage.verified == 0;
+            let abstained = out.abstained(&q);
             if json {
                 let mut doc = serde_json::to_value(&out)?;
                 doc["abstained"] = serde_json::Value::Bool(abstained);
@@ -817,6 +830,13 @@ fn dispatch(cli: Cli) -> Result<i32> {
                             "({} matched but the result limit is 0)",
                             out.coverage.total_matched()
                         );
+                    } else if out.evidence_filtered > 0
+                        && !(require_verified && out.coverage.verified == 0)
+                    {
+                        println!(
+                            "({} matched but none satisfied the question's role, number, or negation constraints)",
+                            out.coverage.total_matched()
+                        );
                     } else if out.coverage.contradicted > 0 {
                         println!("(only contradicted knowledge matched this topic)");
                     } else if require_verified
@@ -839,10 +859,17 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     out.coverage.hidden_rolled_back
                 );
                 if abstained {
-                    println!(
-                        "no verified knowledge covers this topic ({} matched, 0 verified)",
-                        out.coverage.total_matched()
-                    );
+                    if require_verified && out.coverage.verified == 0 {
+                        println!(
+                            "no verified knowledge covers this topic ({} matched, 0 verified)",
+                            out.coverage.total_matched()
+                        );
+                    } else if out.evidence_filtered > 0 {
+                        println!(
+                            "no matched evidence satisfies the question's constraints ({} matched, 0 bound)",
+                            out.coverage.total_matched()
+                        );
+                    }
                 }
             }
             if abstained {

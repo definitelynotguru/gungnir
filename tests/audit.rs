@@ -481,6 +481,264 @@ fn require_verified_names_contradicted_only_matches() {
 }
 
 #[test]
+fn require_evidence_abstains_when_no_hit_binds_the_question() {
+    let (_d, store) = root();
+    let id = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "junior software engineer reviews checkout",
+        ],
+    );
+    ok(&store, &["verify", &id]);
+
+    let asked = "which senior software engineer reviews checkout";
+    let out = run(&store, &["recall", asked, "--require-evidence"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "(1 matched but none satisfied the question's role, number, or negation constraints)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "no matched evidence satisfies the question's constraints (1 matched, 0 bound)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("no verified knowledge"),
+        "the refusal names answer binding, not provenance: {stdout}"
+    );
+    assert!(
+        stdout.contains("coverage: 1 verified"),
+        "coverage still reports what exists: {stdout}"
+    );
+
+    let out = run(&store, &["recall", asked, "--require-evidence", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(doc["abstained"], true);
+    assert_eq!(doc["hits"].as_array().unwrap().len(), 0);
+    assert_eq!(doc["coverage"]["verified"], 1);
+}
+
+#[test]
+fn require_evidence_blames_the_constraints_before_other_coverage() {
+    let (_d, store) = root();
+    let near_miss = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "junior software engineer reviews checkout",
+        ],
+    );
+    ok(&store, &["verify", &near_miss]);
+    let retracted = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "checkout cache tuning",
+        ],
+    );
+    let counter = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "checkout cache counter",
+        ],
+    );
+    ok(&store, &["contradict", &retracted, "--by", &counter]);
+
+    let out = run(
+        &store,
+        &[
+            "recall",
+            "which senior software engineer reviews checkout",
+            "--require-evidence",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("none satisfied the question's role, number, or negation constraints"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("only contradicted knowledge matched"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn require_evidence_answers_when_the_role_binds() {
+    let (_d, store) = root();
+    let id = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "senior software engineer reviews checkout",
+        ],
+    );
+
+    for extra in [vec![], vec!["--require-evidence"]] {
+        let mut args = vec!["recall", "which senior software engineer reviews checkout"];
+        args.extend(extra.iter().copied());
+        let out = run(&store, &args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(&id), "{stdout}");
+        assert!(
+            !stdout.contains("no matched evidence satisfies"),
+            "{stdout}"
+        );
+    }
+
+    let out = run(
+        &store,
+        &[
+            "recall",
+            "which senior software engineer reviews checkout",
+            "--require-evidence",
+            "--json",
+        ],
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(doc["abstained"], false);
+    assert_eq!(doc["hits"].as_array().unwrap().len(), 1, "{doc}");
+    assert_eq!(doc["coverage"]["unverified"], 1);
+}
+
+#[test]
+fn require_evidence_limit_zero_is_not_an_abstention() {
+    let (_d, store) = root();
+    add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "decision",
+            "--summary",
+            "junior software engineer reviews checkout",
+        ],
+    );
+
+    let out = run(
+        &store,
+        &[
+            "recall",
+            "which senior software engineer reviews checkout",
+            "--require-evidence",
+            "--limit",
+            "0",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty page is the caller's choice"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("the result limit is 0"), "{stdout}");
+
+    let out = run(
+        &store,
+        &[
+            "recall",
+            "which senior software engineer reviews checkout",
+            "--require-evidence",
+            "--limit",
+            "0",
+            "--json",
+        ],
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(doc["abstained"], false);
+    assert_eq!(doc["coverage"]["unverified"], 1);
+}
+
+#[test]
+fn require_evidence_preserves_non_constraint_empty_causes() {
+    let (_d, store) = root();
+    let claim = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "checkout cache tuning",
+        ],
+    );
+    let counter = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "retraction note",
+        ],
+    );
+    ok(&store, &["contradict", &claim, "--by", &counter]);
+
+    let out = run(
+        &store,
+        &[
+            "recall",
+            "checkout cache",
+            "--current",
+            "--require-evidence",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("only contradicted knowledge matched"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("none satisfied the question"), "{stdout}");
+    assert!(!stdout.contains("0 bound"), "{stdout}");
+
+    let out = run(&store, &["recall", "quantum zeno", "--require-evidence"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no knowledge matched this topic"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("0 bound"), "{stdout}");
+}
+
+#[test]
 fn brief_limit_zero_blames_the_limit_not_filters() {
     let (_d, store) = root();
     add(

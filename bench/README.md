@@ -95,6 +95,27 @@ lexical by design, so it measures the explicit `0/N` before baseline with a
 different semantic role. This is not a benchmark baseline for the same query
 semantics.
 
+## Answer-binding fixture
+
+`cargo run --example aev27_measurement` is a targeted before/after fixture
+for abstention that tests whether returned evidence binds the question, not
+part of this benchmark and not a full eval. Each of its seven cases stores
+one verified entry that shares lexical terms with the question, so retrieval
+and provenance both succeed and only the binding check separates the legs.
+Three cases are unanswerable by design: a question about a manager against
+senior-engineer evidence, a question about three cats against a four-cat
+note, and a negated question against unnegated evidence. Four are
+answerable controls: the matching role, number, and negation cases plus an
+appliance question whose only shared words are open-class, so the gate must
+stay inert.
+
+The baseline is `0/3` unanswerable empty because keyword recall cannot
+refuse a lexical near-miss. The post-change expectation is `3/3` on the
+`require_evidence` arm with the control leg unchanged at `0/4` on both
+sides. The printed numbers are empty-result counts, not judged-answer
+accuracy and not an LME/BEAM score. `src/recall.rs` pins the same behavior
+as unit tests, and `tests/audit.rs` pins the CLI contract.
+
 ## Files
 
 - `corpus.yaml`: the world under test. Two agents, three sessions, a

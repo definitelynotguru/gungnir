@@ -712,6 +712,67 @@ fn mcp_journal_named_root_keeps_diagnostic_paths_real() {
 }
 
 #[test]
+fn mcp_recall_require_evidence_abstains_on_unbound_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = gungnir::Gungnir::open(dir.path()).unwrap();
+    let mut junior = gungnir::Entry::new(
+        "a",
+        gungnir::EntryKind::Decision,
+        "junior engineer reviews checkout",
+    );
+    junior.verify("review", None);
+    g.codex().unwrap().create(&junior).unwrap();
+    drop(g);
+
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+    let coverage = |text: &str| -> serde_json::Value {
+        serde_json::from_str(
+            text.lines()
+                .last()
+                .unwrap()
+                .trim_start_matches("coverage: "),
+        )
+        .unwrap()
+    };
+
+    let r = p.rpc(&msg(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "recall",
+            "arguments": {
+                "query": "which senior engineer reviews checkout",
+                "require_evidence": true
+            }
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("no matches"), "{text}");
+    let cov = coverage(text);
+    assert_eq!(cov["abstained"], true, "{text}");
+    assert_eq!(cov["verified"], 1);
+
+    let r = p.rpc(&msg(
+        3,
+        "tools/call",
+        serde_json::json!({
+            "name": "recall",
+            "arguments": {
+                "query": "which junior engineer reviews checkout",
+                "require_evidence": true
+            }
+        }),
+    ));
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains(&junior.id.to_string()), "{text}");
+    let cov = coverage(text);
+    assert_eq!(cov["abstained"], false, "{text}");
+    assert_eq!(cov["verified"], 1);
+}
+
+#[test]
 fn mcp_brief_require_verified_hides_unverified_hits() {
     let dir = tempfile::tempdir().unwrap();
     let g = gungnir::Gungnir::open(dir.path()).unwrap();

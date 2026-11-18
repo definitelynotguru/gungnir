@@ -82,8 +82,9 @@ get the lane** — temporal questions and `--current`/knowledge-update queries
 stay on keyword recall so generic rules cannot crowd their top-k. Task verbs
 match common inflections ("building" meets "build"); cues match whole words in
 either the summary or the body, never a phrase split across the two fields.
-`--require-verified` is a strict provenance query and stays lexical. Lane hits
-carry score 0.0 and do not count as topic-matched coverage, so a briefing that
+`--require-verified` is a strict provenance query and stays lexical.
+`--require-evidence` also excludes the standing lane. Lane hits carry score
+0.0 and do not count as topic-matched coverage, so a briefing that
 lists them says so plainly instead of claiming no knowledge matched. The lane
 is part of keyword and hybrid recall; `embed` stays opt-in.
 
@@ -101,9 +102,9 @@ Every ordered hit that is verified at the query instant and has positive
 lexical or vector relevance seeds one hop to verified neighbors that share its
 entity string or session id. Unverified, contradicted, and rolled-back entries
 neither seed expansion nor enter the lane, and existing hit ids are
-excluded. `require_verified` stays lexical and returns no expansion. At most
-`EXPANSION_LANE_CAP = 6` neighbors append after the ordered hits and the
-standing lane, under `--limit`. This is a second, independent
+excluded. `require_verified` stays lexical and returns no expansion.
+`require_evidence` also returns no expansion. At most `EXPANSION_LANE_CAP = 6`
+neighbors append after the ordered hits and the standing lane, under `--limit`. This is a second, independent
 budget; the standing lane keeps its cap of 4. Expansion hits carry score 0.0
 and do not change coverage or abstention. The lane is deterministic: newest
 `timestamp` first, then descending `EntryId`. `as_of`, `--current`, rollback,
@@ -193,10 +194,68 @@ gungnir brief --agent builder "postgres" --require-verified
 ```
 
 Exit codes: 0 success, 1 error, 2 abstention. On MCP, `recall` accepts
-`require_verified` and `as_of` and always ends its result with a `coverage:`
-JSON line including `abstained`; `brief` accepts `require_verified` and
-says "N unverified or contradicted match(es) exist, none verified" when the
-verdict fires.
+`require_verified`, `require_evidence`, and `as_of` and always ends its
+result with a `coverage:` JSON line including `abstained`. `brief` accepts
+`require_verified` and says "N unverified or contradicted match(es) exist,
+none verified" when the verdict fires.
+
+## Binding answers to the question
+
+`--require-verified` asks whether a hit is vouched for. It does not ask
+whether the hit answers the question. A verified "junior engineer reviews
+checkout" is a fine fact and a wrong answer to "which senior engineer
+reviews checkout". `--require-evidence` adds that answer check. It is opt-in
+and off by default.
+
+The gate parses three closed-class constraint kinds from the question and
+checks them against each hit's summary and body:
+
+- **Role and title modifiers**: senior, junior, manager, lead, principal,
+  staff, director, chief, intern, associate, assistant, vp, president,
+  distinguished. A modifier counts only in a title pattern such as "lead
+  engineer", "senior software engineer", "engineering manager", or "manager
+  of engineering". "Package manager" and "lead time" do not create role
+  constraints. Evidence uses the exact modifier or a common
+  plural noun, so "managers" binds "manager" but the verb "leads" does not
+  bind "lead".
+- **Digit-bearing tokens**: "3" in "did I adopt 3 cats" must occur in the
+  evidence. Leading zeros, numeric ordinals, comma groups, and compact or
+  spaced times bind their equivalents. Thus "03", "3rd", and "3" bind,
+  "3,000" binds "3000", and "3pm" binds "3 pm". Relative times such as "3
+  days ago" and list framing such as "top 3" are not answer constraints.
+- **Negation in yes/no questions**: a negated yes/no question needs negated
+  evidence. Negated wh-questions can have positive answers and do not get
+  this constraint. Negation on the opening verb, as in "didn't I deploy",
+  also permits positive evidence. `no`, `not`, `never`, `none`, `nobody`, `nothing`,
+  `neither`, `nor`, `without`, and unapostrophized contractions count alone.
+  Apostrophe contractions count as two-token phrases such as "don t", so
+  bare "don" and "won" stay ordinary words. "No longer" is an update cue and
+  does not require negated evidence.
+
+Open-class words are never required. "Kitchen appliance" can therefore bind
+a smoker when lexical or vector ranking returns that entry. Extra modifiers
+and numbers in the evidence are allowed. A question with no closed-class
+constraints does not filter any hits, but an empty result still abstains.
+
+The gate filters ordered hits after the provenance filter and before
+`--limit`. Strict answer queries exclude the standing and expansion lanes so
+an off-topic neighbor cannot satisfy a constraint. Ordinary recall keeps
+both lanes. Coverage and scores stay unchanged. The flags compose:
+
+```bash
+gungnir recall "which senior engineer reviews checkout" --require-verified --require-evidence
+gungnir recall "did I adopt 3 cats" --require-evidence   # exit 2 when only 4-cat notes match
+```
+
+`abstained` is true when no hits remain at a nonzero limit. The CLI prints a
+constraint verdict only when the gate filtered a hit. A zero limit is an
+empty page, not an abstention caused by evidence filtering.
+
+The modifier and role-noun lists are curated. Other title words and roles
+bind nothing. Spelled-out numbers such as "third" do not bind "3". The
+apostrophized "can't" is not recognized because its first token is "can",
+but "cant" is recognized. Negation is presence, not scope or coreference. No
+model judges eligibility.
 
 ## How it works
 
@@ -255,9 +314,12 @@ Key behaviors:
   their heads and drops contradicted facts. `--as-of <RFC3339>` evaluates
   history from the verification log, no schema change required. Every search
   reports coverage, and briefings say plainly when no verified knowledge
-  covers a task. Task-shaped queries also surface standing constraints that
-  share no words with the question, and all but `--require-verified` queries
-  append verified entity and session neighbors. See
+  covers a task. `--require-evidence` adds the other half of abstention,
+  testing whether returned evidence carries the question's role, number, and
+  negation terms, so a verified near-miss is refused instead of answered.
+  Task-shaped queries also surface standing constraints that
+  share no words with the question. Queries without `--require-verified` or
+  `--require-evidence` append verified entity and session neighbors. See
   [Standing constraints in recall](#standing-constraints-in-recall) and
   [Entity and session expansion in recall](#entity-and-session-expansion-in-recall).
   Plain current queries resolve `revises` chains as slots so the latest

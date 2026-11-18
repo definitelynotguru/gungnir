@@ -248,7 +248,7 @@ impl Server {
             },
             {
                 "name": "recall",
-                "description": "Keyword search. layer: codex (default) or journal. Task-shaped queries also surface standing constraints that share no words with the question; fact/temporal queries do not. All but require_verified queries also append a capped slice of verified entity and session neighbors, up to 6, below the ordered hits. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: only verified hits. The result always ends with a machine-readable coverage JSON line including `abstained`. as_of: evaluate history at an RFC3339 instant.",
+                "description": "Keyword search. layer: codex (default) or journal. Task-shaped queries also surface standing constraints that share no words with the question; fact/temporal queries do not. All but require_verified and require_evidence queries append a capped slice of verified entity and session neighbors, up to 6, below the ordered hits. semantic: fuse in embedding similarity (needs the `embed` build). require_verified: only verified hits. require_evidence: only ordered hits whose summary and body carry the question's role/title words, digit-bearing tokens, and yes/no-question negation; excludes the standing and expansion lanes; open-class wording is left to ranking. It abstains when no hits remain at a nonzero limit. Provenance and answer binding compose. The result always ends with a machine-readable coverage JSON line including `abstained`. as_of: evaluate history at an RFC3339 instant.",
                 "inputSchema": schema(json!({
                     "query": {"type": "string"},
                     "layer": {"type": "string", "enum": ["codex", "journal"]},
@@ -256,6 +256,7 @@ impl Server {
                     "limit": {"type": "integer"},
                     "semantic": {"type": "boolean"},
                     "require_verified": {"type": "boolean"},
+                    "require_evidence": {"type": "boolean"},
                     "as_of": {"type": "string"}
                 }), &["query"])
             },
@@ -451,9 +452,16 @@ impl Server {
                     .get("require_verified")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let require_evidence = args
+                    .get("require_evidence")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let mut q = Query::new(query, limit);
                 if require_verified {
                     q = q.require_verified();
+                }
+                if require_evidence {
+                    q = q.require_evidence();
                 }
                 if let Some(raw) = arg("as_of") {
                     let t = chrono::DateTime::parse_from_rfc3339(raw)
@@ -484,7 +492,7 @@ impl Server {
                 } else {
                     self.g.search_layer(layer, &q)?
                 };
-                let abstained = require_verified && out.coverage.verified == 0;
+                let abstained = out.abstained(&q);
                 let mut coverage = serde_json::to_value(out.coverage)?;
                 coverage["abstained"] = Value::Bool(abstained);
                 // Coverage is always emitted — the abstention signal is the
