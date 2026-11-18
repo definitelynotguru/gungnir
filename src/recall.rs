@@ -35,11 +35,11 @@
 //!
 //! Entity and session expansion builds a derived adjacency map on each query
 //! from the temporal pool. Keys come from normalized `entity_mentions()` and
-//! `session_id`, with separate prefixes so the two cannot collide. Positive
-//! lexical or vector hits seed one hop to verified neighbors that share a
-//! key. At most `EXPANSION_LANE_CAP` neighbors append after the ordered hits
-//! and the standing lane, under `limit`, with score 0.0 and no coverage
-//! change. The map is read-only and never persisted.
+//! `session_id`, with separate prefixes so the two cannot collide. Live
+//! verified lexical or vector hits seed one hop to verified neighbors that
+//! share a key. At most `EXPANSION_LANE_CAP` neighbors append after the
+//! ordered hits and the standing lane, under `limit`, with score 0.0 and no
+//! coverage change. The map is read-only and never persisted.
 //!
 //! Slot resolution: an explicit `revises` chain is one slot, and its head is
 //! the member no live `revises` link points at. `current_only` hides the
@@ -613,12 +613,12 @@ fn standing_lane(
 /// The capped entity and session expansion slice. One derived adjacency map
 /// per query holds the index of every pool entry under each normalized
 /// `entity_mentions()` string and `session_id`; prefixes keep the two key
-/// namespaces separate. Every positive-relevance hit in `scored` seeds one
-/// hop to neighbors sharing a key, so the lane follows topical relevance
-/// rather than the standing-constraint cues. Only verified, visible neighbors
-/// qualify, and `existing_ids` keeps seeds and standing-lane hits out. The
-/// slice is a read-only view over the same temporal pool, so `as_of`,
-/// `current_only`, rollback, and latest-slot resolution stay in force.
+/// namespaces separate. Every live verified positive-relevance hit in
+/// `scored` seeds one hop to neighbors sharing a key, so the lane follows
+/// topical relevance rather than the standing-constraint cues. Only verified,
+/// visible neighbors qualify, and `existing_ids` keeps seeds and standing-lane
+/// hits out. The slice is a read-only view over the same temporal pool, so
+/// `as_of`, `current_only`, rollback, and latest-slot resolution stay in force.
 fn expansion_lane(
     pool: &[Candidate],
     revised: &HashSet<EntryId>,
@@ -649,8 +649,8 @@ fn expansion_lane(
     let visible: HashSet<usize> = visible_indices(pool, revised, query).into_iter().collect();
     let mut lane: Vec<(Entry, StateAt, f64)> = Vec::new();
     let mut chosen: HashSet<usize> = HashSet::new();
-    for (seed, _, relevance) in scored {
-        if *relevance <= 0.0 {
+    for (seed, state, relevance) in scored {
+        if *state != StateAt::Verified || *relevance <= 0.0 {
             continue;
         }
         let keys = seed
@@ -2484,5 +2484,165 @@ mod tests {
 
         let zero = search_with_coverage(&store, &Query::new("zephyr release", 0)).unwrap();
         assert!(zero.hits.is_empty(), "limit 0 returns no hits");
+    }
+
+    /// An unverified or contradicted lexical hit must not choose which
+    /// verified neighbors enter a briefing, even when it shares a session id.
+    #[test]
+    fn unverified_or_contradicted_seeds_do_not_expand_verified_neighbors() {
+        let counter = Entry::new("a", EntryKind::Observation, "counter evidence");
+        let mut contradicted_seed = Entry::new("a", EntryKind::Decision, "amber module rollout");
+        contradicted_seed.session_id = Some("session-amber".into());
+        contradicted_seed.contradict(counter.id, "ops", None);
+        let mut unverified_seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        unverified_seed.session_id = Some("session-harbor".into());
+        let mut amber_neighbor = Entry::new("a", EntryKind::Decision, "velvet parchment");
+        amber_neighbor.session_id = Some("session-amber".into());
+        amber_neighbor.verify("review", None);
+        let mut harbor_neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        harbor_neighbor.session_id = Some("session-harbor".into());
+        harbor_neighbor.verify("review", None);
+
+        let (_dir, store) = store_with(vec![
+            counter,
+            contradicted_seed.clone(),
+            unverified_seed.clone(),
+            amber_neighbor.clone(),
+            harbor_neighbor.clone(),
+        ]);
+
+        let contradicted_out =
+            search_with_coverage(&store, &Query::new("amber module", 10)).unwrap();
+        assert!(
+            contradicted_out
+                .hits
+                .iter()
+                .any(|h| h.entry.id == contradicted_seed.id),
+            "the contradicted lexical hit is visible"
+        );
+        assert!(
+            contradicted_out
+                .hits
+                .iter()
+                .all(|h| h.entry.id != amber_neighbor.id),
+            "a contradicted seed must not expand a verified neighbor"
+        );
+
+        let unverified_out =
+            search_with_coverage(&store, &Query::new("zephyr release", 10)).unwrap();
+        assert!(
+            unverified_out
+                .hits
+                .iter()
+                .any(|h| h.entry.id == unverified_seed.id),
+            "the unverified lexical hit is visible"
+        );
+        assert!(
+            unverified_out
+                .hits
+                .iter()
+                .all(|h| h.entry.id != harbor_neighbor.id),
+            "an unverified seed must not expand a verified neighbor"
+        );
+    }
+
+    /// Fact-shaped queries receive expansion from their temporal pool. A task
+    /// cue is not required and a `FACT_CUES` word must not disable the lane.
+    #[test]
+    fn fact_shaped_query_still_expands_a_verified_session_neighbor() {
+        let mut seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        seed.session_id = Some("session-harbor".into());
+        seed.verify("review", None);
+        let mut neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        neighbor.session_id = Some("session-harbor".into());
+        neighbor.verify("review", None);
+        let (_dir, store) = store_with(vec![seed.clone(), neighbor.clone()]);
+
+        let out =
+            search_with_coverage(&store, &Query::new("when was the zephyr release", 10)).unwrap();
+        let seed_pos = out.hits.iter().position(|h| h.entry.id == seed.id).unwrap();
+        let neighbor_pos = out
+            .hits
+            .iter()
+            .position(|h| h.entry.id == neighbor.id)
+            .unwrap();
+        assert!(seed_pos < neighbor_pos, "the lexical seed stays first");
+        assert_eq!(out.hits[neighbor_pos].score, 0.0);
+        assert_eq!(out.coverage.total_matched(), 1);
+    }
+
+    /// A neighbor verified before an `as_of` cutoff appends from the
+    /// historical pool. A cutoff before that verification leaves it out.
+    #[test]
+    fn as_of_cutoff_including_the_neighbor_expands_it_but_an_earlier_cutoff_does_not() {
+        let verified_at = Utc::now() - chrono::Duration::days(10);
+        let before = verified_at - chrono::Duration::days(1);
+        let after = verified_at + chrono::Duration::days(1);
+
+        let mut seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        seed.session_id = Some("session-harbor".into());
+        seed.timestamp = before;
+        seed.verify("review", None);
+        seed.verification_log[0].timestamp = before;
+        let mut neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        neighbor.session_id = Some("session-harbor".into());
+        neighbor.timestamp = before;
+        neighbor.verify("review", None);
+        neighbor.verification_log[0].timestamp = verified_at;
+        let (_dir, store) = store_with(vec![seed, neighbor.clone()]);
+
+        let included =
+            search_with_coverage(&store, &Query::new("zephyr release", 10).as_of(after)).unwrap();
+        let hit = included
+            .hits
+            .iter()
+            .find(|h| h.entry.id == neighbor.id)
+            .unwrap();
+        assert_eq!(hit.score, 0.0);
+        assert_eq!(hit.state, StateAt::Verified);
+
+        let excluded =
+            search_with_coverage(&store, &Query::new("zephyr release", 10).as_of(before)).unwrap();
+        assert!(
+            excluded.hits.iter().all(|h| h.entry.id != neighbor.id),
+            "an unverified neighbor at the cutoff must not expand"
+        );
+    }
+
+    /// One task query can engage both append lanes. An entry eligible for
+    /// the standing lane must not also appear through expansion.
+    #[test]
+    fn standing_and_expansion_lanes_dedupe_entries_across_both_lanes() {
+        let mut seed = Entry::new("a", EntryKind::Decision, "zephyr release notes");
+        seed.session_id = Some("session-harbor".into());
+        seed.verify("review", None);
+        let mut standing = Entry::new("a", EntryKind::Decision, "Always highlight snippets");
+        standing.session_id = Some("session-harbor".into());
+        standing.verify("review", None);
+        let mut neighbor = Entry::new("a", EntryKind::Decision, "quartz ledger");
+        neighbor.session_id = Some("session-harbor".into());
+        neighbor.verify("review", None);
+        let (_dir, store) = store_with(vec![seed, standing.clone(), neighbor.clone()]);
+
+        let out = search_with_coverage(&store, &Query::new("how do i deploy zephyr", 10)).unwrap();
+        let ids: Vec<_> = out.hits.iter().map(|h| h.entry.id).collect();
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(ids.len(), unique.len(), "no entry appears twice");
+        assert_eq!(
+            ids.iter().filter(|&&id| id == standing.id).count(),
+            1,
+            "the standing hit is not duplicated by expansion"
+        );
+        assert_eq!(
+            ids.iter().filter(|&&id| id == neighbor.id).count(),
+            1,
+            "the expansion neighbor appears once"
+        );
+        assert!(
+            out.hits.iter().any(|h| h.score > 0.0),
+            "lexical hits keep their scores"
+        );
     }
 }

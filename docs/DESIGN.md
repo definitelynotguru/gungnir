@@ -126,10 +126,11 @@ summarization and event-ordering probes). Recall now derives one adjacency
 map per query from the temporal candidate pool: keys are normalized
 `entity_mentions()` strings (frontmatter `entities:` plus name-shaped
 `[[wikilinks]]`) and `session_id`, under separate prefixes so the namespaces
-cannot collide. Every ordered hit with positive lexical or vector relevance
-seeds one hop to verified neighbors sharing a key, so expansion follows
-topical relevance rather than standing cues. Seeds and existing hit ids are
-excluded; unverified, contradicted, and rolled-back neighbors never enter.
+cannot collide. Every ordered hit that is `Verified` at the query instant
+and has positive lexical or vector relevance seeds one hop to verified
+neighbors sharing a key, so expansion follows topical relevance rather than
+standing cues. Existing hit ids are excluded; unverified, contradicted, and
+rolled-back entries neither seed expansion nor enter the lane.
 `require_verified` stays lexical. At most `EXPANSION_LANE_CAP = 6` neighbors
 append after the ordered hits and the standing lane, under `limit`, with
 score 0.0 and no coverage change. The slice is deterministic (newest
