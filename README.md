@@ -97,12 +97,13 @@ name-shaped `[[wikilinks]]`) and from `session_id`, with separate prefixes so
 the two cannot collide. Nothing is persisted, and files stay the store of
 truth.
 
-Every ordered hit with positive lexical or vector relevance seeds one hop to
-verified neighbors that share its entity string or session id. Unverified,
-contradicted, and rolled-back neighbors never enter, and seeds plus existing
-hit ids are excluded. `require_verified` stays lexical and returns no
-expansion. At most `EXPANSION_LANE_CAP = 6` neighbors append after the ordered
-hits and the standing lane, under `--limit`. This is a second, independent
+Every ordered hit that is verified at the query instant and has positive
+lexical or vector relevance seeds one hop to verified neighbors that share its
+entity string or session id. Unverified, contradicted, and rolled-back entries
+neither seed expansion nor enter the lane, and existing hit ids are
+excluded. `require_verified` stays lexical and returns no expansion. At most
+`EXPANSION_LANE_CAP = 6` neighbors append after the ordered hits and the
+standing lane, under `--limit`. This is a second, independent
 budget; the standing lane keeps its cap of 4. Expansion hits carry score 0.0
 and do not change coverage or abstention. The lane is deterministic: newest
 `timestamp` first, then descending `EntryId`. `as_of`, `--current`, rollback,

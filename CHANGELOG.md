@@ -10,8 +10,9 @@ All notable changes to Gungnir are documented here. The format follows
 
 - **Entity and session expansion in recall.** Each query derives an adjacency
   map from canonical entries keyed by normalized `entity_mentions()` strings
-  and `session_id`, with separate prefixes. Positive lexical or vector hits
-  seed one hop to verified neighbors sharing a key. At most
+  and `session_id`, with separate prefixes. Live verified lexical or vector
+  hits seed one hop to verified neighbors sharing a key. Unverified and
+  contradicted hits neither seed expansion nor enter the lane. At most
   `EXPANSION_LANE_CAP = 6` neighbors append after the ordered hits and the
   standing lane under `limit`, with score 0.0 and no coverage change.
   `require_verified` stays lexical, `as_of`/`current_only`/rollback and

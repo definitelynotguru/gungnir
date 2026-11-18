@@ -218,10 +218,11 @@ derived from the canonical entries in the temporal candidate pool on every
 read. Nothing is persisted, and no parser, triple store, or model runs on the
 write path.
 
-Every ordered lexical or vector hit with positive relevance seeds one hop:
-entries that share a seed's entity string or session id become candidates.
-Only neighbors evaluated `Verified` at the query instant are eligible, so
-unverified, contradicted, and rolled-back neighbors never enter. Seeds and
+Every ordered lexical or vector hit that is `Verified` at the query instant
+and has positive relevance seeds one hop: entries that share a seed's entity
+string or session id become candidates. Only neighbors evaluated `Verified`
+at the query instant are eligible, so unverified, contradicted, and
+rolled-back entries neither seed expansion nor enter the lane. Seeds and
 any id already in the hit set or the standing lane are excluded.
 `require_verified` stays purely lexical and returns no expansion. All other
 query shapes, including fact-shaped, `current_only`, and `as_of`, expand from
