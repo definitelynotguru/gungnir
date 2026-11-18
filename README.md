@@ -90,22 +90,24 @@ is part of keyword and hybrid recall; `embed` stays opt-in.
 ## Latest-slot resolution in recall
 
 An explicit `revises` chain is one **slot**: "12 commits merged into main"
-replaced by "main now has 19 commits". A plain current query ranks the
-**latest live verified member** of that slot first, even when the stale
-wording shares more of the question's words and would win on keyword score
-alone. Both generations stay visible on a plain read — nothing is deleted —
-but the stale one is demoted below current knowledge. `--current` still
-hides all superseded tails and counts them as hidden, as before.
+replaced by "main now has 19 commits". The head is the member no live
+`revises` link points at. A plain current query ranks that **live verified
+head** first, even when the stale wording shares more of the question's words
+and would win on keyword score alone. Both generations stay visible on a
+plain read — nothing is deleted — but the stale one is demoted below current
+knowledge. `--current` still hides all superseded tails and counts them as
+hidden, as before.
 
 Slot identity comes only from explicit `revises` links written by
 `resolve --supersede`, `supersede`, or rollback. Recall never invents a link,
-never writes a file, and never changes a verification state. The winner is
-chosen deterministically by timestamp with the entry id as a tie-break, and
-only a live verified member can win: an unverified proposal cannot displace
-verified knowledge just by being newer. `--as-of` queries keep their
-historical ordering — a point-in-time read never consults present-day slot
-state. Rolled-back heads fall back to the last live member. The rule lives in
-the shared ranking step, so keyword and opt-in hybrid recall agree.
+never writes a file, and never changes a verification state. Plain and
+`--current` views share one head definition (the same link-target set), so
+they can never name opposite heads. Only a live verified tail is demoted: an
+unverified proposal cannot displace verified knowledge. `--as-of` queries
+keep their historical ordering — a point-in-time read never consults
+present-day slot state. Rolled-back heads fall back to the last live member,
+and a `revises` cycle degrades safely. The rule lives in the shared ranking
+step, so keyword and opt-in hybrid recall agree.
 
 ## Semantic recall (opt-in)
 

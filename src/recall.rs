@@ -33,12 +33,14 @@
 //! canonical files on every query; it writes nothing, verifies nothing, and
 //! fact-shaped (including temporal) queries never receive it.
 //!
-//! Slot resolution: an explicit `revises` chain is one slot, and its live
-//! head is the latest verified member. For a present-time query, the other
-//! verified members of that slot rank below current knowledge, so a stale
-//! wording cannot beat the current fact on BM25 score alone. The chain is
-//! derived from canonical files on every query; nothing is written, no
-//! verification state changes, and `as_of` reads keep historical semantics.
+//! Slot resolution: an explicit `revises` chain is one slot, and its head is
+//! the member no live `revises` link points at. `current_only` hides the
+//! link targets; a plain present-time query instead ranks those verified
+//! tails below current knowledge, so a stale wording cannot beat the current
+//! fact on BM25 score alone. Both views share the link-target set from
+//! `temporal_pool`, so they never disagree. The chain is derived from
+//! canonical files on every query; nothing is written, no verification
+//! state changes, and `as_of` reads keep historical semantics.
 
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -309,9 +311,12 @@ pub(crate) struct Candidate {
     pub state: StateAt,
 }
 
-/// The candidate pool after `as_of` filtering, plus the set of ids hidden
-/// by `current_only` supersession. Shared by keyword and hybrid search so
-/// both paths honor the temporal contract identically.
+/// The candidate pool after `as_of` filtering, plus the set of ids that a
+/// live `revises` link points at (superseded tails). Shared by keyword and
+/// hybrid search, and by both current views: `current_only` hides those ids,
+/// while a plain present-time query only demotes them. One definition of a
+/// slot head, so the two views can never disagree about which member is
+/// current.
 ///
 /// `revised` collects revises targets from every as-of-valid live entry,
 /// not just topic-matched ones: otherwise a chain A<-B<-C where B is
@@ -330,10 +335,10 @@ pub(crate) fn temporal_pool(
             }
         }
         let state = state_at(&entry, query.as_of);
-        // A rolled-back head must not hide its predecessor. Current view
-        // falls back to the last live revision. A rollback record's
-        // `revises` marks the ancestor it restores, so it is not a revision.
-        if query.current_only && state != StateAt::RolledBack && entry.kind != EntryKind::Rollback {
+        // A rolled-back head must not hide its predecessor. A rollback
+        // record's `revises` marks the ancestor it restores, so it is not a
+        // revision. Both current views use this same `revised` set.
+        if state != StateAt::RolledBack && entry.kind != EntryKind::Rollback {
             if let Some(prev) = entry.revises {
                 revised.insert(prev);
             }
@@ -343,105 +348,23 @@ pub(crate) fn temporal_pool(
     Ok((pool, revised, scan.skipped))
 }
 
-/// Ids of stale slot members: verified entries that are not the latest live
-/// verified member of their own `revises` slot. A present-time query ranks
-/// them below current knowledge, so a stale wording cannot beat a live head
-/// (or any other current fact) on BM25 score alone.
+/// Verified slot tails that a plain present-time query demotes below current
+/// knowledge. Slot identity is the `revised` set from `temporal_pool`: the
+/// ids that live `revises` links point at. `current_only` hides that same
+/// set, so both current views share one head definition.
 ///
-/// One explicit `revises` chain is one slot. Following the links backward
-/// from any live member reaches the slot's root, so all members share a root
-/// even when a link's direction does not match the real update order — the
-/// read path decides the winner deterministically, with no write-time
-/// judgment. The head is the newest verified member (timestamp, then id as a
-/// stable tie-break).
-///
-/// A `kind = rollback` record and any member evaluated `RolledBack` do not
-/// participate: a rollback's `revises` restores an ancestor rather than
-/// replacing it, matching every other supersession consumer in the store.
-/// A `revises` cycle and an all-unverified chain resolve to no head. `as_of`
-/// views never call this, so historical ordering is untouched.
-fn stale_slot_members(pool: &[Candidate]) -> HashSet<EntryId> {
-    let live: HashMap<EntryId, &Candidate> = pool
-        .iter()
-        .filter(|c| c.state != StateAt::RolledBack && c.entry.kind != EntryKind::Rollback)
-        .map(|c| (c.entry.id, c))
-        .collect();
-    // Most stores have no `revises` links at all. Skip the slot walk so a
-    // plain query over an unlinked corpus pays only this one pass.
-    if live.values().all(|c| c.entry.revises.is_none()) {
-        return HashSet::new();
-    }
-    // A parent edge exists only when the revises target is itself live.
-    // Following links backward always ends at the one member with no
-    // `revises` target, so an inverted direction (the newer member carries
-    // the link) still groups into one slot: both walks reach the same root.
-    let parent = |id: EntryId| {
-        live.get(&id)
-            .and_then(|c| c.entry.revises)
-            .filter(|p| live.contains_key(p))
-    };
-
-    // Slot id = the root reached by walking revises backward. Memoized per
-    // member so a long chain costs one walk, not one per (member, member).
-    // `None` marks a cycle: degrade to no slot, independent of scan order.
-    let mut slot_of: HashMap<EntryId, Option<EntryId>> = HashMap::new();
-    for &id in live.keys() {
-        if slot_of.contains_key(&id) {
-            continue;
-        }
-        let mut path = Vec::new();
-        let mut seen = HashSet::new();
-        let mut cur = id;
-        let slot = loop {
-            if let Some(s) = slot_of.get(&cur) {
-                break *s;
-            }
-            if !seen.insert(cur) {
-                break None;
-            }
-            path.push(cur);
-            match parent(cur) {
-                Some(p) => cur = p,
-                None => break Some(cur),
-            }
-        };
-        for m in path {
-            slot_of.insert(m, slot);
-        }
-    }
-
-    let mut slots: HashMap<EntryId, Vec<EntryId>> = HashMap::new();
-    for &id in live.keys() {
-        if let Some(Some(root)) = slot_of.get(&id) {
-            slots.entry(*root).or_default().push(id);
-        }
-    }
-
-    let mut stale = HashSet::new();
-    for members in slots.into_values() {
-        // The head is the latest live verified member of the slot. Only
-        // verified members are ever demoted: an unverified proposal or a
-        // contradicted fact keeps its own trust bucket, so slot resolution
-        // never makes a hearsay claim "stale" by a read-path judgment.
-        let verified: Vec<EntryId> = members
-            .iter()
-            .copied()
-            .filter(|id| live[id].state == StateAt::Verified)
-            .collect();
-        let Some(head) = verified
-            .iter()
-            .copied()
-            .max_by_key(|id| (live[id].entry.timestamp, *id))
-        else {
-            continue; // an all-unverified chain keeps trust-weighted ordering
-        };
-        for m in verified {
-            if m != head {
-                stale.insert(m);
-            }
-        }
-    }
-    stale
+/// An unverified proposal is never demoted: it keeps its own trust bucket, so
+/// slot resolution cannot call hearsay stale by a read-path judgment. `as_of`
+/// views skip this entirely, keeping historical ordering.
+fn stale_slot_members(pool: &[Candidate], revised: &HashSet<EntryId>) -> HashSet<EntryId> {
+    pool.iter()
+        .filter(|c| {
+            c.state == StateAt::Verified
+                && c.entry.kind != EntryKind::Rollback
+                && revised.contains(&c.entry.id)
+        })
+        .map(|c| c.entry.id)
+        .collect()
 }
 
 /// Cues that mark an entry as a standing constraint: a durable rule or
@@ -722,13 +645,12 @@ pub(crate) fn finish(
         }
     }
 
-    // Plain present-time queries resolve each explicit `revises` chain as
-    // one slot: the latest live verified member wins, and every other
-    // verified member of that slot is demoted below current knowledge on a
-    // tie-break inside the trust bucket. `current_only` already hides those
-    // tails; `as_of` reads keep their historical ordering.
+    // Plain present-time queries demote the same link-target set that
+    // `current_only` hides: the verified tails rank below current knowledge
+    // on a tie-break inside the trust bucket. One shared head definition for
+    // both views; `as_of` reads keep their historical ordering.
     let stale_slots = if query.as_of.is_none() && !query.current_only {
-        stale_slot_members(pool)
+        stale_slot_members(pool, revised)
     } else {
         HashSet::new()
     };
@@ -1835,60 +1757,92 @@ mod tests {
         assert_eq!(store.require(stale_id).unwrap().revises, None);
     }
 
-    /// An inverted `revises` direction must still pick the newest member.
-    /// The read path groups the chain as a slot and decides the winner from
-    /// timestamps; it does not trust the link's arrow to name the truth.
-    #[test]
-    fn slot_resolution_ignores_revises_direction_and_picks_newest_verified() {
+    /// The slot head is the link target's revises parent: the member with no
+    /// live `revises` parent. Plain and `--current` views must agree on it in
+    /// both link directions, so a link whose arrow points at the newer entry
+    /// cannot make the two views name opposite heads.
+    fn slot_pair(direction: &str) -> (tempfile::TempDir, Store, EntryId, EntryId) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let mut older = Entry::new("a", EntryKind::Decision, "budget is 100 dollars");
         older.timestamp = Utc::now() - chrono::Duration::days(30);
         older.verify("archive", None);
-        store.create(&older).unwrap();
         let mut newer = Entry::new("a", EntryKind::Decision, "budget is 250 dollars");
-        newer.body = "budget 100 dollars budget 100 dollars".into();
         newer.timestamp = Utc::now() - chrono::Duration::days(1);
         newer.verify("archive", None);
-        store.create(&newer).unwrap();
-        // The newer fact is named as the tail, so the lexical score favors
-        // the older one. Slot resolution must still put the newer fact first.
-        older.revises = Some(newer.id);
-        store.update_with(&older, &|_| Ok(true)).unwrap();
-
-        let out = search_with_coverage(&store, &Query::new("budget dollars", 10)).unwrap();
-        assert_eq!(out.hits[0].entry.id, newer.id);
+        match direction {
+            // Well-formed: newer.revises = older. `head` = newer.
+            "newer_revises_older" => newer.revises = Some(older.id),
+            // Inverted: older.revises = newer. `head` = older (no parent).
+            "older_revises_newer" => older.revises = Some(newer.id),
+            _ => unreachable!(),
+        }
+        // The lexical advantage goes to the non-head, so only slot
+        // resolution can put the head first.
+        if direction == "newer_revises_older" {
+            older.body = "budget dollars budget dollars budget dollars".into();
+        } else {
+            newer.body = "budget dollars budget dollars budget dollars".into();
+        }
+        // Write-time validation requires the `revises` target to exist, so
+        // the target goes first in each direction.
+        if direction == "newer_revises_older" {
+            store.create(&older).unwrap();
+            store.create(&newer).unwrap();
+            (dir, store, newer.id, older.id)
+        } else {
+            store.create(&newer).unwrap();
+            store.create(&older).unwrap();
+            (dir, store, older.id, newer.id)
+        }
     }
 
-    /// Equal timestamps break by EntryId, so the slot winner is stable no
-    /// matter what order the store scans its files in.
+    #[test]
+    fn plain_and_current_views_agree_on_slot_head_in_both_link_directions() {
+        for direction in ["newer_revises_older", "older_revises_newer"] {
+            let (_d, store, head, tail) = slot_pair(direction);
+            let plain = search_with_coverage(&store, &Query::new("budget dollars", 10)).unwrap();
+            assert_eq!(plain.hits[0].entry.id, head, "{direction}: plain head");
+            let current =
+                search_with_coverage(&store, &Query::new("budget dollars", 10).current()).unwrap();
+            assert_eq!(current.hits.len(), 1, "{direction}: current hides the tail");
+            assert_eq!(current.hits[0].entry.id, head, "{direction}: current head");
+            assert!(!current.hits.iter().any(|h| h.entry.id == tail));
+            assert_eq!(current.coverage.hidden_superseded, 1);
+        }
+    }
+
+    /// With equal timestamps, the shared head definition still decides
+    /// deterministically: the member with no live `revises` parent wins, and
+    /// both current views agree regardless of scan order or lexical score.
     #[test]
     fn slot_resolution_is_deterministic_at_equal_timestamps() {
         let tied = Utc::now() - chrono::Duration::days(1);
-        let mut a = Entry::new("a", EntryKind::Decision, "quota is 40 units");
-        a.timestamp = tied;
-        a.verify("archive", None);
-        let mut b = Entry::new("a", EntryKind::Decision, "quota is 90 units");
-        b.timestamp = tied;
-        b.verify("archive", None);
-        a.revises = Some(b.id);
-        // Give the lexically stronger text to the smaller id, so the max-id
-        // winner cannot win on BM25 alone. Only the deterministic id
-        // tie-break can put it first, regardless of link direction.
-        let lo: &mut Entry = if a.id < b.id { &mut a } else { &mut b };
-        lo.body = "quota units quota units quota units quota units".into();
-        let expected = a.id.max(b.id);
-        // Create the target first: write-time validation requires the
-        // `revises` parent to already exist in the store.
-        let (_d, store) = store_with(vec![b.clone(), a.clone()]);
+        let mut tail = Entry::new("a", EntryKind::Decision, "quota is 40 units");
+        tail.timestamp = tied;
+        tail.verify("archive", None);
+        let mut head = Entry::new("a", EntryKind::Decision, "quota is 90 units");
+        head.timestamp = tied;
+        head.verify("archive", None);
+        // The head carries `revises` pointing at the tail, so `revised`
+        // holds the tail and the head wins. Give the tail the lexical
+        // advantage so only slot resolution puts the head first, then repeat
+        // to prove the order is stable at equal timestamps.
+        head.revises = Some(tail.id);
+        tail.body = "quota units quota units quota units quota units".into();
+        // The link target must exist first for write-time validation.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.create(&tail).unwrap();
+        store.create(&head).unwrap();
 
-        // Repeated queries over the same store must agree on the winner.
         for _ in 0..3 {
-            let out = search_with_coverage(&store, &Query::new("quota units", 10)).unwrap();
-            assert_eq!(
-                out.hits[0].entry.id, expected,
-                "id tie-break decides the head"
-            );
+            let plain = search_with_coverage(&store, &Query::new("quota units", 10)).unwrap();
+            assert_eq!(plain.hits[0].entry.id, head.id, "plain head is stable");
+            let current =
+                search_with_coverage(&store, &Query::new("quota units", 10).current()).unwrap();
+            assert_eq!(current.hits.len(), 1);
+            assert_eq!(current.hits[0].entry.id, head.id, "current head agrees");
         }
     }
 
@@ -1999,6 +1953,39 @@ mod tests {
         // The rolled-back head is hidden; v2 is the latest live member.
         assert_eq!(out.hits[0].entry.id, v2.id);
         assert_eq!(out.coverage.hidden_rolled_back, 1);
+        // The shared `revised` set excludes the rolled-back head's link, so
+        // the strict current view names the same live head.
+        let current =
+            search_with_coverage(&store, &Query::new("sessions use", 10).current()).unwrap();
+        assert_eq!(current.hits[0].entry.id, v2.id);
+    }
+
+    /// A `revises` cycle degrades safely: the shared link-target rule marks
+    /// both members as tails, both current views still return results, and
+    /// neither view crashes or hides the whole slot.
+    #[test]
+    fn revises_cycle_degrades_without_hiding_the_slot_in_both_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut a = Entry::new("a", EntryKind::Decision, "quota is 40 units");
+        a.verify("archive", None);
+        let mut b = Entry::new("a", EntryKind::Decision, "quota is 90 units");
+        b.verify("archive", None);
+        // A direct cycle. Write-time validation of `revises` needs the
+        // target to exist, so create `a` first, then `b` pointing at `a`,
+        // then rewrite `a` to point back at `b`.
+        store.create(&a).unwrap();
+        b.revises = Some(a.id);
+        store.create(&b).unwrap();
+        a.revises = Some(b.id);
+        store.update_with(&a, &|_| Ok(true)).unwrap();
+
+        let plain = search_with_coverage(&store, &Query::new("quota units", 10)).unwrap();
+        assert_eq!(plain.hits.len(), 2);
+        let current =
+            search_with_coverage(&store, &Query::new("quota units", 10).current()).unwrap();
+        assert_eq!(current.hits.len(), 0, "both are link targets, both hidden");
+        assert_eq!(current.coverage.hidden_superseded, 2);
     }
 
     /// `current_only` still hides every tail and counts it as hidden. The

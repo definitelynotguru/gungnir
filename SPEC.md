@@ -93,20 +93,22 @@ relevance × trust × recency` — trust weights the bucket
 
 **Latest-slot resolution (plain present-time queries).** One explicit
 `revises` chain is one slot, derived from the canonical files on every read.
-The latest live verified member wins; every other verified member of that
-slot is ranked below current knowledge, so a stale wording cannot outrank a
-current fact on BM25 score. Both generations stay visible on a plain read
-(nothing is deleted or hidden), and `--current` still hides all superseded
-tails and counts them as hidden. The winner is chosen by `timestamp` then
-`EntryId` for determinism at equal timestamps. Only a live verified member
-can win: a slot with no verified member keeps the ordinary trust-weighted
-order, and an unverified proposal never displaces verified knowledge by
-being newer. A `kind = rollback` record and members evaluated `RolledBack`
-do not participate; a rolled-back head falls back to the last live member.
-A `revises` cycle degrades to no slot. This is a read-path rule only: files
-stay canonical, no `revises` link is written from an unverified proposal,
-and no verification state changes. The shared ranking step applies it to
-keyword and hybrid recall alike.
+The head is the member that no live `revises` link points at — the same
+`temporal_pool` link-target set that `current_only` hides. A plain query
+demotes every verified tail in that set below current knowledge, so a stale
+wording cannot outrank a current fact on BM25 score. Both generations stay
+visible on a plain read (nothing is deleted or hidden), and `--current`
+still hides all superseded tails and counts them as hidden. The two views
+share one head definition, so an inverted link cannot make them disagree.
+Only a live verified tail is demoted: a slot with no verified tail keeps the
+ordinary trust-weighted order, and an unverified proposal never displaces
+verified knowledge. A `kind = rollback` record and members evaluated
+`RolledBack` do not contribute links; a rolled-back head falls back to the
+last live member, and a `revises` cycle degrades safely (both members are
+link targets). `as_of` reads skip the rule entirely. This is a read-path
+rule only: files stay canonical, no `revises` link is written from an
+unverified proposal, and no verification state changes. The shared ranking
+step applies it to keyword and hybrid recall alike.
 
 Temporal modes:
 

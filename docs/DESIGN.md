@@ -121,23 +121,23 @@ them reports them instead of claiming no knowledge matched.
 union standing guidance.
 
 **Latest-slot resolution (both modes).** An explicit `revises` chain is one
-slot. On a plain present-time query the latest live verified member wins,
-and its stale verified slot-mates are demoted below current knowledge even
-when their wording scores higher on BM25. Both generations stay visible on a
-plain read; `current_only` still hides the tails and counts them as hidden.
-The slot is grouped from
-canonical `revises` links on every query, so a link whose arrow disagrees
-with the real update order still resolves to the newest member. The winner
-is `max(timestamp, EntryId)` over verified live members, so equal
-timestamps are deterministic and an unverified proposal can never displace
-verified knowledge. A `kind = rollback` record and rolled-back members do
-not participate, matching every other supersession consumer; a cycle
-degrades to no slot. `as_of` and `current_only` skip the rule, so historical
-ordering and the strict current view are unchanged. The rule is purely a
-read-path sort key: files stay the store of record, no link is written from
-an unverified proposal, no verification state changes, and no embedder or
-LLM judge is involved. It lives in the shared ranking step, so keyword and
-hybrid recall cannot disagree about which member is current.
+slot. The head is the member no live `revises` link points at, computed once
+in `temporal_pool` as the link-target set. `current_only` hides that set; a
+plain present-time query instead demotes the verified tails in it below
+current knowledge even when their wording scores higher on BM25. Both
+generations stay visible on a plain read; the two views share one head
+definition, so an inverted link cannot make them name opposite heads. Only
+verified tails are demoted, so an unverified proposal can never displace
+verified knowledge. A `kind = rollback` record and rolled-back members
+contribute no links, matching every other supersession consumer: a
+rolled-back head falls back to the last live member, and a cycle marks both
+members as link targets without aborting the read. `as_of` and
+`current_only` skip the demotion, so historical ordering and the strict
+current view are unchanged. The rule is purely a read-path sort key: files
+stay the store of record, no link is written from an unverified proposal, no
+verification state changes, and no embedder or LLM judge is involved. It
+lives in the shared ranking step, so keyword and hybrid recall cannot
+disagree about which member is current.
 
 **Scoring formula, both modes.** Final order is a verification bucket
 (verified > unverified > contradicted) sorted lexicographically first, then
