@@ -161,6 +161,46 @@ exits 2 (a machine-checkable abstention) when no verified knowledge covers
 the topic; `recall --json` emits `{hits, coverage, abstained}`, and MCP
 `recall` always ends with a `coverage:` JSON line carrying the same fields.
 
+`require_evidence` (Query `require_evidence()`, CLI `--require-evidence`,
+MCP `require_evidence`) admits a hit only when that entry's summary and body
+carry every closed-class constraint extracted from the question.
+
+- Curated role and title modifiers: senior, junior, manager, lead,
+  principal, staff, director, chief, intern, associate, assistant, vp,
+  president, distinguished. A modifier counts only in a title pattern such
+  as "lead engineer", "senior software engineer", "engineering manager", or
+  "manager of engineering". Evidence uses the exact modifier or a common
+  plural noun. Thus "managers" binds
+  "manager", while the verb "leads" does not bind "lead".
+- Digit-bearing tokens: leading zeros, numeric ordinals, comma groups, and
+  compact or spaced times bind their equivalents. "03", "3rd", and "3"
+  bind, "3,000" binds "3000", and "3pm" binds "3 pm". Other digit-bearing
+  tokens stay exact. Relative times such as "3 days ago" and list framing
+  such as "top 3" are not answer constraints.
+- Negation in yes/no questions. A negated yes/no question requires negated
+  evidence. Negated wh-questions and negation on the opening verb do not.
+  `no`, `not`, `never`, `none`,
+  `nobody`, `nothing`, `neither`, `nor`, `without`, and unapostrophized
+  contractions count alone. Apostrophe contractions count as two-token
+  phrases, so bare "don" and "won" are words, not negations. The
+  apostrophized "can't" is not recognized because its first token is "can".
+  The unapostrophized "cant" is recognized. "No longer" is an update cue and
+  does not require negated evidence.
+
+Open-class words are not required, so paraphrase remains eligible. Extra
+modifiers and numbers are allowed. A question with no closed-class
+constraints does not filter any hits, but an empty result still abstains.
+
+The gate filters ordered hits after the provenance filter and before `limit`.
+Strict answer queries exclude the standing and expansion lanes so an
+off-topic neighbor cannot satisfy a constraint. Ordinary recall keeps both
+lanes. Coverage, scores, and ordering are unchanged. The two flags compose.
+Abstention therefore has two causes behind one signal: zero verified
+coverage under `require_verified`, or no surviving hit under
+`require_evidence` at a nonzero limit. The CLI prints a constraint verdict
+only when the gate filtered a hit. An empty page at `limit` 0 is the caller's
+choice, never an answer-binding miss. No model judges eligibility.
+
 Hybrid mode (`--semantic` on CLI, `semantic: true` on MCP) fuses keyword
 ranks with embedding cosine ranks via reciprocal rank fusion (k = 60) over
 the same temporal pool, coverage, and ordering rule. A candidate is
@@ -202,9 +242,10 @@ hit; when lexical hits fill the limit the union is empty. Lane entries carry
 no lexical relevance (score 0.0) and do not count as topic-matched coverage,
 so a briefing that lists standing constraints reports them instead of
 claiming no knowledge matched. Cues match whole words in either the summary
-or body, never a phrase assembled across the field boundary. `require_verified` is a strict provenance
-query and stays purely lexical — it does not union standing constraints. The
-same lane applies to keyword and hybrid recall; `embed` stays opt-in.
+or body, never a phrase assembled across the field boundary.
+`require_verified` and `require_evidence` are strict queries and do not union
+standing constraints. The same lane applies to ordinary keyword and hybrid
+recall; `embed` stays opt-in.
 
 ### Entity and session expansion
 
@@ -224,9 +265,10 @@ string or session id become candidates. Only neighbors evaluated `Verified`
 at the query instant are eligible, so unverified, contradicted, and
 rolled-back entries neither seed expansion nor enter the lane. Seeds and
 any id already in the hit set or the standing lane are excluded.
-`require_verified` stays purely lexical and returns no expansion. All other
-query shapes, including fact-shaped, `current_only`, and `as_of`, expand from
-their own temporal pool.
+`require_verified` stays purely lexical and returns no expansion.
+`require_evidence` also returns no expansion because an off-topic neighbor
+cannot serve as answer evidence. Other query shapes, including fact-shaped,
+`current_only`, and `as_of`, expand from their own temporal pool.
 
 At most `EXPANSION_LANE_CAP = 6` neighbors append after the ordered hits and
 the standing lane, under `limit`. This is a second, independent budget; the
@@ -362,7 +404,8 @@ specifies. Source is `--from <session-id-or-entry>`, `--file <path>`, or
   `rollback`, `promote`, `brief`, `conflicts`, `log`, `diff`, `blame`,
   `review`, `entities`, `session`, `stats`
   (`--topic` reports cross-journal coverage counts), `mcp`. Exit codes: 0
-  success, 1 error, 2 explicit abstention under `--require-verified`.
+  success, 1 error, 2 explicit abstention (`--require-verified` provenance,
+  `--require-evidence` answer binding).
 - **MCP server**: tools `start_session`, `end_session`, `add_observation`,
   `add_attempt`, `extract`, `recall`, `brief`, `verify`, `contradict`,
   `promote`, `supersede`, `rollback`, `conflicts`, `resolve_conflict`,
