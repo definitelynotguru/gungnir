@@ -84,10 +84,29 @@ Default mode: BM25-lite keyword scoring — `idf × tf` across `summary`
 (weight 2) + body, length-normalized, over a stemmed, stopword-stripped
 vocabulary so inflections collapse ("migrating" matches "migration").
 Filtering happens before scoring. Sort key: `(verification_bucket,
-final_score)` where bucket orders verified > unverified > contradicted
-and `final_score = relevance × trust × recency` — trust weights the bucket
+slot_stale, final_score)` where bucket orders verified > unverified >
+contradicted, `slot_stale` demotes non-winning members of a resolved slot
+below their slot's latest live verified member, and `final_score =
+relevance × trust × recency` — trust weights the bucket
 (1.0 / 0.75 / 0.35) and recency decays at a 90-day half-life floored at
 0.25. Rolled-back entries are always hidden.
+
+**Latest-slot resolution (plain present-time queries).** One explicit
+`revises` chain is one slot, derived from the canonical files on every read.
+The latest live verified member wins; every other verified member of that
+slot is ranked below current knowledge, so a stale wording cannot outrank a
+current fact on BM25 score. Both generations stay visible on a plain read
+(nothing is deleted or hidden), and `--current` still hides all superseded
+tails and counts them as hidden. The winner is chosen by `timestamp` then
+`EntryId` for determinism at equal timestamps. Only a live verified member
+can win: a slot with no verified member keeps the ordinary trust-weighted
+order, and an unverified proposal never displaces verified knowledge by
+being newer. A `kind = rollback` record and members evaluated `RolledBack`
+do not participate; a rolled-back head falls back to the last live member.
+A `revises` cycle degrades to no slot. This is a read-path rule only: files
+stay canonical, no `revises` link is written from an unverified proposal,
+and no verification state changes. The shared ranking step applies it to
+keyword and hybrid recall alike.
 
 Temporal modes:
 
@@ -100,6 +119,10 @@ Temporal modes:
   at T".
 - `current_only`: every revises chain resolves to its head; superseded tails
   and contradicted facts are excluded from hits and counted in coverage.
+  Latest-slot resolution is skipped here because tails are already removed.
+- `as_of` and any point-in-time view skip latest-slot resolution entirely:
+  historical ordering is reconstructed from the pool at the cutoff, never
+  from present-day slot state.
 
 Every search reports topic-scoped coverage counts (verified / unverified /
 contradicted, plus hidden superseded and rolled-back totals, plus the total

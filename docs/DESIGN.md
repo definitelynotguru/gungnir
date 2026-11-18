@@ -120,14 +120,34 @@ them reports them instead of claiming no knowledge matched.
 `require_verified` stays purely lexical, so strict provenance queries never
 union standing guidance.
 
+**Latest-slot resolution (both modes).** An explicit `revises` chain is one
+slot. On a plain present-time query the latest live verified member wins,
+and its stale verified slot-mates are demoted below current knowledge even
+when their wording scores higher on BM25. Both generations stay visible on a
+plain read; `current_only` still hides the tails and counts them as hidden.
+The slot is grouped from
+canonical `revises` links on every query, so a link whose arrow disagrees
+with the real update order still resolves to the newest member. The winner
+is `max(timestamp, EntryId)` over verified live members, so equal
+timestamps are deterministic and an unverified proposal can never displace
+verified knowledge. A `kind = rollback` record and rolled-back members do
+not participate, matching every other supersession consumer; a cycle
+degrades to no slot. `as_of` and `current_only` skip the rule, so historical
+ordering and the strict current view are unchanged. The rule is purely a
+read-path sort key: files stay the store of record, no link is written from
+an unverified proposal, no verification state changes, and no embedder or
+LLM judge is involved. It lives in the shared ranking step, so keyword and
+hybrid recall cannot disagree about which member is current.
+
 **Scoring formula, both modes.** Final order is a verification bucket
 (verified > unverified > contradicted) sorted lexicographically first, then
-the score `relevance × trust × recency`:
+a slot-staleness tie-break inside that bucket, then the score
+`relevance × trust × recency`:
 
 - `relevance`: BM25-lite for keyword, RRF score ×1000 for hybrid.
 - `trust`: 1.0 verified, 0.75 unverified, 0.35 contradicted. Because the
   bucket sorts first, a contradicted entry can never outrank a verified one
-  on the same topic regardless of relevance.
+  on the same topic regardless of relevance or slot membership.
 - `recency`: exponential decay in entry age at the query instant,
   half-life 90 days, floored at 0.25 so old-but-true facts keep a floor.
 

@@ -87,6 +87,26 @@ carry score 0.0 and do not count as topic-matched coverage, so a briefing that
 lists them says so plainly instead of claiming no knowledge matched. The lane
 is part of keyword and hybrid recall; `embed` stays opt-in.
 
+## Latest-slot resolution in recall
+
+An explicit `revises` chain is one **slot**: "12 commits merged into main"
+replaced by "main now has 19 commits". A plain current query ranks the
+**latest live verified member** of that slot first, even when the stale
+wording shares more of the question's words and would win on keyword score
+alone. Both generations stay visible on a plain read — nothing is deleted —
+but the stale one is demoted below current knowledge. `--current` still
+hides all superseded tails and counts them as hidden, as before.
+
+Slot identity comes only from explicit `revises` links written by
+`resolve --supersede`, `supersede`, or rollback. Recall never invents a link,
+never writes a file, and never changes a verification state. The winner is
+chosen deterministically by timestamp with the entry id as a tie-break, and
+only a live verified member can win: an unverified proposal cannot displace
+verified knowledge just by being newer. `--as-of` queries keep their
+historical ordering — a point-in-time read never consults present-day slot
+state. Rolled-back heads fall back to the last live member. The rule lives in
+the shared ranking step, so keyword and opt-in hybrid recall agree.
+
 ## Semantic recall (opt-in)
 
 The default build is BM25-lite keyword scoring with stemming and makes
@@ -210,6 +230,9 @@ Key behaviors:
   covers a task. Task-shaped queries also surface standing constraints that
   share no words with the question — see
   [Standing constraints in recall](#standing-constraints-in-recall).
+  Plain current queries resolve `revises` chains as slots so the latest
+  verified fact outranks a stale wording — see
+  [Latest-slot resolution in recall](#latest-slot-resolution-in-recall).
   Hybrid vector+keyword fusion via reciprocal rank fusion is
   available per query through the opt-in `embed` build — see
   [Semantic recall (opt-in)](#semantic-recall-opt-in).

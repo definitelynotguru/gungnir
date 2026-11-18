@@ -786,4 +786,41 @@ mod tests {
             "hybrid fact recall must not pull in the standing rule"
         );
     }
+
+    /// Slot resolution lives in the shared `finish`, so hybrid recall must
+    /// rank a stale verified tail below its live verified head on a plain
+    /// present-time query too. The fake embedder sees no known token in
+    /// either wording, so keyword relevance alone decides and the stale
+    /// tail would otherwise win.
+    #[test]
+    fn hybrid_recall_ranks_latest_slot_head_above_stale_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut stale = Entry::new("a", EntryKind::Decision, "12 commits merged into main");
+        stale.body = "12 commits merged into main total count".into();
+        stale.timestamp = chrono::Utc::now() - chrono::Duration::days(30);
+        stale.verify("archive", None);
+        store.create(&stale).unwrap();
+        let mut head = Entry::new("a", EntryKind::Decision, "main now has 19 commits");
+        head.body = "merge count updated".into();
+        head.timestamp = chrono::Utc::now() - chrono::Duration::days(1);
+        head.revises = Some(stale.id);
+        head.verify("archive", None);
+        store.create(&head).unwrap();
+
+        let embedder = CachedEmbedder::new(
+            Fake {
+                calls: Mutex::new(0),
+            },
+            dir.path(),
+        );
+        let out = hybrid_search(
+            &store,
+            &Query::new("commits merged into main", 10),
+            &embedder,
+        )
+        .unwrap();
+        assert_eq!(out.hits[0].entry.id, head.id);
+        assert_eq!(out.hits[1].entry.id, stale.id);
+    }
 }
