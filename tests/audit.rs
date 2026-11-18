@@ -634,6 +634,38 @@ fn require_evidence_answers_when_the_role_binds() {
 }
 
 #[test]
+fn require_evidence_binds_equivalent_clock_forms() {
+    let (_d, store) = root();
+    let id = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "the review starts at 3:00pm",
+        ],
+    );
+    ok(&store, &["verify", &id]);
+
+    let out = run(
+        &store,
+        &[
+            "recall",
+            "did the review start at 3pm",
+            "--require-evidence",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(doc["abstained"], false);
+    assert_eq!(doc["hits"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn require_evidence_limit_zero_is_not_an_abstention() {
     let (_d, store) = root();
     add(
