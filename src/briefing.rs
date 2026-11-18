@@ -226,7 +226,9 @@ pub fn compile(input: BriefingInput) -> Briefing {
         // contradict its own output. Standing-constraint lane hits are
         // listed too; they carry score 0.0 (no lexical relevance) and do
         // not count toward topic-matched coverage, but the briefing still
-        // shows them, so it must not claim the task matched nothing.
+        // shows them, so it must not claim the task matched nothing. A
+        // listed verified lane hit must not be denied by a "none are
+        // verified" verdict either.
         let c = input.codex_coverage;
         let j = input.journal_coverage;
         let matched_any = c
@@ -245,7 +247,12 @@ pub fn compile(input: BriefingInput) -> Briefing {
             .chain(&input.journal_hits)
             .filter(|h| h.score == 0.0)
             .count();
-        if matched_any {
+        let verified_lane_hit = input
+            .codex_hits
+            .iter()
+            .chain(&input.journal_hits)
+            .any(|h| h.score == 0.0 && h.state == recall::StateAt::Verified);
+        if matched_any && !verified_lane_hit {
             md.push_str(
                 "\nEntries matched this task but none are verified. Proceed with caution.\n",
             );
@@ -256,20 +263,16 @@ pub fn compile(input: BriefingInput) -> Briefing {
         }
     }
 
-    // Coverage counts topic-matched contradicted facts, but a hit listed
-    // above with zero coverage (a lane hit) would otherwise get no warning.
-    // Drive the count from the hits actually shown too, so "fact(s) above"
-    // stays true of the rendered output. max() keeps the existing count when
-    // coverage is higher, e.g. a truncated result limit.
-    let coverage_contradicted =
-        input.codex_coverage.contradicted + input.journal_coverage.contradicted;
-    let listed_contradicted = input
+    // The warning names contradicted facts "above", so it counts only the
+    // contradicted hits actually rendered, not the larger pre-truncation
+    // coverage pool. A contradicted lane hit has zero topic coverage but is
+    // still listed, so it earns the warning too.
+    let contradicted = input
         .codex_hits
         .iter()
         .chain(&input.journal_hits)
         .filter(|h| h.state == recall::StateAt::Contradicted)
         .count();
-    let contradicted = coverage_contradicted.max(listed_contradicted);
     if contradicted > 0 {
         md.push_str(&format!(
             "\nWarning: {contradicted} contradicted fact(s) above. Do not rely on them.\n"
@@ -346,6 +349,39 @@ mod tests {
         assert!(b.markdown.contains("standing constraints are listed above"));
     }
 
+    /// A verified standing constraint listed beside an unverified topical
+    /// match must not be denied by a "none are verified" verdict.
+    #[test]
+    fn verified_lane_hit_is_not_denied_when_unverified_matches_exist() {
+        let mut i = input();
+        i.codex_hits = vec![
+            Hit {
+                entry: Entry::new("a", EntryKind::Observation, "login layout notes"),
+                state: StateAt::Unverified,
+                score: 1.0,
+            },
+            Hit {
+                entry: Entry::new("a", EntryKind::Decision, "Always syntax-highlight code"),
+                state: StateAt::Verified,
+                score: 0.0,
+            },
+        ];
+        i.codex_coverage.unverified = 1;
+        let b = compile(i);
+        assert!(
+            b.markdown
+                .contains("[verified] Always syntax-highlight code"),
+            "{}",
+            b.markdown
+        );
+        assert!(!b.markdown.contains("none are verified"), "{}", b.markdown);
+        assert!(
+            b.markdown.contains("standing constraints are listed above"),
+            "{}",
+            b.markdown
+        );
+    }
+
     /// A contradicted hit listed above with no topic coverage still earns the
     /// do-not-rely warning. Coverage counters alone would stay silent.
     #[test]
@@ -386,6 +422,32 @@ mod tests {
         let b = compile(i);
         assert!(b.markdown.contains("CONTRADICTED"));
         assert!(b.markdown.contains("Do not rely on them"));
+    }
+
+    /// The do-not-rely warning counts contradicted hits actually rendered
+    /// above, not the larger pre-truncation coverage pool.
+    #[test]
+    fn contradicted_warning_counts_only_listed_hits() {
+        let mut e = Entry::new("a", EntryKind::Decision, "deploy on fridays");
+        e.contradict(EntryId::generate(), "reviewer", None);
+        let mut i = input();
+        i.codex_hits = vec![Hit {
+            entry: e,
+            state: StateAt::Contradicted,
+            score: 1.0,
+        }];
+        i.codex_coverage.contradicted = 2; // pool saw two, only one is listed
+        let b = compile(i);
+        assert!(
+            b.markdown.contains("Warning: 1 contradicted fact(s) above"),
+            "{}",
+            b.markdown
+        );
+        assert!(
+            !b.markdown.contains("Warning: 2 contradicted"),
+            "{}",
+            b.markdown
+        );
     }
 
     #[test]
