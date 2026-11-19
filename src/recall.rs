@@ -1122,8 +1122,11 @@ impl AnswerConstraints {
         for clause in tokens.split(|token| token == "and" || token == "or") {
             let clause = clause.join(" ");
             let view = ConstraintView::of(&[&clause], true);
-            if view.numbers.len() < 2 {
+            if view.numbers.is_empty() {
                 continue;
+            }
+            if view.numbers.len() < 2 {
+                return None;
             }
             if view.topics.len() < 2 || covered.intersection(&view.numbers).next().is_some() {
                 return None;
@@ -3937,6 +3940,130 @@ mod tests {
         let out = search_with_coverage(&store, &q).unwrap();
         assert!(out.hits.is_empty());
         assert!(out.abstained(&q));
+    }
+
+    #[test]
+    fn answer_gate_set_binding_rejects_repeated_singleton_clause() {
+        let mut quiz = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my quiz score rose from 65 to 82 on triangle classification",
+        );
+        quiz.verify("review", None);
+        let mut test = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my test grade score rose from 80 to 92 on congruence proofs",
+        );
+        test.verify("review", None);
+        let (_dir, store) = store_with(vec![quiz, test]);
+        let asked = "Did my quiz score rise from 65 to 82 and my test grade rise from 80 to 92 and my final exam reach 92?";
+        let plain = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+        assert_eq!(plain.hits.len(), 2, "premise: both clauses have hits");
+        let q = Query::new(asked, 10).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert!(out.hits.is_empty());
+        assert!(out.abstained(&q));
+    }
+
+    #[test]
+    fn answer_gate_set_binding_keeps_role_and_negation_per_entry() {
+        let mut quiz = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my quiz score improved from 65% to 82% after classifying triangles by sides",
+        );
+        quiz.verify("review", None);
+        let mut test = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my test score improved from 80% to 92% on congruence proofs and similarity calculations",
+        );
+        test.verify("review", None);
+        let (_dir, store) = store_with(vec![quiz, test]);
+
+        for asked in [
+            "Which senior engineer's quiz score increased from 65% to 82% on triangle classifications, or senior engineer's test score increased from 80% to 92% on congruence proofs?",
+            "Did my quiz score not rise from 65% to 82% on triangle classifications, or did my test score rise from 80% to 92% on congruence proofs?",
+        ] {
+            let plain = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+            assert!(!plain.hits.is_empty(), "premise: {asked}");
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert!(out.hits.is_empty(), "{asked}");
+            assert!(out.abstained(&q), "{asked}");
+        }
+    }
+
+    #[test]
+    fn answer_gate_set_binding_rejects_witness_outside_limit_page() {
+        let mut quiz = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my quiz score improved from 65% to 82% after classifying triangles by sides",
+        );
+        quiz.verify("review", None);
+        quiz.timestamp = Utc::now() - chrono::Duration::days(365);
+        let mut distractor = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "quiz score triangle side classifications test score congruence proofs 11 17",
+        );
+        distractor.verify("review", None);
+        let mut test = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my test score improved from 80% to 92% on congruence proofs and similarity calculations",
+        );
+        test.verify("review", None);
+        test.timestamp = Utc::now() - chrono::Duration::days(365);
+        let asked = "Which improvement happened first: my quiz score increasing from 65% to 82% after focusing on triangle side classifications, or my test score rising from 80% to 92% on congruence proofs and similarity calculations?";
+        let (_dir, store) = store_with(vec![quiz.clone(), distractor.clone(), test.clone()]);
+        let plain = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+        assert_eq!(plain.hits.len(), 3, "premise: all entries match");
+        assert!(
+            plain
+                .hits
+                .iter()
+                .position(|hit| hit.entry.id == distractor.id)
+                .unwrap()
+                < 2,
+            "premise: the distractor consumes a slot on the two-entry page"
+        );
+
+        let limited = Query::new(asked, 2).require_evidence();
+        let out = search_with_coverage(&store, &limited).unwrap();
+        assert!(out.hits.is_empty());
+        assert!(out.abstained(&limited));
+
+        let full = Query::new(asked, 3).require_evidence();
+        let out = search_with_coverage(&store, &full).unwrap();
+        let expected: Vec<_> = plain
+            .hits
+            .iter()
+            .filter(|hit| hit.entry.id == quiz.id || hit.entry.id == test.id)
+            .map(|hit| hit.entry.id)
+            .collect();
+        let actual: Vec<_> = out.hits.iter().map(|hit| hit.entry.id).collect();
+        assert_eq!(actual, expected);
+        assert!(!out.abstained(&full));
+    }
+
+    #[test]
+    fn answer_gate_one_entry_binding_all_groups_still_returns_one_hit() {
+        let mut complete = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my quiz score improved from 65% to 82% after classifying triangles by sides, and my test score improved from 80% to 92% on congruence proofs and similarity calculations",
+        );
+        complete.verify("review", None);
+        let (_dir, store) = store_with(vec![complete.clone()]);
+        let asked = "Which improvement happened first: my quiz score increasing from 65% to 82% after focusing on triangle side classifications, or my test score rising from 80% to 92% on congruence proofs and similarity calculations?";
+        let q = Query::new(asked, 10).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.id, complete.id);
+        assert!(!out.abstained(&q));
     }
 
     #[test]
