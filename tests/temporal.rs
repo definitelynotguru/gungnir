@@ -1097,3 +1097,63 @@ fn exact_timestamp_dates_outrank_stronger_lexical_tolerance_evidence() {
     assert_eq!(out.hits[1].entry.id, tolerance.id);
     assert!(out.hits[1].score > out.hits[0].score);
 }
+
+#[test]
+fn verified_tolerance_dates_outrank_contradicted_exact_dates() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let mut counter = Entry::new("a", EntryKind::Observation, "counter evidence");
+    counter.timestamp = h(-72);
+    codex.create(&counter).unwrap();
+    let mut exact = dated_entry(
+        "exact purchase",
+        "No calendar date in this note.",
+        date_at(2026, 1, 1),
+    );
+    exact.contradict(counter.id, "ops", None);
+    let mut tolerance = dated_entry(
+        "tolerance purchase",
+        "No calendar date in this note.",
+        date_at(2026, 1, 2),
+    );
+    tolerance.verify("team", None);
+    codex.create(&exact).unwrap();
+    codex.create(&tolerance).unwrap();
+
+    let out = codex_recall(
+        &g,
+        Query::new("smoker 10 days ago", 10).question_time(date_at(2026, 1, 11)),
+    );
+    assert_eq!(out.hits.len(), 2);
+    assert_eq!(out.hits[0].entry.id, tolerance.id);
+    assert_eq!(out.hits[0].state, gungnir::StateAt::Verified);
+    assert_eq!(out.hits[1].entry.id, exact.id);
+    assert_eq!(out.hits[1].state, gungnir::StateAt::Contradicted);
+}
+
+#[test]
+fn absolute_only_query_with_question_time_does_not_match_timestamp_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Gungnir::open(dir.path()).unwrap();
+    let codex = g.codex().unwrap();
+    let in_text = dated_entry(
+        "in-text purchase",
+        "Bought on 2026-01-01.",
+        date_at(2026, 1, 10),
+    );
+    let timestamp = dated_entry(
+        "timestamp purchase",
+        "No calendar date in this note.",
+        date_at(2026, 1, 2),
+    );
+    codex.create(&in_text).unwrap();
+    codex.create(&timestamp).unwrap();
+
+    let out = codex_recall(
+        &g,
+        Query::new("Which object is dated 2026-01-01?", 10).question_time(date_at(2026, 1, 11)),
+    );
+    assert_eq!(out.hits.len(), 1);
+    assert_eq!(out.hits[0].entry.id, in_text.id);
+}
