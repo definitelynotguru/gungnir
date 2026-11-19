@@ -3642,6 +3642,159 @@ mod tests {
     }
 
     #[test]
+    fn answer_gate_binds_complete_numeric_groups_across_topical_entries() {
+        let mut quiz = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my quiz score improved from 65% to 82% after classifying triangles by sides",
+        );
+        quiz.verify("review", None);
+        let mut test = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my test score improved from 80% to 92% on congruence proofs and similarity calculations",
+        );
+        test.verify("review", None);
+        let mut travel = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my travel journal lists 65 cities and 82 countries",
+        );
+        travel.verify("review", None);
+        let (_dir, store) = store_with(vec![test.clone(), quiz.clone(), travel.clone()]);
+        let asked = "Which improvement happened first: my quiz score increasing from 65% to 82% after focusing on triangle side classifications, or my test score rising from 80% to 92% on congruence proofs and similarity calculations?";
+        let plain = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+        assert!(
+            [test.id, quiz.id, travel.id]
+                .iter()
+                .all(|id| plain.hits.iter().any(|hit| hit.entry.id == *id)),
+            "premise: ranking returns both witnesses and the unrelated numeric pair"
+        );
+
+        let q = Query::new(asked, 10).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        let expected: Vec<_> = plain
+            .hits
+            .iter()
+            .filter(|hit| hit.entry.id == test.id || hit.entry.id == quiz.id)
+            .collect();
+        let actual: Vec<_> = out.hits.iter().collect();
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].entry.id, expected[0].entry.id);
+        assert_eq!(actual[1].entry.id, expected[1].entry.id);
+        assert_eq!(actual[0].score, expected[0].score);
+        assert_eq!(actual[1].score, expected[1].score);
+        assert!(out.hits.iter().all(|hit| hit.entry.id != travel.id));
+        assert_eq!(out.coverage, plain.coverage);
+        assert!(!out.abstained(&q));
+    }
+
+    #[test]
+    fn answer_gate_set_binding_requires_complete_topical_groups() {
+        let asked = "Which improvement happened first: my quiz score increasing from 65% to 82% after focusing on triangle side classifications, or my test score rising from 80% to 92% on congruence proofs and similarity calculations?";
+        let mut quiz = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my quiz score improved from 65% to 82% after classifying triangles by sides",
+        );
+        quiz.verify("review", None);
+        let mut travel = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my travel journal lists 80 cities and 92 countries",
+        );
+        travel.verify("review", None);
+        let mut partial_test = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my test score reached 80% on congruence proofs",
+        );
+        partial_test.verify("review", None);
+        let mut partial_similarity = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my test score reached 92% on similarity calculations",
+        );
+        partial_similarity.verify("review", None);
+
+        for entries in [
+            vec![quiz.clone(), travel],
+            vec![quiz.clone(), partial_test, partial_similarity],
+            vec![quiz],
+        ] {
+            let (_dir, store) = store_with(entries);
+            let q = Query::new(asked, 10).require_evidence();
+            let out = search_with_coverage(&store, &q).unwrap();
+            assert!(out.hits.is_empty());
+            assert!(out.abstained(&q));
+        }
+    }
+
+    #[test]
+    fn answer_gate_set_binding_requires_a_complete_returned_page() {
+        let mut quiz = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my quiz score improved from 65% to 82% after classifying triangles by sides",
+        );
+        quiz.verify("review", None);
+        let mut test = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my test score improved from 80% to 92% on congruence proofs and similarity calculations",
+        );
+        test.verify("review", None);
+        let asked = "Which improvement happened first: my quiz score increasing from 65% to 82% after focusing on triangle side classifications, or my test score rising from 80% to 92% on congruence proofs and similarity calculations?";
+
+        let (_dir, store) = store_with(vec![quiz, test]);
+        let q = Query::new(asked, 1).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert!(out.hits.is_empty());
+        assert!(out.abstained(&q));
+
+        let zero = Query::new(asked, 0).require_evidence();
+        let out = search_with_coverage(&store, &zero).unwrap();
+        assert!(out.hits.is_empty());
+        assert!(!out.abstained(&zero));
+    }
+
+    #[test]
+    fn answer_gate_set_binding_keeps_verified_provenance() {
+        let mut quiz = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my quiz score improved from 65% to 82% after classifying triangles by sides",
+        );
+        quiz.verify("review", None);
+        let test = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my test score improved from 80% to 92% on congruence proofs and similarity calculations",
+        );
+        let (_dir, store) = store_with(vec![quiz, test]);
+        let asked = "Which improvement happened first: my quiz score increasing from 65% to 82% after focusing on triangle side classifications, or my test score rising from 80% to 92% on congruence proofs and similarity calculations?";
+        let q = Query::new(asked, 10).require_verified().require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert!(out.hits.is_empty());
+        assert_eq!(out.coverage.verified, 1);
+        assert_eq!(out.coverage.unverified, 1);
+        assert!(out.abstained(&q));
+    }
+
+    #[test]
+    fn answer_gate_ambiguous_numeric_groups_keep_per_entry_abstention() {
+        let mut three = Entry::new("a", EntryKind::Observation, "I scored 3 on the quiz");
+        three.verify("review", None);
+        let mut four = Entry::new("a", EntryKind::Observation, "I scored 4 on the quiz");
+        four.verify("review", None);
+        let (_dir, store) = store_with(vec![three, four]);
+        let q = Query::new("did I score 3 or 4 on the quiz", 10).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        assert!(out.hits.is_empty());
+        assert!(out.abstained(&q));
+    }
+
+    #[test]
     fn answer_gate_excludes_standing_lane() {
         let mut seed = Entry::new("a", EntryKind::Decision, "write zephyr briefs carefully");
         seed.verify("review", None);
