@@ -245,7 +245,8 @@ reviews checkout". `--require-evidence` adds that answer check. It is opt-in
 and off by default.
 
 The gate parses three closed-class constraint kinds from the question and
-checks them against each hit's summary and body:
+checks them against each hit's summary and body. A single hit passes when it
+carries every constraint:
 
 - **Role and title modifiers**: senior, junior, manager, lead, principal,
   staff, director, chief, intern, associate, assistant, vp, president,
@@ -271,10 +272,23 @@ checks them against each hit's summary and body:
   bare "don" and "won" stay ordinary words. "No longer" is an update cue and
   does not require negated evidence.
 
-Open-class words are never required. "Kitchen appliance" can therefore bind
-a smoker when lexical or vector ranking returns that entry. Extra modifiers
-and numbers in the evidence are allowed. A question with no closed-class
-constraints does not filter any hits, but an empty result still abstains.
+Single-entry binding does not require open-class words. "Kitchen appliance"
+can therefore bind a smoker when lexical or vector ranking returns that
+entry. Extra modifiers and numbers in the evidence are allowed. A question
+with no closed-class constraints does not filter any hits, but an empty
+result still abstains.
+
+If no single hit binds, a numeric-only question can bind across entries. The
+gate splits the question at `and` and `or`, then requires at least two
+disjoint clauses with at least two numbers each. Those clauses must cover
+every numeric constraint. Each clause needs an entry that carries its full
+number group and shares at least two stemmed topic tokens that distinguish
+that clause from the other numeric clauses.
+Only the earliest witness for each group joins the result. Joint witnesses
+come only from the first `--limit` provenance-eligible hits, and that page
+must cover every group. Incomplete or ambiguous structures keep the old
+per-entry abstention. Role and negation constraints never combine
+across entries.
 
 The gate filters ordered hits after the provenance filter and before
 `--limit`. Strict answer queries exclude the standing and expansion lanes so

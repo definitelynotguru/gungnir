@@ -142,12 +142,12 @@ enum Cmd {
         /// empty verdict and exits 2 — a machine-checkable abstention.
         #[arg(long)]
         require_verified: bool,
-        /// Return only hits whose summary and body carry the question's
-        /// closed-class constraints: role/title words, digit-bearing tokens,
-        /// and negation. Open-class wording is left to ranking so a
-        /// paraphrase still matches. Composes with `--require-verified`.
-        /// When no hits remain at a nonzero limit, exits 2. Coverage and
-        /// scores are unchanged.
+        /// Bind the question's role/title words, digit-bearing tokens, and
+        /// negation in one entry, or bind complete numeric clauses across
+        /// topical entries when no single entry answers. Single-entry
+        /// open-class wording is left to ranking. Composes with
+        /// `--require-verified`. When no hits remain at a nonzero limit,
+        /// exits 2. Coverage and scores are unchanged.
         #[arg(long)]
         require_evidence: bool,
         /// Emit JSON: {hits, coverage, abstained}.

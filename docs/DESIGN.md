@@ -333,8 +333,21 @@ or spaced times. Relative times and "top N" framing are not answer
 constraints. Negation binding applies to yes/no questions, not wh-questions
 or negation on the opening verb. Positive causes and positive answers remain
 eligible. "No longer" remains an update
-cue. Open-class words are excluded because ranking already handles them and
-requiring them would reject paraphrases.
+cue. Single-entry binding excludes open-class words because ranking already
+handles them and requiring them would reject paraphrases.
+
+When no entry carries every constraint, numeric-only questions can bind
+across entries. The question must split at `and` or `or` into at least two
+disjoint clauses with at least two numbers each, covering every numeric
+constraint. A clause contributes only when an entry carries its complete
+number group and shares at least two stemmed topic tokens that distinguish it
+from the other numeric clauses. Words shared by every clause do not count, so
+generic framing such as `my` or `score` cannot bind an unrelated entry. Only
+the earliest witness for each group returns, in the original ranked order.
+Joint witnesses come from the first `limit` provenance-eligible hits.
+Incomplete or ambiguous groups and pages without every witness keep the
+per-entry abstention. Role and negation constraints stay per-entry because separate
+entries cannot safely compose their scope.
 
 The check lives in `recall::finish` after the provenance filter and before
 truncation. Strict answer queries exclude standing and expansion lanes. This
