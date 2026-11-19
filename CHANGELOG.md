@@ -8,6 +8,12 @@ All notable changes to Gungnir are documented here. The format follows
 
 ### Added
 
+- **Multi-source answer evidence.** `require_evidence` can bind a numeric-only
+  question across topical entries when no single entry carries every number.
+  Each entry must carry a complete disjoint numeric clause, and the first
+  `limit` provenance-eligible hits must cover every clause. Role and negation
+  binding stay per-entry, and ambiguous or incomplete sets keep the old
+  abstention.
 - **In-text date retrieval.** Recall derives an in-memory date-to-entry index
   from canonical summaries and bodies. Absolute ISO dates and narrow relative
   day and week phrases can select direct matches in keyword and hybrid recall,

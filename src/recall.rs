@@ -52,15 +52,16 @@
 //!
 //! Answer binding: `require_evidence` adds a deterministic gate over the
 //! closed-class parts of a question. These are curated role/title modifiers,
-//! digit-bearing tokens, and negation presence. It drops every hit whose
-//! summary and body do not carry them. It answers "does the returned
-//! evidence bind the question", which `require_verified` cannot: a verified
-//! junior engineer is not an answer to a question about a senior one. The
-//! gate never reorders, rescans, or re-scores. It filters ordered hits in
+//! digit-bearing tokens, and negation presence. A single hit binds when its
+//! summary and body carry all of them. If no hit does, a numeric-only
+//! question with disjoint numeric clauses can bind across topical hits. Every
+//! returned hit must carry one clause's complete number group, and the
+//! returned page must cover every group. Otherwise the old abstention stays.
+//! The gate never reorders, rescans, or re-scores. It filters ordered hits in
 //! `finish` after the provenance filter and excludes the standing and
 //! expansion lanes so off-topic entries cannot satisfy a constraint. Scores
-//! and coverage stay unchanged. Open-class terms are left to ranking on
-//! purpose, so paraphrase still matches. No model judges eligibility.
+//! and coverage stay unchanged. Single-entry binding leaves open-class terms
+//! to ranking so paraphrase still matches. No model judges eligibility.
 
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -88,10 +89,11 @@ pub struct Query {
     pub require_verified: bool,
     /// Return only hits whose evidence binds the closed-class constraints
     /// the question states: curated role/title modifiers, digit-bearing
-    /// tokens, and negation in yes/no questions. Provenance is untouched. This asks
-    /// whether a hit *answers* the question, not whether it is verified,
-    /// and open-class wording is left to ranking so paraphrase still
-    /// matches. Coverage and scores are unchanged.
+    /// tokens, and negation in yes/no questions. One entry can bind all
+    /// constraints, or topical entries can each bind a complete numeric
+    /// clause when no single entry answers. Provenance is untouched.
+    /// Single-entry open-class wording is left to ranking so paraphrase
+    /// still matches. Coverage and scores are unchanged.
     pub require_evidence: bool,
 }
 
@@ -1040,6 +1042,7 @@ fn numeric_tokens(tokens: &[String], question_framing: bool) -> HashSet<String> 
 #[derive(Debug, Default)]
 struct ConstraintView {
     tokens: Vec<String>,
+    topics: HashSet<String>,
     numbers: HashSet<String>,
     negated: bool,
 }
@@ -1047,6 +1050,11 @@ struct ConstraintView {
 impl ConstraintView {
     fn of(parts: &[&str], question_framing: bool) -> Self {
         let tokens: Vec<String> = parts.iter().flat_map(|part| normalized(part)).collect();
+        let topics = parts
+            .iter()
+            .flat_map(|part| tokenize(part))
+            .filter(|token| !token.chars().any(|c| c.is_ascii_digit()))
+            .collect();
         let numeric_text: Vec<String> = parts
             .iter()
             .flat_map(|part| normalized(&normalize_comma_groups(part)))
@@ -1055,7 +1063,21 @@ impl ConstraintView {
             numbers: numeric_tokens(&numeric_text, question_framing),
             negated: negates(&tokens),
             tokens,
+            topics,
         }
+    }
+}
+
+#[derive(Debug)]
+struct NumericGroup {
+    numbers: HashSet<String>,
+    topics: HashSet<String>,
+}
+
+impl NumericGroup {
+    fn permits(&self, view: &ConstraintView) -> bool {
+        self.numbers.iter().all(|n| view.numbers.contains(n))
+            && self.topics.intersection(&view.topics).count() >= 2
     }
 }
 
@@ -1064,26 +1086,68 @@ struct AnswerConstraints {
     title_modifiers: Vec<&'static str>,
     numbers: HashSet<String>,
     negated: bool,
+    numeric_groups: Option<Vec<NumericGroup>>,
 }
 
 impl AnswerConstraints {
     fn parse(text: &str, date_selected: bool) -> Self {
         let masked = date_selected.then(|| dates::mask_absolute_dates(text));
-        let view = ConstraintView::of(&[masked.as_deref().unwrap_or(text)], true);
-        Self {
-            title_modifiers: TITLE_MODIFIERS
-                .iter()
-                .copied()
-                .filter(|modifier| {
-                    view.tokens.iter().enumerate().any(|(i, token)| {
-                        modifier_form(token) == *modifier
-                            && is_role_modifier(&view.tokens, i, modifier)
-                    })
+        let text = masked.as_deref().unwrap_or(text);
+        let view = ConstraintView::of(&[text], true);
+        let title_modifiers = TITLE_MODIFIERS
+            .iter()
+            .copied()
+            .filter(|modifier| {
+                view.tokens.iter().enumerate().any(|(i, token)| {
+                    modifier_form(token) == *modifier && is_role_modifier(&view.tokens, i, modifier)
                 })
-                .collect(),
+            })
+            .collect::<Vec<_>>();
+        let negated = answer_negated(&view.tokens);
+        let numeric_groups = (title_modifiers.is_empty() && !negated)
+            .then(|| Self::numeric_groups(text, &view.numbers))
+            .flatten();
+        Self {
+            title_modifiers,
             numbers: view.numbers,
-            negated: answer_negated(&view.tokens),
+            negated,
+            numeric_groups,
         }
+    }
+
+    fn numeric_groups(text: &str, required: &HashSet<String>) -> Option<Vec<NumericGroup>> {
+        let tokens = normalized(&normalize_comma_groups(text));
+        let mut groups = Vec::new();
+        let mut covered = HashSet::new();
+        for clause in tokens.split(|token| token == "and" || token == "or") {
+            let clause = clause.join(" ");
+            let view = ConstraintView::of(&[&clause], true);
+            if view.numbers.len() < 2 {
+                continue;
+            }
+            if view.topics.len() < 2 || covered.intersection(&view.numbers).next().is_some() {
+                return None;
+            }
+            covered.extend(view.numbers.iter().cloned());
+            groups.push(NumericGroup {
+                numbers: view.numbers,
+                topics: view.topics,
+            });
+        }
+        if groups.len() < 2 || covered != *required {
+            return None;
+        }
+        let mut shared = groups[0].topics.clone();
+        for group in &groups[1..] {
+            shared.retain(|token| group.topics.contains(token));
+        }
+        for group in &mut groups {
+            group.topics.retain(|token| !shared.contains(token));
+            if group.topics.len() < 2 {
+                return None;
+            }
+        }
+        Some(groups)
     }
 
     fn permits(&self, entry: &Entry) -> bool {
@@ -1093,6 +1157,58 @@ impl AnswerConstraints {
             .all(|modifier| binds_title_modifier(&view.tokens, modifier))
             && self.numbers.iter().all(|n| view.numbers.contains(n))
             && (!self.negated || view.negated)
+    }
+
+    fn bind(
+        &self,
+        ordered: Vec<(Entry, StateAt, f64)>,
+        limit: usize,
+    ) -> (Vec<(Entry, StateAt, f64)>, usize) {
+        if limit == 0 {
+            return (Vec::new(), 0);
+        }
+
+        let mut direct = Vec::new();
+        let mut rejected = Vec::new();
+        let mut evidence_filtered = 0;
+        for hit in ordered {
+            if self.permits(&hit.0) {
+                direct.push(hit);
+                if direct.len() == limit {
+                    break;
+                }
+            } else {
+                evidence_filtered += 1;
+                rejected.push(hit);
+            }
+        }
+        if !direct.is_empty() {
+            return (direct, evidence_filtered);
+        }
+
+        let Some(groups) = &self.numeric_groups else {
+            return (Vec::new(), evidence_filtered);
+        };
+        let views: Vec<ConstraintView> = rejected
+            .iter()
+            .take(limit)
+            .map(|(entry, _, _)| ConstraintView::of(&[&entry.summary, &entry.body], false))
+            .collect();
+        let mut selected = HashSet::new();
+        for group in groups {
+            let Some(index) = views.iter().position(|view| group.permits(view)) else {
+                return (Vec::new(), evidence_filtered);
+            };
+            selected.insert(index);
+        }
+        let hits = rejected
+            .into_iter()
+            .take(limit)
+            .enumerate()
+            .filter(|(index, _)| selected.contains(index))
+            .map(|(_, hit)| hit)
+            .collect();
+        (hits, evidence_filtered)
     }
 }
 
@@ -1220,20 +1336,18 @@ pub(crate) fn finish(
         .require_evidence
         .then(|| AnswerConstraints::parse(&query.text, date_selected));
 
-    let mut evidence_filtered = 0;
-    let hits = scored
+    let ordered = scored
         .into_iter()
         .chain(standing)
         .chain(expansion)
-        .filter(|(_, st, _)| !query.require_verified || *st == StateAt::Verified)
-        .filter(|(e, _, _)| {
-            let rejected = binding
-                .as_ref()
-                .is_some_and(|constraints| !constraints.permits(e));
-            evidence_filtered += usize::from(rejected);
-            !rejected
-        })
-        .take(query.limit)
+        .filter(|(_, st, _)| !query.require_verified || *st == StateAt::Verified);
+    let (hits, evidence_filtered) = if let Some(binding) = binding {
+        binding.bind(ordered.collect(), query.limit)
+    } else {
+        (ordered.take(query.limit).collect(), 0)
+    };
+    let hits = hits
+        .into_iter()
         .map(|(entry, state, score)| Hit {
             entry,
             state,
@@ -3658,7 +3772,7 @@ mod tests {
         let mut travel = Entry::new(
             "a",
             EntryKind::Observation,
-            "my travel journal lists 65 cities and 82 countries",
+            "my travel score journal lists 65 cities and 82 countries",
         );
         travel.verify("review", None);
         let (_dir, store) = store_with(vec![test.clone(), quiz.clone(), travel.clone()]);
@@ -3701,7 +3815,7 @@ mod tests {
         let mut travel = Entry::new(
             "a",
             EntryKind::Observation,
-            "my travel journal lists 80 cities and 92 countries",
+            "my travel score journal lists 80 cities and 92 countries",
         );
         travel.verify("review", None);
         let mut partial_test = Entry::new(
@@ -3717,15 +3831,25 @@ mod tests {
         );
         partial_similarity.verify("review", None);
 
-        for entries in [
+        for (case, entries) in [
             vec![quiz.clone(), travel],
             vec![quiz.clone(), partial_test, partial_similarity],
             vec![quiz],
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (_dir, store) = store_with(entries);
             let q = Query::new(asked, 10).require_evidence();
             let out = search_with_coverage(&store, &q).unwrap();
-            assert!(out.hits.is_empty());
+            assert!(
+                out.hits.is_empty(),
+                "case {case} returned {:?}",
+                out.hits
+                    .iter()
+                    .map(|hit| &hit.entry.summary)
+                    .collect::<Vec<_>>()
+            );
             assert!(out.abstained(&q));
         }
     }

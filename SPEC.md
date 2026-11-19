@@ -208,8 +208,10 @@ the topic; `recall --json` emits `{hits, coverage, abstained}`, and MCP
 `recall` always ends with a `coverage:` JSON line carrying the same fields.
 
 `require_evidence` (Query `require_evidence()`, CLI `--require-evidence`,
-MCP `require_evidence`) admits a hit only when that entry's summary and body
-carry every closed-class constraint extracted from the question.
+MCP `require_evidence`) first admits a hit only when that entry's summary and
+body carry every closed-class constraint extracted from the question. If no
+single hit qualifies, disjoint numeric clauses can bind across topical hits
+under the rules below.
 
 - Curated role and title modifiers: senior, junior, manager, lead,
   principal, staff, director, chief, intern, associate, assistant, vp,
@@ -234,9 +236,23 @@ carry every closed-class constraint extracted from the question.
   The unapostrophized "cant" is recognized. "No longer" is an update cue and
   does not require negated evidence.
 
-Open-class words are not required, so paraphrase remains eligible. Extra
-modifiers and numbers are allowed. A question with no closed-class
-constraints does not filter any hits, but an empty result still abstains.
+Single-entry binding does not require open-class words, so paraphrase remains
+eligible. Extra modifiers and numbers are allowed. A question with no
+closed-class constraints does not filter any hits, but an empty result still
+abstains.
+
+Joint binding applies only to numeric-only questions when per-entry binding
+returns no hits. The parser splits at `and` and `or`. It requires at least two
+disjoint clauses with at least two numbers each, covering every numeric
+constraint. Each clause must have an entry whose summary and body carry its
+complete number group and at least two stemmed topic tokens that distinguish
+the clause from the other numeric clauses. Words shared by every clause do
+not count toward this guard.
+The earliest witness for each group joins the result in ranked order. Joint
+witnesses come only from the first `limit` provenance-eligible hits, and that
+page must cover every group, or the old empty per-entry result remains. Role and negation constraints never combine
+across entries. A clause structure with singleton, overlapping, or uncovered
+numbers is ambiguous and keeps that same fallback.
 
 The gate filters ordered hits after the provenance filter and before `limit`.
 Strict answer queries exclude the standing and expansion lanes so an
