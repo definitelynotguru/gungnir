@@ -4067,6 +4067,38 @@ mod tests {
     }
 
     #[test]
+    fn answer_gate_binds_three_disjoint_numeric_groups() {
+        let mut quiz = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my quiz score rose from 65 to 82 on triangle classification",
+        );
+        quiz.verify("review", None);
+        let mut test = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my test score rose from 80 to 92 on congruence proofs",
+        );
+        test.verify("review", None);
+        let mut area = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my area accuracy improved from 70 to 90 on area calculations",
+        );
+        area.verify("review", None);
+        let (_dir, store) = store_with(vec![quiz.clone(), test.clone(), area.clone()]);
+        let asked = "Which scores changed first: my quiz score rose from 65 to 82 on triangle classification, or my test score rose from 80 to 92 on congruence proofs, or my area accuracy improved from 70 to 90 on area calculations?";
+        let plain = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+        assert_eq!(plain.hits.len(), 3, "premise: all three witnesses match");
+        let q = Query::new(asked, 10).require_evidence();
+        let out = search_with_coverage(&store, &q).unwrap();
+        let expected: Vec<_> = plain.hits.iter().map(|hit| hit.entry.id).collect();
+        let actual: Vec<_> = out.hits.iter().map(|hit| hit.entry.id).collect();
+        assert_eq!(actual, expected);
+        assert!(!out.abstained(&q));
+    }
+
+    #[test]
     fn answer_gate_excludes_standing_lane() {
         let mut seed = Entry::new("a", EntryKind::Decision, "write zephyr briefs carefully");
         seed.verify("review", None);
