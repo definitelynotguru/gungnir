@@ -247,7 +247,8 @@ disjoint clauses with at least two numbers each, covering every numeric
 constraint. Each clause must have an entry whose summary and body carry its
 complete number group and at least two stemmed topic tokens that distinguish
 the clause from the other numeric clauses. Words shared by every clause do
-not count toward this guard.
+not count toward this guard. The two-token threshold rejects a single
+incidental match, but it remains a lexical guard rather than semantic proof.
 The earliest witness for each group joins the result in ranked order. Joint
 witnesses come only from the first `limit` provenance-eligible hits, and that
 page must cover every group, or the old empty per-entry result remains. Role and negation constraints never combine
