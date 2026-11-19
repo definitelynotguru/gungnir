@@ -1189,9 +1189,9 @@ impl AnswerConstraints {
         let Some(groups) = &self.numeric_groups else {
             return (Vec::new(), evidence_filtered);
         };
-        let views: Vec<ConstraintView> = rejected
+        let page: Vec<_> = rejected.into_iter().take(limit).collect();
+        let views: Vec<ConstraintView> = page
             .iter()
-            .take(limit)
             .map(|(entry, _, _)| ConstraintView::of(&[&entry.summary, &entry.body], false))
             .collect();
         let mut selected = HashSet::new();
@@ -1201,9 +1201,8 @@ impl AnswerConstraints {
             };
             selected.insert(index);
         }
-        let hits = rejected
+        let hits = page
             .into_iter()
-            .take(limit)
             .enumerate()
             .filter(|(index, _)| selected.contains(index))
             .map(|(_, hit)| hit)
@@ -3818,6 +3817,18 @@ mod tests {
             "my travel score journal lists 80 cities and 92 countries",
         );
         travel.verify("review", None);
+        let mut shared_framing = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "my score log lists 80 cities and 92 countries",
+        );
+        shared_framing.verify("review", None);
+        let mut one_distinctive = Entry::new(
+            "a",
+            EntryKind::Observation,
+            "the test of 80 cities and 92 countries",
+        );
+        one_distinctive.verify("review", None);
         let mut partial_test = Entry::new(
             "a",
             EntryKind::Observation,
@@ -3833,13 +3844,23 @@ mod tests {
 
         for (case, entries) in [
             vec![quiz.clone(), travel],
+            vec![quiz.clone(), shared_framing],
+            vec![quiz.clone(), one_distinctive],
             vec![quiz.clone(), partial_test, partial_similarity],
             vec![quiz],
         ]
         .into_iter()
         .enumerate()
         {
+            let expected: Vec<_> = entries.iter().map(|entry| entry.id).collect();
             let (_dir, store) = store_with(entries);
+            let plain = search_with_coverage(&store, &Query::new(asked, 10)).unwrap();
+            assert!(
+                expected
+                    .iter()
+                    .all(|id| plain.hits.iter().any(|hit| hit.entry.id == *id)),
+                "case {case} lacks an ungated premise"
+            );
             let q = Query::new(asked, 10).require_evidence();
             let out = search_with_coverage(&store, &q).unwrap();
             assert!(

@@ -283,8 +283,9 @@ gate splits the question at `and` and `or`, then requires at least two
 disjoint clauses with at least two numbers each. Those clauses must cover
 every numeric constraint. Each clause needs an entry that carries its full
 number group and shares at least two stemmed topic tokens that distinguish
-that clause from the other numeric clauses.
-Only the earliest witness for each group joins the result. Joint witnesses
+that clause from the other numeric clauses. The two-token threshold rejects a
+single incidental match, but it remains a lexical guard rather than semantic
+proof. Only the earliest witness for each group joins the result. Joint witnesses
 come only from the first `--limit` provenance-eligible hits, and that page
 must cover every group. Incomplete or ambiguous structures keep the old
 per-entry abstention. Role and negation constraints never combine
