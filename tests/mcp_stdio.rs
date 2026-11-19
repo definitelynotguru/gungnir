@@ -773,6 +773,55 @@ fn mcp_recall_require_evidence_abstains_on_unbound_evidence() {
 }
 
 #[test]
+fn mcp_recall_require_evidence_binds_numeric_groups_across_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = gungnir::Gungnir::open(dir.path()).unwrap();
+    let mut quiz = gungnir::Entry::new(
+        "a",
+        gungnir::EntryKind::Observation,
+        "my quiz score improved from 65% to 82% after classifying triangles by sides",
+    );
+    quiz.verify("review", None);
+    let mut test = gungnir::Entry::new(
+        "a",
+        gungnir::EntryKind::Observation,
+        "my test score improved from 80% to 92% on congruence proofs and similarity calculations",
+    );
+    test.verify("review", None);
+    g.codex().unwrap().create(&quiz).unwrap();
+    g.codex().unwrap().create(&test).unwrap();
+    drop(g);
+
+    let mut p = Proc::spawn(dir.path());
+    p.rpc(&msg(1, "initialize", serde_json::json!({})));
+    let r = p.rpc(&msg(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "recall",
+            "arguments": {
+                "query": "Which improvement happened first: my quiz score increasing from 65% to 82% after focusing on triangle side classifications, or my test score rising from 80% to 92% on congruence proofs and similarity calculations?",
+                "require_verified": true,
+                "require_evidence": true
+            }
+        }),
+    ));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains(&quiz.id.to_string()), "{text}");
+    assert!(text.contains(&test.id.to_string()), "{text}");
+    let cov: serde_json::Value = serde_json::from_str(
+        text.lines()
+            .last()
+            .unwrap()
+            .trim_start_matches("coverage: "),
+    )
+    .unwrap();
+    assert_eq!(cov["abstained"], false, "{text}");
+    assert_eq!(cov["verified"], 2);
+}
+
+#[test]
 fn mcp_recall_require_evidence_binds_equivalent_clock_forms() {
     let dir = tempfile::tempdir().unwrap();
     let g = gungnir::Gungnir::open(dir.path()).unwrap();

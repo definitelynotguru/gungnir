@@ -634,6 +634,55 @@ fn require_evidence_answers_when_the_role_binds() {
 }
 
 #[test]
+fn require_evidence_binds_numeric_groups_across_entries() {
+    let (_d, store) = root();
+    let quiz = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "my quiz score improved from 65% to 82% after classifying triangles by sides",
+        ],
+    );
+    let test = add(
+        &store,
+        &[
+            "--agent",
+            "a",
+            "--kind",
+            "observation",
+            "--summary",
+            "my test score improved from 80% to 92% on congruence proofs and similarity calculations",
+        ],
+    );
+    ok(&store, &["verify", &quiz]);
+    ok(&store, &["verify", &test]);
+
+    let out = run(
+        &store,
+        &[
+            "recall",
+            "Which improvement happened first: my quiz score increasing from 65% to 82% after focusing on triangle side classifications, or my test score rising from 80% to 92% on congruence proofs and similarity calculations?",
+            "--require-verified",
+            "--require-evidence",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(doc["abstained"], false);
+    let hits = doc["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "{doc}");
+    assert!(hits.iter().any(|hit| hit["entry"]["id"] == quiz));
+    assert!(hits.iter().any(|hit| hit["entry"]["id"] == test));
+    assert_eq!(doc["coverage"]["verified"], 2);
+}
+
+#[test]
 fn require_evidence_binds_equivalent_clock_forms() {
     let (_d, store) = root();
     let id = add(
