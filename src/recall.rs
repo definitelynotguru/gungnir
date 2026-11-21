@@ -510,6 +510,64 @@ const FACT_CUES: &[&str] = &[
 /// Task-shaped queries ask the agent to produce or act. Only a query with
 /// one of these and no fact cue gets the lane; every other query stays
 /// fact-shaped. Content-shape markers, not topic words.
+/// Set-shaped questions ask for every mention of a closed class or the
+/// order things happened ("total number of siblings", "order in which").
+/// Explicit phrases only: a generic wh-word does not mark a set question,
+/// and the strict flags still keep the fact path regardless of wording.
+const SET_CUES: &[&str] = &[
+    "how many",
+    "total number",
+    "number of",
+    "count of",
+    "order in which",
+    "in what order",
+    "what order",
+    "chronological",
+    "list all",
+    "what are all",
+    "all the different",
+];
+
+/// The shipped mention-set predicate is the closed kinship class. A set
+/// question that names a kinship term binds the user's own family mentions;
+/// every other set-shaped question has no predicate and falls back to the
+/// lexical page. Terms are matched on their stems, so plurals and
+/// inflections meet at the base.
+const KINSHIP_TERMS: &[&str] = &[
+    "sibling",
+    "sister",
+    "brother",
+    "twin",
+    "stepsister",
+    "stepbrother",
+];
+
+/// True when a stemmed token names a member of the kinship class.
+fn is_kinship_stem(token: &str) -> bool {
+    KINSHIP_TERMS.iter().any(|term| stem(term) == token)
+}
+
+/// The kinship predicate binds the counted noun, not just any kinship word
+/// in the question: the stem must appear within three words after a set
+/// phrase ("how many siblings", "total number of siblings", "how many of my
+/// sisters"). "How many children does my sister have" counts children, so
+/// it has no predicate and falls back to the lexical page.
+fn kinship_object(words: &[String]) -> bool {
+    SET_CUES.iter().any(|cue| {
+        let phrase: Vec<&str> = cue.split_whitespace().collect();
+        phrase.len() <= words.len()
+            && words.windows(phrase.len()).enumerate().any(|(start, w)| {
+                w.iter()
+                    .zip(phrase.iter().copied())
+                    .all(|(a, b)| a.as_str() == b)
+                    && words[start + phrase.len()..]
+                        .iter()
+                        .take(3)
+                        .any(|w| is_kinship_stem(&stem(w)))
+            })
+    })
+}
+
 const TASK_CUES: &[&str] = &[
     "show me",
     "show us",
@@ -556,6 +614,7 @@ const TASK_CUES: &[&str] = &[
 enum QueryShape {
     Task,
     Fact,
+    MentionSet,
 }
 
 /// Lowercase whole-word sequence, punctuation split. Cues match whole words,
@@ -606,26 +665,98 @@ fn has_task_cue(words: &[String]) -> bool {
 
 /// Route by query shape, not topic words. `require_verified` is a strict
 /// provenance query and `require_evidence` is a strict answer query, so
-/// standing constraints stay out of both. Temporal and current-view queries
-/// are fact-shaped outright, independent of their wording. Fact cues win
-/// over task cues. An unrecognized query defaults to fact-shaped, the
+/// standing constraints and mention sets stay out of both. `as_of` reads
+/// keep historical semantics outright. An explicit set cue then outranks
+/// generic fact cues ("what is the total number of siblings" is a count
+/// question, not a fact question), and it also outranks `current_only`:
+/// the measured eval path sets `.current()` on every question, so the set
+/// operator must still run there. Every other `current_only` query stays
+/// fact-shaped, preserving the standing-lane invariant. Fact cues win over
+/// task cues, and an unrecognized query defaults to fact-shaped, the
 /// conservative direction that keeps generic rules out of fact top-k.
+/// `current_only` filters revises inside the selected shape.
 fn query_shape(query: &Query) -> QueryShape {
-    if query.require_verified
-        || query.require_evidence
-        || query.as_of.is_some()
-        || query.current_only
-    {
+    if query.require_verified || query.require_evidence || query.as_of.is_some() {
         return QueryShape::Fact;
     }
     let words = normalized(&query.text);
-    if has_cue(&words, FACT_CUES) {
+    if has_cue(&words, SET_CUES) {
+        return QueryShape::MentionSet;
+    }
+    if query.current_only || has_cue(&words, FACT_CUES) {
         return QueryShape::Fact;
     }
     if has_task_cue(&words) {
         return QueryShape::Task;
     }
     QueryShape::Fact
+}
+
+/// The text of the user's own turns in an entry body. Transcript bodies
+/// mark roles as `ROLE:` line prefixes with continuation lines belonging to
+/// the last marked role; an entry with no role markers at all is treated as
+/// a single user-authored turn. Assistant and system text never contributes
+/// membership evidence.
+fn user_turn_text(entry: &Entry) -> String {
+    let mut user_lines = String::new();
+    let mut saw_role = false;
+    let mut in_user = false;
+    for line in entry.body.lines() {
+        let role = line
+            .split_once(':')
+            .map(|(head, _)| head.trim().to_ascii_lowercase());
+        match role.as_deref() {
+            Some("user") | Some("assistant") | Some("system") => {
+                saw_role = true;
+                in_user = role.as_deref() == Some("user");
+                if in_user {
+                    if !user_lines.is_empty() {
+                        user_lines.push('\n');
+                    }
+                    user_lines.push_str(line.split_once(':').map(|(_, rest)| rest).unwrap_or(""));
+                }
+            }
+            _ if in_user => {
+                user_lines.push(' ');
+                user_lines.push_str(line.trim());
+            }
+            _ => {}
+        }
+    }
+    if saw_role {
+        user_lines
+    } else {
+        format!("{}\n{}", entry.summary, entry.body)
+    }
+}
+
+/// The mention set for a count/order/facet question. The question's own
+/// mention of a kinship term selects the only shipped predicate; members
+/// are visible verified entries whose user turns mention the same class,
+/// ordered by adapter transcript order (pool order) and capped at `limit`.
+/// Everything is derived at read time from the canonical pool — no index,
+/// no write, no unverified source. An empty set is no answer at all: the
+/// caller keeps the ordinary lexical page.
+fn mention_set(
+    pool: &[Candidate],
+    revised: &HashSet<EntryId>,
+    query: &Query,
+) -> Vec<(Entry, StateAt, f64)> {
+    if !kinship_object(&normalized(&query.text)) {
+        return Vec::new();
+    }
+    visible_indices(pool, revised, query)
+        .into_iter()
+        .map(|i| &pool[i])
+        .filter(|c| c.state == StateAt::Verified && !revised.contains(&c.entry.id))
+        .filter(|c| {
+            tokenize(&user_turn_text(&c.entry))
+                .iter()
+                .any(|t| is_kinship_stem(t))
+        })
+        .map(|c| (c.entry.clone(), c.state, 0.0))
+        .take(query.limit)
+        .collect()
 }
 
 /// Deterministic cue tagger. The lane is derived from the canonical entries
@@ -1328,9 +1459,31 @@ pub(crate) fn finish(
     // the keyword result. Lane hits carry no lexical relevance (score 0.0).
     // Standing and expansion draw from independent caps, and expansion
     // dedupes against both the lexical hits and the standing lane.
+    // A set-shaped page leads with the mention set in transcript order,
+    // then keeps the ordinary lexical hits for any slots the set does not
+    // fill. Members keep the score they earned as lexical hits; unseen
+    // members carry 0.0 like lane hits. An empty set leaves the page
+    // identical to the fact path. An explicit date selection owns the page
+    // instead: its exact-date evidence must not lose the lead to the set.
+    let mention = if query_shape(query) == QueryShape::MentionSet && !date_selected {
+        mention_set(pool, revised, query)
+    } else {
+        Vec::new()
+    };
+    let member_scores: HashMap<EntryId, f64> = scored.iter().map(|(e, _, s)| (e.id, *s)).collect();
+    let mention: Vec<(Entry, StateAt, f64)> = mention
+        .into_iter()
+        .map(|(e, st, _)| {
+            let score = member_scores.get(&e.id).copied().unwrap_or(0.0);
+            (e, st, score)
+        })
+        .collect();
+    let member_ids: HashSet<EntryId> = mention.iter().map(|(e, _, _)| e.id).collect();
+
     let lexical_ids: HashSet<EntryId> = scored.iter().map(|(e, _, _)| e.id).collect();
     let standing = standing_lane(pool, revised, query, &lexical_ids);
     let mut existing_ids = lexical_ids;
+    existing_ids.extend(member_ids.iter().copied());
     existing_ids.extend(standing.iter().map(|(e, _, _)| e.id));
     let expansion = expansion_lane(pool, revised, query, &scored, &existing_ids);
 
@@ -1338,8 +1491,13 @@ pub(crate) fn finish(
         .require_evidence
         .then(|| AnswerConstraints::parse(&query.text, date_selected));
 
-    let ordered = scored
+    let ordered = mention
         .into_iter()
+        .chain(
+            scored
+                .into_iter()
+                .filter(|(e, _, _)| !member_ids.contains(&e.id)),
+        )
         .chain(standing)
         .chain(expansion)
         .filter(|(_, st, _)| !query.require_verified || *st == StateAt::Verified);
@@ -1615,6 +1773,312 @@ mod tests {
             stats.idf("ulid"),
             stats.idf("checkout")
         );
+    }
+
+    #[test]
+    fn count_kinship_question_leads_with_mention_set() {
+        // A count question naming a kinship term leads the page with every
+        // verified user turn mentioning the class, in transcript order,
+        // ahead of higher-scored lexical hits.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut lexical = Entry::new("a", EntryKind::Observation, "siblings and totals");
+        lexical.body = "ASSISTANT: siblings siblings siblings".into();
+        lexical.verify("review", None);
+        // Fixed ids pin transcript order: generated ULIDs minted in the
+        // same millisecond compare on their random suffix.
+        let mut m1 = Entry::new("a", EntryKind::Observation, "gift session");
+        m1.id = "00000000000000000000000001".parse().unwrap();
+        m1.body = "USER: a necklace for my sister's birthday\nASSISTANT: lovely".into();
+        m1.verify("review", None);
+        let mut m2 = Entry::new("a", EntryKind::Observation, "match session");
+        m2.id = "00000000000000000000000002".parse().unwrap();
+        m2.body = "USER: going to the match with my brother\nASSISTANT: have fun".into();
+        m2.verify("review", None);
+        store.create(&lexical).unwrap();
+        store.create(&m1).unwrap();
+        store.create(&m2).unwrap();
+
+        let out = search_with_coverage(
+            &store,
+            &Query::new("what is the total number of siblings i have", 10).current(),
+        )
+        .unwrap();
+        let order: Vec<String> = out.hits.iter().map(|h| h.entry.summary.clone()).collect();
+        assert_eq!(&order[..2], &["gift session", "match session"]);
+    }
+
+    #[test]
+    fn mention_set_never_includes_unverified_or_assistant_mentions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // Unverified kinship mention: must not enter the set.
+        let mut unverified = Entry::new("a", EntryKind::Observation, "draft sister note");
+        unverified.body = "USER: my sister".into();
+        // Assistant-only kinship mention: not a member.
+        let mut assistant = Entry::new("a", EntryKind::Observation, "movie night");
+        assistant.body = "ASSISTANT: a film about twin siblings\nUSER: sounds good".into();
+        assistant.verify("review", None);
+        let mut member = Entry::new("a", EntryKind::Observation, "real member");
+        member.body = "USER: i have a brother".into();
+        member.verify("review", None);
+        store.create(&unverified).unwrap();
+        store.create(&assistant).unwrap();
+        store.create(&member).unwrap();
+
+        let out = search_with_coverage(
+            &store,
+            &Query::new("total number of siblings", 10).current(),
+        )
+        .unwrap();
+        assert_eq!(out.hits[0].entry.summary, "real member");
+    }
+
+    #[test]
+    fn set_question_without_kinship_keeps_lexical_page() {
+        // A count cue with no kinship word in the question has no predicate:
+        // the page is the ordinary lexical page.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut best = Entry::new("a", EntryKind::Observation, "ten bass");
+        best.body = "USER: i caught ten largemouth bass".into();
+        best.verify("review", None);
+        store.create(&best).unwrap();
+
+        let text = "how many largemouth bass did i catch";
+        let with_set = search_with_coverage(&store, &Query::new(text, 10)).unwrap();
+        let ids: Vec<_> = with_set.hits.iter().map(|h| h.entry.id).collect();
+        assert_eq!(ids, vec![best.id]);
+    }
+
+    #[test]
+    fn strict_flags_keep_fact_shape_on_count_questions() {
+        // require_verified and require_evidence stay Fact: the mention set
+        // never leads a strict query.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut member = Entry::new("a", EntryKind::Observation, "real member");
+        member.body = "USER: i have a brother".into();
+        member.verify("review", None);
+        store.create(&member).unwrap();
+
+        for q in [
+            Query::new("total number of siblings", 10).require_verified(),
+            Query::new("total number of siblings", 10).require_evidence(),
+        ] {
+            let out = search_with_coverage(&store, &q).unwrap();
+            // The strict page is the lexical page for the same pool; the
+            // entry appears only because it scores, never as a set member.
+            assert!(out.hits.iter().all(|h| h.score > 0.0));
+        }
+    }
+
+    #[test]
+    fn mention_set_excludes_contradicted_rolled_back_and_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut member = Entry::new("a", EntryKind::Observation, "live member");
+        member.id = "00000000000000000000000001".parse().unwrap();
+        member.body = "USER: i have a brother".into();
+        member.verify("review", None);
+        let mut dead = Entry::new("a", EntryKind::Observation, "contradicted note");
+        dead.id = "00000000000000000000000002".parse().unwrap();
+        dead.body = "USER: my sister called".into();
+        dead.contradict(member.id, "review", None);
+        let mut rolled = Entry::new("a", EntryKind::Observation, "rolled back note");
+        rolled.id = "00000000000000000000000003".parse().unwrap();
+        rolled.body = "USER: my twin is here".into();
+        rolled.mark_rolled_back("review");
+        // A superseded kinship note: it stays visible on a plain read but
+        // must not lead the set ahead of its correction.
+        let mut stale = Entry::new("a", EntryKind::Observation, "superseded note");
+        stale.id = "00000000000000000000000004".parse().unwrap();
+        stale.body = "USER: i have two sisters".into();
+        stale.verify("review", None);
+        let mut head = Entry::new("a", EntryKind::Observation, "correction");
+        head.id = "00000000000000000000000005".parse().unwrap();
+        head.body = "USER: actually three sisters now".into();
+        head.revises = Some(stale.id);
+        head.verify("review", None);
+        store.create(&member).unwrap();
+        store.create(&dead).unwrap();
+        store.create(&rolled).unwrap();
+        store.create(&stale).unwrap();
+        store.create(&head).unwrap();
+
+        let out =
+            search_with_coverage(&store, &Query::new("total number of siblings", 10)).unwrap();
+        assert_eq!(out.hits[0].entry.id, member.id);
+        let member_leads: Vec<_> = out
+            .hits
+            .iter()
+            .take_while(|h| h.score == 0.0)
+            .map(|h| h.entry.id)
+            .collect();
+        assert!(member_leads.contains(&member.id));
+        assert!(!member_leads.contains(&dead.id));
+        assert!(!member_leads.contains(&rolled.id));
+        assert!(!member_leads.contains(&stale.id));
+    }
+
+    #[test]
+    fn markerless_body_counts_as_user_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut member = Entry::new("a", EntryKind::Observation, "plain note");
+        member.id = "00000000000000000000000001".parse().unwrap();
+        member.body = "my brother visited last week".into();
+        member.verify("review", None);
+        store.create(&member).unwrap();
+
+        let out = search_with_coverage(
+            &store,
+            &Query::new("total number of siblings", 10).current(),
+        )
+        .unwrap();
+        assert_eq!(out.hits[0].entry.id, member.id);
+    }
+
+    #[test]
+    fn mention_set_honors_the_query_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut ids = Vec::new();
+        for (i, (name, kin)) in [("one", "sister"), ("two", "brother"), ("three", "twin")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut e = Entry::new("a", EntryKind::Observation, name);
+            e.id = format!("0000000000000000000000000{}", i + 1)
+                .parse()
+                .unwrap();
+            e.body = format!("USER: my {kin} is here");
+            e.verify("review", None);
+            store.create(&e).unwrap();
+            ids.push(e.id);
+        }
+
+        let out =
+            search_with_coverage(&store, &Query::new("total number of siblings", 2).current())
+                .unwrap();
+        assert_eq!(out.hits.len(), 2);
+        assert_eq!(
+            out.hits.iter().map(|h| h.entry.id).collect::<Vec<_>>(),
+            &ids[..2],
+            "the set takes the first `limit` members in transcript order"
+        );
+
+        let out =
+            search_with_coverage(&store, &Query::new("total number of siblings", 1).current())
+                .unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].entry.id, ids[0]);
+    }
+
+    #[test]
+    fn as_of_keeps_the_fact_page_on_a_set_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut member = Entry::new("a", EntryKind::Observation, "member");
+        member.body = "USER: i have a brother".into();
+        member.verify("review", None);
+        store.create(&member).unwrap();
+
+        let out = search_with_coverage(
+            &store,
+            &Query::new("total number of siblings", 10).as_of(Utc::now()),
+        )
+        .unwrap();
+        assert!(
+            out.hits.iter().all(|h| h.score > 0.0),
+            "as_of reads stay fact-shaped: no zero-score set lead"
+        );
+    }
+
+    #[test]
+    fn mention_members_are_not_reappended_by_expansion() {
+        // A member with no lexical score that shares a session with a scored
+        // seed must appear once: leading the page, never again in the tail.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut seed = Entry::new("a", EntryKind::Observation, "number seed");
+        seed.id = "00000000000000000000000001".parse().unwrap();
+        seed.body = "USER: the total number puzzle".into();
+        seed.session_id = Some("s1".into());
+        seed.verify("review", None);
+        let mut member = Entry::new("a", EntryKind::Observation, "session member");
+        member.id = "00000000000000000000000002".parse().unwrap();
+        member.body = "USER: my brother came over".into();
+        member.session_id = Some("s1".into());
+        member.verify("review", None);
+        store.create(&seed).unwrap();
+        store.create(&member).unwrap();
+
+        let out = search_with_coverage(
+            &store,
+            &Query::new("total number of siblings", 10).current(),
+        )
+        .unwrap();
+        assert_eq!(out.hits[0].entry.id, member.id);
+        assert_eq!(
+            out.hits.iter().filter(|h| h.entry.id == member.id).count(),
+            1,
+            "a member leads the page exactly once"
+        );
+    }
+
+    #[test]
+    fn count_question_about_a_relatives_children_keeps_lexical_page() {
+        // "How many children does my sister have" counts children; the
+        // kinship word belongs to the person, not the counted noun, so no
+        // member promotion happens.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut sister_note = Entry::new("a", EntryKind::Observation, "sister note");
+        sister_note.id = "00000000000000000000000001".parse().unwrap();
+        sister_note.body = "USER: my sister visited".into();
+        sister_note.verify("review", None);
+        let mut children_note = Entry::new("a", EntryKind::Observation, "children note");
+        children_note.id = "00000000000000000000000002".parse().unwrap();
+        children_note.body = "USER: does emma have many children".into();
+        children_note.verify("review", None);
+        store.create(&sister_note).unwrap();
+        store.create(&children_note).unwrap();
+
+        let out = search_with_coverage(
+            &store,
+            &Query::new("how many children does my sister have", 10).current(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.hits[0].entry.id, children_note.id,
+            "the children evidence outranks an unpromoted sister mention"
+        );
+    }
+
+    #[test]
+    fn explicit_date_selection_outranks_the_mention_set() {
+        // A dated set question keeps its exact-date page: the date match
+        // leads, the set does not leapfrog it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut dated = Entry::new("a", EntryKind::Observation, "dated member");
+        dated.id = "00000000000000000000000001".parse().unwrap();
+        dated.body = "USER: on 2024-03-05 my sister called".into();
+        dated.verify("review", None);
+        let mut undated = Entry::new("a", EntryKind::Observation, "undated member");
+        undated.id = "00000000000000000000000002".parse().unwrap();
+        undated.body = "USER: my brother came over".into();
+        undated.verify("review", None);
+        store.create(&dated).unwrap();
+        store.create(&undated).unwrap();
+
+        let out = search_with_coverage(
+            &store,
+            &Query::new("total number of siblings on 2024-03-05", 10).current(),
+        )
+        .unwrap();
+        assert_eq!(out.hits[0].entry.id, dated.id);
     }
 
     #[test]
