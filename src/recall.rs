@@ -1952,7 +1952,7 @@ mod tests {
             e.id = format!("0000000000000000000000000{}", i + 1)
                 .parse()
                 .unwrap();
-            e.body = format!("USER: my {kin} is here").into();
+            e.body = format!("USER: my {kin} is here");
             e.verify("review", None);
             store.create(&e).unwrap();
             ids.push(e.id);
