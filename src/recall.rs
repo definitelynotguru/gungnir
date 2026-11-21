@@ -1763,10 +1763,14 @@ mod tests {
         let mut lexical = Entry::new("a", EntryKind::Observation, "siblings and totals");
         lexical.body = "ASSISTANT: siblings siblings siblings".into();
         lexical.verify("review", None);
+        // Fixed ids pin transcript order: generated ULIDs minted in the
+        // same millisecond compare on their random suffix.
         let mut m1 = Entry::new("a", EntryKind::Observation, "gift session");
+        m1.id = "00000000000000000000000001".parse().unwrap();
         m1.body = "USER: a necklace for my sister's birthday\nASSISTANT: lovely".into();
         m1.verify("review", None);
         let mut m2 = Entry::new("a", EntryKind::Observation, "match session");
+        m2.id = "00000000000000000000000002".parse().unwrap();
         m2.body = "USER: going to the match with my brother\nASSISTANT: have fun".into();
         m2.verify("review", None);
         store.create(&lexical).unwrap();
